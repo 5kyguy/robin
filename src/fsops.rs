@@ -905,6 +905,19 @@ pub fn move_child(
     to: &std::ffi::OsStr,
     opts: &mut MoveOpts<'_>,
 ) -> Result<CopyOutcome> {
+    let mark = LANDED.with(|l| l.borrow().len());
+    let out = move_child_untracked(parent, from, dest_parent, to, opts);
+    LANDED.with(|l| l.borrow_mut().truncate(mark));
+    out
+}
+
+fn move_child_untracked(
+    parent: &DirFd,
+    from: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    to: &std::ffi::OsStr,
+    opts: &mut MoveOpts<'_>,
+) -> Result<CopyOutcome> {
     if !opts.force_copy {
         let from_c = component(from)?;
         let to_c = component(to)?;
@@ -1243,18 +1256,17 @@ fn move_directory_inner(
     };
     let src = parent.open_dir_nofollow(from)?;
     let dst = dest_parent.open_dir_nofollow(dest_name.as_os_str())?;
+    let dst_id =
+        ident(&rustix::fs::fstat(dst.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?);
+    let mark = LANDED.with(|l| l.borrow().len());
     let mut all_copied = true;
-    // What was there before, so a Cancel inside a merged folder can take
-    // back only what this job added.
-    let before: std::collections::HashSet<std::ffi::OsString> = if created {
-        Default::default()
-    } else {
-        dst.list()?.into_iter().map(|e| e.name).collect()
-    };
     // Children first; the mode and times are applied even if a child fails,
     // so a partial copy does not stay 0700 or carry the copy time.
     let children = (|| -> Result<()> {
         for entry in src.list()? {
+            if opts.copy.cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
             let child_rel = rel.join(&entry.name);
             let outcome = move_entry(
                 &src,
@@ -1272,28 +1284,38 @@ fn move_directory_inner(
         }
         Ok(())
     })();
+    // A Cancel takes back what this job landed here. Any other error does
+    // too in a folder this job created, so a failed copy leaves no
+    // half-built folder; in a merged folder it keeps what landed.
+    if let Err(err) = &children {
+        if created || matches!(err, Error::Cancelled) {
+            LANDED.with(|l| undo_landed(&dst, dst_id, &l.borrow()[mark..]));
+            if created {
+                drop(dst);
+                if let Ok(c) = component(dest_name.as_os_str()) {
+                    match rustix::fs::statat(
+                        dest_parent.as_fd(),
+                        c.as_c_str(),
+                        AtFlags::SYMLINK_NOFOLLOW,
+                    ) {
+                        Ok(st) if ident(&st) == dst_id => {
+                            let _ = rustix::fs::unlinkat(
+                                dest_parent.as_fd(),
+                                c.as_c_str(),
+                                AtFlags::REMOVEDIR,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return children.map(|_| CopyOutcome::Skipped);
+        }
+    }
     if created {
         rustix::fs::fchmod(dst.as_fd(), Mode::from_raw_mode(stat.st_mode & 0o777))
             .map_err(|e| Error::from_errno(&dest_name, e))?;
         set_times(dst.as_fd(), &stat).map_err(|e| Error::from_errno(&dest_name, e))?;
-    }
-    if let Err(Error::Cancelled) = children {
-        // Leave nothing half-copied behind: drop the folder this job made,
-        // or what it added to the folder it was merging into.
-        let fresh = Cancel::new();
-        if created {
-            drop(dst);
-            remove_child(dest_parent, &dest_name, &mut |_| {}, &fresh)?;
-        } else {
-            for entry in dst.list()? {
-                if !before.contains(&entry.name)
-                    && !entry.name.to_string_lossy().starts_with(".robin-partial")
-                {
-                    remove_child(&dst, &entry.name, &mut |_| {}, &fresh)?;
-                }
-            }
-        }
-        return Err(Error::Cancelled);
     }
     children?;
     rustix::fs::fsync(dst.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
@@ -1614,6 +1636,83 @@ fn resolve_dest_name(
 /// Retries when the chosen name appears between choosing it and landing.
 const KEEP_BOTH_TRIES: usize = 16;
 
+/// An entry this job created under a new name, never one it replaced.
+struct Landed {
+    parent: (u64, u64),
+    name: std::ffi::OsString,
+    id: (u64, u64),
+    dir: bool,
+}
+
+thread_local! {
+    /// Everything the running transfer landed, so a folder can take back
+    /// exactly its own entries when it is cancelled or fails. A transfer
+    /// runs on one thread; [`move_child`] clears its entries when done.
+    static LANDED: std::cell::RefCell<Vec<Landed>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn ident(st: &rustix::fs::Stat) -> (u64, u64) {
+    (st.st_dev, st.st_ino)
+}
+
+/// Remove what this job landed inside `dir` (identity `id`), deepest
+/// first. Each entry goes only while it is still the inode we made, and
+/// a folder only once empty, so anything another program put there stays.
+/// Best effort: it runs while another error is already being returned.
+fn undo_landed(dir: &DirFd, id: (u64, u64), landed: &[Landed]) {
+    for entry in landed.iter().rev().filter(|e| e.parent == id) {
+        let Ok(c) = component(&entry.name) else {
+            continue;
+        };
+        let Ok(st) = rustix::fs::statat(dir.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        else {
+            continue;
+        };
+        if ident(&st) != entry.id {
+            continue;
+        }
+        if entry.dir {
+            let Ok(sub) = dir.open_dir_nofollow(&entry.name) else {
+                continue;
+            };
+            match rustix::fs::fstat(sub.as_fd()) {
+                Ok(st) if ident(&st) == entry.id => {
+                    // A finished copy carries the source mode; make our
+                    // own folder writable again to empty it.
+                    if st.st_mode & 0o200 == 0 {
+                        let _ = rustix::fs::fchmod(
+                            sub.as_fd(),
+                            Mode::from_raw_mode((st.st_mode & 0o777) | 0o700),
+                        );
+                    }
+                    undo_landed(&sub, entry.id, landed)
+                }
+                _ => continue,
+            }
+        }
+        let flags = if entry.dir {
+            AtFlags::REMOVEDIR
+        } else {
+            AtFlags::empty()
+        };
+        // Recheck right before removing; an rmdir only ever takes an
+        // empty folder.
+        match rustix::fs::statat(dir.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) if ident(&st) == entry.id => {
+                let _ = rustix::fs::unlinkat(dir.as_fd(), c.as_c_str(), flags);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fail the landing of this name with EIO, like a disk error.
+    pub(crate) static FAIL_LANDING: std::cell::RefCell<Option<std::ffi::OsString>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(test)]
 type LandingHook = Box<dyn FnMut(&DirFd, &std::ffi::OsStr)>;
 
@@ -1642,9 +1741,31 @@ fn land_keep_both(
                 hook(dest_parent, &name);
             }
         });
+        #[cfg(test)]
+        if FAIL_LANDING.with(|f| f.borrow().as_deref() == Some(name.as_os_str())) {
+            return Err(Error::from_errno(&name, Errno::IO));
+        }
         let c = component(name.as_os_str())?;
         match op(&c) {
-            Ok(()) => return Ok(name),
+            Ok(()) => {
+                let parent = rustix::fs::fstat(dest_parent.as_fd())
+                    .map_err(|e| Error::from_errno(&name, e))?;
+                let st = rustix::fs::statat(
+                    dest_parent.as_fd(),
+                    c.as_c_str(),
+                    AtFlags::SYMLINK_NOFOLLOW,
+                )
+                .map_err(|e| Error::from_errno(&name, e))?;
+                LANDED.with(|l| {
+                    l.borrow_mut().push(Landed {
+                        parent: ident(&parent),
+                        name: name.clone(),
+                        id: ident(&st),
+                        dir: is_dir(st.st_mode) && !is_lnk(st.st_mode),
+                    })
+                });
+                return Ok(name);
+            }
             Err(Errno::EXIST) => name = fresh_name(dest_parent, base)?,
             Err(err) => return Err(Error::from_errno(&name, err)),
         }
@@ -2130,6 +2251,93 @@ mod tests {
         assert!(!root.join("src/a").exists(), "copied originals still go");
         assert_eq!(std::fs::read(root.join("dest/a")).unwrap(), b"a");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn merge_cancel_keeps_a_file_another_program_added() {
+        let root = scratch("merge-foreign");
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        std::fs::create_dir_all(root.join("dest/sub")).unwrap();
+        std::fs::write(root.join("src/sub/x"), b"x").unwrap();
+        std::fs::write(root.join("src/sub/y"), b"y").unwrap();
+        std::fs::write(root.join("dest/sub/keep"), b"old").unwrap();
+        let cancel = std::rc::Rc::new(Cancel::new());
+        let c = cancel.clone();
+        on_landing(move |dir, _| {
+            // Another program drops a file into the merge target, then
+            // the user cancels before the next item.
+            let _ = std::fs::write(dir_path(dir).join("foreign"), b"theirs");
+            c.cancel();
+        });
+        let out = force_move(&root, "src", "dest", &cancel);
+        assert!(matches!(out, Err(Error::Cancelled)), "{out:?}");
+        let mut left = walk(&root.join("dest"));
+        left.sort();
+        assert_eq!(left, ["sub", "sub/foreign", "sub/keep"]);
+        assert!(root.join("src/sub/x").exists() && root.join("src/sub/y").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_new_folder_keeps_a_foreign_file_and_drops_only_ours() {
+        let root = scratch("new-foreign");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a"), b"a").unwrap();
+        std::fs::write(root.join("src/b"), b"b").unwrap();
+        let cancel = std::rc::Rc::new(Cancel::new());
+        let c = cancel.clone();
+        on_landing(move |dir, name| {
+            if name == "dest" {
+                return;
+            }
+            let _ = std::fs::write(dir_path(dir).join("foreign"), b"theirs");
+            c.cancel();
+        });
+        let out = force_move(&root, "src", "dest", &cancel);
+        assert!(matches!(out, Err(Error::Cancelled)), "{out:?}");
+        assert_eq!(
+            walk(&root.join("dest")),
+            ["foreign"],
+            "the folder stays for it"
+        );
+        assert!(root.join("src/a").exists() && root.join("src/b").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_error_or_cancel_mid_folder_leaves_no_new_folder() {
+        for how in ["eio", "cancel"] {
+            let root = scratch("mid-folder");
+            std::fs::create_dir_all(root.join("src/inner")).unwrap();
+            for f in ["a", "b", "inner/c", "inner/d"] {
+                std::fs::write(root.join("src").join(f), f).unwrap();
+            }
+            let cancel = std::rc::Rc::new(Cancel::new());
+            let c = cancel.clone();
+            let mut landed = 0;
+            if how == "eio" {
+                FAIL_LANDING.with(|f| *f.borrow_mut() = Some("d".into()));
+            } else {
+                on_landing(move |_, _| {
+                    landed += 1;
+                    if landed == 4 {
+                        c.cancel();
+                    }
+                });
+            }
+            let out = force_move(&root, "src", "dest", &cancel);
+            FAIL_LANDING.with(|f| *f.borrow_mut() = None);
+            assert!(out.is_err(), "{how}: {out:?}");
+            assert!(
+                !root.join("dest").exists(),
+                "{how}: {:?}",
+                walk(&root.join("dest"))
+            );
+            for f in ["a", "b", "inner/c", "inner/d"] {
+                assert!(root.join("src").join(f).exists(), "{how}: {f}");
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     fn walk(dir: &Path) -> Vec<String> {
