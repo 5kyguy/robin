@@ -34,6 +34,17 @@ impl Error {
         }
     }
 
+    /// The path no longer exists or is no longer a folder.
+    pub fn is_gone(&self) -> bool {
+        match self {
+            Self::Io { source, .. } => matches!(
+                source.raw_os_error(),
+                Some(e) if e == libc::ENOENT || e == libc::ENOTDIR
+            ),
+            _ => false,
+        }
+    }
+
     pub fn from_errno(path: impl Into<PathBuf>, err: rustix::io::Errno) -> Self {
         Self::io(path, std::io::Error::from(err))
     }

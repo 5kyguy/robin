@@ -19,6 +19,7 @@ pub mod stats;
 pub mod theme;
 pub mod thumbs;
 pub mod video;
+pub mod watch;
 
 pub use error::{Error, Result};
 

@@ -79,6 +79,10 @@ pub fn known(view: &str) -> bool {
             | "progress"
             | "confirm-delete"
             | "undo"
+            | "list-modified-sorted"
+            | "list-name-natural"
+            | "list-name-desc"
+            | "watch-fallback"
     )
 }
 
@@ -263,6 +267,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
     ))));
     let (tone, text, details, pinned) = toast(view);
     ui.set_toast_tone(tone.into());
+    ui.set_toast_glyph(crate::app::toast_glyph(tone).into());
     ui.set_toast_text(text.into());
     crate::app::set_toast_rows(
         ui,
@@ -944,6 +949,9 @@ fn menu() -> Vec<slint::SharedString> {
 /// The views of the wired file operations: cut rows, a drag over a folder,
 /// a running job, the keyboard-focused confirms, and the undo toast.
 fn fileops_scene(ui: &AppWindow, view: &str) {
+    if view.starts_with("list-") || view == "watch-fallback" {
+        return list_scene(ui, view);
+    }
     let mut rows = files(false);
     let pick = |rows: &mut Vec<Row>, f: &dyn Fn(&mut Row)| {
         for r in rows
@@ -1090,6 +1098,79 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
     }
     if matches!(view, "cut" | "dnd-copy" | "dnd-move" | "dnd-refused") {
         ui.set_files(ModelRc::new(Rc::new(VecModel::from(rows))));
+    }
+}
+
+/// The list as the real controller fills and sorts it, over made-up
+/// entries, at a fixed time in +05:30.
+fn list_scene(ui: &AppWindow, view: &str) {
+    use crate::model::Entry;
+    // 2026-10-31 16:10 in +05:30.
+    let now = 1_793_443_200;
+    let mut ctl =
+        crate::app::Controller::new("/demo/Pictures".into(), crate::ops::Env::from_system());
+    ctl.clock = Some((now, 19_800));
+    let e = |name: &str, dir: bool, len: u64, ago: i64| Entry {
+        name: name.into(),
+        is_dir: dir,
+        is_symlink: false,
+        len,
+        mtime: std::time::UNIX_EPOCH + std::time::Duration::from_secs((now - ago) as u64),
+        mode: if dir { 0o040755 } else { 0o100644 },
+    };
+    ctl.listing.set_entries(vec![
+        e("raw-exports", true, 0, 2 * 86_400),
+        e("tatooine-trip", true, 0, 19 * 86_400),
+        e("Desert-10", true, 0, 3_600),
+        e("Desert-9", true, 0, 40 * 86_400),
+        e("dune-sunset-0412.jpg", false, 6_500_000, 1_200),
+        e("dune-sunset-0413.jpg", false, 6_300_000, 9_000),
+        e("frame-2.png", false, 2_100_000, 86_400 + 600),
+        e("frame-10.png", false, 2_400_000, 30_000),
+        e("frame-1.png", false, 1_900_000, 400 * 86_400),
+        e("speeder-run.mp4", false, 432_000_000, 3 * 86_400),
+        e("palette.toml", false, 3_400, 52_000),
+        e("shot-list.md", false, 1_200, 10 * 86_400),
+        e("binary-sunset.flac", false, 39_000_000, 77 * 86_400),
+    ]);
+    for (name, n) in [
+        ("raw-exports", 48),
+        ("tatooine-trip", 312),
+        ("Desert-10", 7),
+        ("Desert-9", 0),
+    ] {
+        ctl.counts.insert(name.into(), n);
+    }
+    match view {
+        "list-modified-sorted" => {
+            ctl.sort_by(3);
+            ctl.sort_by(3);
+        }
+        "list-name-desc" => {
+            ctl.sort_by(0);
+        }
+        _ => {}
+    }
+    ui.set_files(ModelRc::new(Rc::new(VecModel::from(ctl.rows()))));
+    let (column, desc) = ctl.sort_header();
+    ui.set_sort_column(column);
+    ui.set_sort_desc(desc);
+    ui.set_status_left(crate::ops::count(ctl.listing.view().len()).into());
+    // The two neutral notices, with the same text the app shows.
+    let notice = match view {
+        "watch-fallback" => Some(crate::app::watch_fallback_notice(Path::new(
+            "/mnt/archive/Pictures",
+        ))),
+        _ => None,
+    };
+    if let Some((text, details)) = notice {
+        let tone = if view == "watch-fallback" { "info" } else { "" };
+        ui.set_toast_tone(tone.into());
+        ui.set_toast_glyph(crate::app::toast_glyph(tone).into());
+        ui.set_toast_text(text.into());
+        crate::app::set_toast_rows(ui, &crate::app::detail_rows(&details, false, false));
+        ui.set_toast_on(true);
+        ui.set_toast_open(true);
     }
 }
 

@@ -463,6 +463,36 @@ component Meter inherits Rectangle {
     }
 }
 
+// A list column header: click to sort, again to reverse. The sorted
+// column is accented and carries the direction arrow.
+component HeaderCell inherits Rectangle {
+    in property <string> label;
+    in property <int> column;
+    in property <bool> sorted;
+    in property <bool> desc;
+    in property <bool> align-right;
+    in property <color> accent;
+    in property <color> muted;
+    callback clicked();
+    y: 0px;
+    Text {
+        text: root.sorted ? (root.align-right ? (root.desc ? "󰁅  " : "󰁝  ") + root.label : root.label + (root.desc ? "  󰁅" : "  󰁝")) : root.label;
+        width: parent.width;
+        height: parent.height;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 1px;
+        color: root.sorted ? root.accent : root.muted;
+        horizontal-alignment: root.align-right ? right : left;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 export component AppWindow inherits Window {
     property <length> row-h: compact ? 24px : 30px;
     in property <bool> harness: true;
@@ -501,6 +531,13 @@ export component AppWindow inherits Window {
     in property <[Place]> device-places;
     in property <[Place]> trash-places;
     in property <[Row]> files;
+    // The sorted list column (0 Name, 1 Size, 2 Type, 3 Modified).
+    in property <int> sort-column: 0;
+    in property <bool> sort-desc: false;
+    callback sort-by(int);
+    // Scroll offsets, kept across live refreshes and reset on navigation.
+    in-out property <length> list-scroll: 0px;
+    in-out property <length> grid-scroll: 0px;
     in property <[GridLine]> grid-rows;
     in property <[string]> menu-labels;
     in property <string> toast-text: "";
@@ -510,6 +547,8 @@ export component AppWindow inherits Window {
     in property <bool> toast-expanded: false;
     // "" neutral, "warning" partial move, "danger" refused up front.
     in property <string> toast-tone: "";
+    // Set from Rust by `app::toast_glyph`.
+    in property <string> toast-glyph: "󰄬";
     in property <string> refusal-title;
     in property <[RefusalLine]> refusal-lines;
     // False when a folder can't be read: only Close is offered.
@@ -871,63 +910,63 @@ export component AppWindow inherits Window {
                 if state == "files" && !grid: VerticalLayout {
                     Rectangle {
                         height: 26px;
-                        Text {
-                            text: "NAME  󰁝";
+                        HeaderCell {
+                            label: "NAME";
+                            column: 0;
+                            sorted: root.sort-column == 0;
+                            desc: root.sort-desc;
                             x: Columns.name-x;
-                            y: 0px;
                             width: Columns.name-w(parent.width);
+                            align-right: false;
                             height: parent.height;
-                            font-size: 11px;
-                            font-weight: 700;
-                            letter-spacing: 1px;
-                            color: accent;
-                            horizontal-alignment: left;
-                            vertical-alignment: center;
-                            overflow: elide;
+                            accent: accent;
+                            muted: muted;
+                            clicked => { root.sort-by(0); }
                         }
-                        Text {
-                            text: "SIZE";
+                        HeaderCell {
+                            label: "SIZE";
+                            column: 1;
+                            sorted: root.sort-column == 1;
+                            desc: root.sort-desc;
                             x: Columns.size-x(parent.width);
-                            y: 0px;
                             width: Columns.size-w;
+                            align-right: true;
                             height: parent.height;
-                            font-size: 11px;
-                            font-weight: 700;
-                            color: muted;
-                            horizontal-alignment: right;
-                            vertical-alignment: center;
-                            overflow: elide;
+                            accent: accent;
+                            muted: muted;
+                            clicked => { root.sort-by(1); }
                         }
-                        Text {
-                            text: "TYPE";
+                        HeaderCell {
+                            label: "TYPE";
+                            column: 2;
+                            sorted: root.sort-column == 2;
+                            desc: root.sort-desc;
                             x: Columns.type-x(parent.width);
-                            y: 0px;
                             width: Columns.type-w;
+                            align-right: false;
                             height: parent.height;
-                            font-size: 11px;
-                            font-weight: 700;
-                            color: muted;
-                            horizontal-alignment: left;
-                            vertical-alignment: center;
-                            overflow: elide;
+                            accent: accent;
+                            muted: muted;
+                            clicked => { root.sort-by(2); }
                         }
-                        Text {
-                            text: "MODIFIED";
+                        HeaderCell {
+                            label: "MODIFIED";
+                            column: 3;
+                            sorted: root.sort-column == 3;
+                            desc: root.sort-desc;
                             x: Columns.mod-x(parent.width);
-                            y: 0px;
                             width: Columns.mod-w;
+                            align-right: false;
                             height: parent.height;
-                            font-size: 11px;
-                            font-weight: 700;
-                            color: muted;
-                            horizontal-alignment: left;
-                            vertical-alignment: center;
-                            overflow: elide;
+                            accent: accent;
+                            muted: muted;
+                            clicked => { root.sort-by(3); }
                         }
                     }
                     Rectangle { height: 1px; background: divider; }
                     ListView {
                         vertical-stretch: 1;
+                        viewport-y <=> root.list-scroll;
                         for row[i] in files: Rectangle {
                             width: parent.width;
                             height: row-h;
@@ -1016,6 +1055,7 @@ export component AppWindow inherits Window {
                 }
                 if state == "files" && grid: ListView {
                     vertical-stretch: 1;
+                    viewport-y <=> root.grid-scroll;
                     for line in grid-rows: HorizontalLayout {
                         padding-left: 16px;
                         padding-right: 16px;
@@ -1192,10 +1232,10 @@ export component AppWindow inherits Window {
         background: surface;
         border-radius: 8px;
         border-width: 1px;
-        border-color: toast-tone == "" ? hairline : tone;
+        border-color: toast-tone == "" || toast-tone == "info" ? hairline : tone;
         drop-shadow-blur: 16px;
         drop-shadow-color: #000000.with-alpha(0.35);
-        if toast-tone != "": Rectangle {
+        if toast-tone == "warning" || toast-tone == "danger": Rectangle {
             x: 0px;
             y: 0px;
             width: 4px;
@@ -1205,7 +1245,7 @@ export component AppWindow inherits Window {
             background: tone;
         }
         Text {
-            text: toast-tone == "warning" ? "󰀦" : toast-tone == "danger" ? "󰅙" : "󰄬";
+            text: toast-glyph;
             x: 16px;
             y: 0px;
             width: 18px;

@@ -316,3 +316,82 @@ Things that never animate: scrolling content, list sorting (it cuts), and typing
 30. theme-black for frames 1, 3, 24, and 28
 
 Mockups: `/workspace/robin-design/mockups/{01-list,02-grid,03-viewer,04-stats,05-dialogs}.png`. They are a direction only, and this spec wins over them.
+
+## External drag and drop (Slint 1.17.1)
+
+Checked against the 1.17.1 sources rather than assumed.
+
+- `DragArea`/`DropArea` are in-window only. `DataTransfer` holds
+  `plain_text`, `image` and `user_data`; there is no MIME/uri-list slot.
+- `i-slint-backend-winit` 1.17.1 neither starts native drags nor
+  forwards `WindowEvent::DroppedFile` into Slint's drop machinery.
+- So outbound drags to other apps are impossible without patching
+  Slint; we do not fake them (e.g. by copying paths to the clipboard).
+- Inbound: the `unstable-winit-030` feature exposes
+  `WinitWindowAccessor::on_winit_window_event`, and winit 0.30 emits
+  `DroppedFile(path)` on X11 (once per path). `app::run` collects those
+  together with the folder open at that moment (the destination is
+  frozen at drop time, not at flush time). The next 100ms tick turns
+  them into jobs via `ops::external_drop`, unless a dialog is open, in
+  which case they wait; jobs queue behind a running one. Jobs are
+  grouped per source folder, items already in the (canonicalized)
+  destination and into-itself drops are skipped.
+- Inbound drops always **copy**, never move. winit 0.30.13's X11
+  handler (`platform_impl/linux/x11/dnd.rs`) canonicalizes every path
+  (:166), so a dropped symlink arrives as its target and a move would
+  take the target away from where it really lives. It also
+  percent-decodes the whole `text/uri-list` before splitting on CRLF
+  (:149-150), so names containing an encoded CR/LF split wrongly; strips
+  `file://` with a `replace` over the whole string, so a name containing
+  `file://` is mangled; and drops the entire drop if any name isn't
+  UTF-8. Slint doesn't expose the raw uri-list, so none of this can be
+  undone. Copying makes the worst case a duplicate rather than a lost
+  or relocated file. A dropped symlink copies its target: winit resolved
+  it, and a path it can't resolve fails the whole drop inside winit, so
+  Robin never sees a link. The notices for a drop that copied nothing
+  and for an unwatchable folder use the neutral toast.
+- Subfolder item counts open each child without following links and
+  skip a child on another device (a mount point), leaving it blank.
+- The drop API depends on Slint's `unstable-winit-030` feature, which
+  has no semver guarantee; that is why `slint` is pinned to `=1.17.1`.
+  Any Slint bump must recheck `on_winit_window_event` and `DroppedFile`. `DroppedFile` has no position, no
+  modifiers and no hover events, so the target is always the open
+  folder. winit 0.30 has no Wayland implementation, so nothing arrives
+  there.
+- Upstream status (checked 2026-10-31): winit 0.31 replaces
+  `DroppedFile` with `DragEntered`/`DragMoved`/`DragDropped`/`DragLeft`
+  carrying all paths plus the pointer position, and implements them on
+  Wayland ([winit#4571](https://github.com/rust-windowing/winit/pull/4571),
+  merged 2026-07-16, shipped in 0.31 betas). Slint 1.17's release notes
+  say cross-app drag and drop is "in development upstream in winit", and
+  Slint's docs still expose only `winit_030`. Once Slint moves to winit
+  0.31, Robin can switch to `DragDropped` and target the row under the
+  pointer.
+- XWayland: winit 0.30 chooses X11 when `WAYLAND_DISPLAY` is empty and
+  `DISPLAY` is set, so `WAYLAND_DISPLAY= robin` is a documented opt-in,
+  not the default.
+
+## Live refresh
+
+- `watch::Watch` is a non-recursive inotify watch on the open folder.
+  Its callback only flips two `AtomicBool`s: `dirty` (the listing
+  changed) and `stale` (the folder was deleted, moved or replaced, i.e.
+  IN_IGNORED / delete-self / move-self, or the watcher errored). No
+  channel, so a burst of events can't grow memory.
+- A 100ms UI timer reads the flags. `Debounce` waits for 200ms of quiet
+  but fires at most 1.5s after the first event, so a folder that never
+  goes quiet still updates.
+- A stale watch is dropped and re-armed on the next tick, followed by a
+  reread.
+- The reread (`Snapshot::read`: list, stat, subfolder counts) runs on a
+  worker thread, one at a time; the UI thread only sorts and builds
+  rows, and ignores a result for a folder it has left. An unchanged
+  result doesn't redraw.
+- If a watch can't be set up, the folder is reread every 2s instead,
+  setup is retried with backoff (2s doubling to 60s), and a muted toast
+  says so once per folder.
+- Only ENOENT/ENOTDIR on reread falls back to the nearest existing
+  ancestor; other errors (e.g. EACCES) keep the folder and its last
+  listing and show the error once.
+- Measured on a 100k-file folder (release build, ext4, warm cache): worker
+  read+stat ~116ms, UI sort/apply ~18ms, UI row build ~242ms.

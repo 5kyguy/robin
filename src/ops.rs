@@ -148,6 +148,55 @@ pub fn drop_check(op: Op, src: &Path, names: &[OsString], dest: &Path) -> DropCh
     DropCheck::Ok
 }
 
+/// What a drop from another app turns into.
+#[derive(Debug, Default)]
+pub struct ExternalDrop {
+    pub jobs: Vec<Job>,
+    /// Items skipped because they are already in the destination, or
+    /// are the destination's own ancestors.
+    pub already_here: usize,
+}
+
+/// Files dropped on the window by another app, as copy jobs into `dest`,
+/// one per source folder.
+///
+/// Always a copy, never a move: winit 0.30's X11 handler canonicalizes
+/// every dropped path before Robin sees it, so a dropped symlink arrives
+/// as its target, and moving would take the target away from wherever it
+/// really lives. Slint doesn't expose the raw `text/uri-list`, so the link
+/// itself can't be recovered; copying at worst duplicates the target.
+/// winit resolves links before Robin sees a path, so a dropped symlink
+/// copies its target. Items already
+/// in `dest` (compared after canonicalizing it) and folders dropped into
+/// themselves are skipped.
+pub fn external_drop(paths: &[PathBuf], dest: &Path) -> ExternalDrop {
+    let real_dest = std::fs::canonicalize(dest).unwrap_or_else(|_| dest.to_path_buf());
+    let mut out = ExternalDrop::default();
+    let mut groups: Vec<(PathBuf, Vec<OsString>)> = Vec::new();
+    for path in paths {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            continue;
+        };
+        match groups.iter_mut().find(|(p, _)| p == parent) {
+            Some((_, names)) => {
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.to_os_string());
+                }
+            }
+            None => groups.push((parent.to_path_buf(), vec![name.to_os_string()])),
+        }
+    }
+    for (src, names) in groups {
+        let real_src = std::fs::canonicalize(&src).unwrap_or_else(|_| src.clone());
+        if real_src == real_dest || !drop_allowed(Op::Copy, &src, &names, dest) {
+            out.already_here += names.len();
+            continue;
+        }
+        out.jobs.push(Job::transfer(Op::Copy, &src, names, dest));
+    }
+    out
+}
+
 pub fn drop_allowed(op: Op, src: &Path, names: &[OsString], dest: &Path) -> bool {
     drop_check(op, src, names, dest) == DropCheck::Ok
 }
@@ -1215,5 +1264,45 @@ mod tests {
         assert_eq!(fs::read(root.join("a")).unwrap(), b"a");
         assert!(back.toast(JobKind::Restore).text.starts_with("Restored"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn outside_drops_group_by_folder_and_skip_what_is_already_here() {
+        let root = std::env::temp_dir().join(format!("robin-xdrop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (a, b, dest) = (root.join("a"), root.join("b"), root.join("dest"));
+        for d in [&a, &b, &dest, &dest.join("sub")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let paths = vec![
+            a.join("1.jpg"),
+            b.join("2.jpg"),
+            a.join("3.jpg"),
+            a.join("1.jpg"),
+            dest.join("here.txt"),
+            PathBuf::from("/"),
+        ];
+        let jobs = external_drop(&paths, &dest).jobs;
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].src, a);
+        assert_eq!(jobs[0].names, ["1.jpg", "3.jpg"]);
+        assert_eq!(jobs[1].src, b);
+        assert_eq!(jobs[1].names, ["2.jpg"]);
+        assert!(
+            jobs.iter()
+                .all(|j| j.dest == dest && j.kind == JobKind::Copy),
+            "outside drops copy even on the same filesystem"
+        );
+        assert!(
+            external_drop(std::slice::from_ref(&root), &dest.join("sub"))
+                .jobs
+                .is_empty()
+        );
+        // The same folder through a symlinked path is still "already here".
+        std::os::unix::fs::symlink(&dest, root.join("dest-link")).unwrap();
+        let via_link = external_drop(&[dest.join("here.txt")], &root.join("dest-link"));
+        assert!(via_link.jobs.is_empty());
+        assert_eq!(via_link.already_here, 1);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

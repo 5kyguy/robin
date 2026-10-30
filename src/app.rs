@@ -17,7 +17,7 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use crate::fsops::{
     self, Cancel, Conflict, ConflictChoice, ConflictKind, ConflictPrompt, KeptEntry, TrashChoice,
 };
-use crate::model::{Listing, Nav};
+use crate::model::{Listing, Nav, SortDir, SortKey};
 use crate::ops::{self, Clipboard, Env, Job, JobKind, Mods, Op, Outcome, Progress, Trashed};
 use crate::safety::DirFd;
 use crate::{AppWindow, Error, Result, Row};
@@ -113,6 +113,52 @@ pub struct Drag {
     pub refused: Option<usize>,
 }
 
+/// One read of a folder: its entries and each subfolder's item count.
+/// Built off the UI thread for live refresh.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    pub entries: Vec<crate::model::Entry>,
+    pub counts: std::collections::HashMap<OsString, usize>,
+}
+
+impl Snapshot {
+    pub fn read(dir: &Path) -> Result<Self> {
+        let fd = DirFd::open(dir)?;
+        let entries: Vec<crate::model::Entry> = fd
+            .list()?
+            .into_iter()
+            .map(crate::model::Entry::from_dirent)
+            .collect();
+        let counts = subfolder_counts(&fd, &entries, |a, b| device(a) == device(b));
+        Ok(Self { entries, counts })
+    }
+}
+
+fn device(fd: &DirFd) -> Option<u64> {
+    rustix::fs::fstat(fd.as_fd()).ok().map(|st| st.st_dev)
+}
+
+/// Item counts for the subfolders in `entries`. Each is opened without
+/// following links, and one on another device than `parent` (a mount
+/// point, which may be slow or asleep) is left uncounted, so blank.
+fn subfolder_counts(
+    parent: &DirFd,
+    entries: &[crate::model::Entry],
+    same_device: impl Fn(&DirFd, &DirFd) -> bool,
+) -> std::collections::HashMap<OsString, usize> {
+    entries
+        .iter()
+        .filter(|e| e.is_dir)
+        .filter_map(|e| {
+            let child = parent.open_dir_nofollow(&e.name).ok()?;
+            if !same_device(parent, &child) {
+                return None;
+            }
+            Some((e.name.clone(), child.list().ok()?.len()))
+        })
+        .collect()
+}
+
 pub struct Controller {
     pub dir: PathBuf,
     pub listing: Listing,
@@ -124,6 +170,11 @@ pub struct Controller {
     pub drag: Option<Drag>,
     pressed: Option<usize>,
     pub job_running: bool,
+    /// A fixed (now, UTC offset) for tests and renders; the system clock
+    /// and zone otherwise.
+    pub clock: Option<(i64, i64)>,
+    /// Item counts of the folders in the open folder, taken on each reread.
+    pub counts: std::collections::HashMap<OsString, usize>,
 }
 
 pub mod keys {
@@ -160,12 +211,57 @@ impl Controller {
             drag: None,
             pressed: None,
             job_running: false,
+            clock: None,
+            counts: Default::default(),
         }
     }
 
+    /// Reread after an outside change. Only when the folder itself is
+    /// gone (ENOENT/ENOTDIR) fall back to the nearest ancestor that still
+    /// exists; any other error keeps the folder and is returned.
+    pub fn refresh(&mut self) -> Result<()> {
+        match self.reload() {
+            Err(e) if e.is_gone() => self.fall_back(),
+            other => other,
+        }
+    }
+
+    fn fall_back(&mut self) -> Result<()> {
+        let mut dir = self.dir.clone();
+        while dir.pop() {
+            if let Ok(snap) = Snapshot::read(&dir) {
+                let (key, order) = self.listing.sort();
+                self.dir = dir;
+                self.listing = Listing::default();
+                self.listing.set_sort(key, order);
+                self.apply_snapshot(snap);
+                return Ok(());
+            }
+        }
+        self.reload()
+    }
+
+    /// Apply a reread folder, or a gone/error result, as `refresh` would.
+    pub fn apply_read(&mut self, read: Result<Snapshot>) -> Result<()> {
+        match read {
+            Ok(snap) => {
+                self.apply_snapshot(snap);
+                Ok(())
+            }
+            Err(e) if e.is_gone() => self.fall_back(),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn apply_snapshot(&mut self, snap: Snapshot) {
+        self.listing.set_entries(snap.entries);
+        self.counts = snap.counts;
+    }
+
     pub fn reload(&mut self) -> Result<()> {
-        let fd = DirFd::open(&self.dir)?;
-        self.listing.replace_dir(&fd)
+        let snap = Snapshot::read(&self.dir)?;
+        self.apply_snapshot(snap);
+        Ok(())
     }
 
     fn names(&self) -> Vec<OsString> {
@@ -452,7 +548,39 @@ impl Controller {
         })
     }
 
+    /// A column header click: 0 Name, 1 Size, 2 Type, 3 Modified.
+    pub fn sort_by(&mut self, column: i32) -> Action {
+        let key = match column {
+            0 => SortKey::Name,
+            1 => SortKey::Size,
+            2 => SortKey::Type,
+            3 => SortKey::Date,
+            _ => return Action::None,
+        };
+        self.listing.toggle_sort(key);
+        Action::Redraw
+    }
+
+    /// (column, descending) for the header arrow.
+    pub fn sort_header(&self) -> (i32, bool) {
+        let (key, dir) = self.listing.sort();
+        let column = match key {
+            SortKey::Name => 0,
+            SortKey::Size => 1,
+            SortKey::Type => 2,
+            SortKey::Date => 3,
+        };
+        (column, dir == SortDir::Desc)
+    }
+
     pub fn rows(&self) -> Vec<Row> {
+        let now = self
+            .clock
+            .map_or_else(|| secs(std::time::SystemTime::now()), |c| c.0);
+        let offset = |t| {
+            self.clock
+                .map_or_else(|| crate::model::local_offset(t), |c| c.1)
+        };
         let target = self.drag.as_ref().and_then(|d| d.target);
         let refused = self.drag.as_ref().and_then(|d| d.refused);
         self.listing
@@ -460,25 +588,20 @@ impl Controller {
             .iter()
             .enumerate()
             .map(|(i, e)| Row {
-                glyph: if e.is_dir { "󰉋" } else { "󰈔" }.into(),
+                glyph: file_icon(e.is_dir, &e.extension()).0.into(),
                 name: e.name.to_string_lossy().as_ref().into(),
-                size: if e.is_dir {
-                    String::new()
-                } else {
-                    human(e.len)
-                }
-                .into(),
+                size: size_line(e.is_dir, e.len, self.counts.get(&e.name).copied()).into(),
                 kind: if e.is_dir {
                     "Folder".into()
                 } else {
-                    e.extension().to_uppercase()
+                    kind_name(&e.extension())
                 }
                 .into(),
-                modified: SharedString::new(),
+                modified: crate::model::format_modified(secs(e.mtime), now, offset).into(),
                 selected: self.listing.selection().contains(&e.name),
                 hovered: false,
                 hidden: e.is_hidden(),
-                role: i32::from(e.is_dir),
+                role: file_icon(e.is_dir, &e.extension()).1,
                 badge: SharedString::new(),
                 cut: self.clip.is_cut(&self.dir, &e.name),
                 drop: target == Some(i),
@@ -563,6 +686,13 @@ pub fn refusal_view(refused: &[(OsString, Vec<KeptEntry>)]) -> RefusalView {
     }
 }
 
+fn secs(t: std::time::SystemTime) -> i64 {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    }
+}
+
 fn human(n: u64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB"];
     let mut v = n as f64;
@@ -614,6 +744,21 @@ struct State {
     toast_all: Vec<String>,
     toast_pinned: bool,
     arm_timer: slint::Timer,
+    /// Live refresh: the watch on `ctl.dir`, its debounce and poll timer.
+    watch: Option<crate::watch::Watch>,
+    /// Set while the open folder can't be watched.
+    fallback: Option<crate::watch::Fallback>,
+    debounce: crate::model::Debounce,
+    watch_timer: slint::Timer,
+    /// A reread running off the UI thread: the folder and its result.
+    reading: Option<(PathBuf, mpsc::Receiver<Result<Snapshot>>)>,
+    /// The last reread error shown, so it isn't repeated every tick.
+    read_error: Option<String>,
+    /// Paths another app dropped on the window, each with the folder that
+    /// was open when it arrived.
+    dropped: Rc<RefCell<Vec<(PathBuf, PathBuf)>>>,
+    /// The open folder as the drop handler sees it.
+    drop_dest: Rc<RefCell<PathBuf>>,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -639,9 +784,48 @@ pub fn run(dir: PathBuf) -> Result<i32> {
         toast_all: Vec::new(),
         toast_pinned: false,
         arm_timer: slint::Timer::default(),
+        watch: None,
+        fallback: None,
+        debounce: debounce(),
+        watch_timer: slint::Timer::default(),
+        reading: None,
+        read_error: None,
+        dropped: Rc::default(),
+        drop_dest: Rc::default(),
     }));
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
     redraw(&ui, &state.borrow());
+    {
+        // Inbound drops from other apps. winit reports one DroppedFile per
+        // path (X11 only in winit 0.30) and no pointer position, so they
+        // land in the open folder.
+        use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
+        let dropped = state.borrow().dropped.clone();
+        let dest = state.borrow().drop_dest.clone();
+        ui.window()
+            .on_winit_window_event(move |_, event| match event {
+                WindowEvent::DroppedFile(path) => {
+                    // Freeze the destination now: a navigation before the
+                    // batch is flushed must not redirect it.
+                    dropped
+                        .borrow_mut()
+                        .push((path.clone(), dest.borrow().clone()));
+                    EventResult::PreventDefault
+                }
+                _ => EventResult::Propagate,
+            });
+    }
+    let w = ui.as_weak();
+    let st = state.clone();
+    state.borrow().watch_timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(100),
+        move || {
+            if let Some(ui) = w.upgrade() {
+                poll_watch(&ui, &st);
+            }
+        },
+    );
 
     let w = ui.as_weak();
     let st = state.clone();
@@ -676,6 +860,14 @@ pub fn run(dir: PathBuf) -> Result<i32> {
         };
         if let (Some(ui), Some(t)) = (w.upgrade(), target) {
             apply(&ui, &st, Action::Navigate(t));
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_sort_by(move |column| {
+        let action = st.borrow_mut().ctl.sort_by(column);
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
         }
     });
     let w = ui.as_weak();
@@ -728,9 +920,217 @@ pub fn run(dir: PathBuf) -> Result<i32> {
     Ok(0)
 }
 
+const WATCH_DEBOUNCE_MS: u64 = 200;
+/// A folder that never goes quiet still refreshes this often.
+const WATCH_MAX_WAIT_MS: u64 = 1500;
+
+fn debounce() -> crate::model::Debounce {
+    crate::model::Debounce::new(Duration::from_millis(WATCH_DEBOUNCE_MS))
+        .max_wait(Duration::from_millis(WATCH_MAX_WAIT_MS))
+}
+
+/// Dropped paths waiting for a dialog to close, grouped into jobs per
+/// destination frozen at drop time.
+fn flush_drops(ui: &AppWindow, st: &Shared) {
+    if st.borrow().ctl.dialog.is_some() {
+        return; // keep them queued until the dialog closes
+    }
+    let dropped = std::mem::take(&mut *st.borrow().dropped.borrow_mut());
+    if dropped.is_empty() {
+        return;
+    }
+    let mut by_dest: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+    for (path, dest) in dropped {
+        match by_dest.iter_mut().find(|(d, _)| *d == dest) {
+            Some((_, paths)) => paths.push(path),
+            None => by_dest.push((dest, vec![path])),
+        }
+    }
+    let (mut here, mut jobs) = (0, 0);
+    for (dest, paths) in by_dest {
+        let plan = ops::external_drop(&paths, &dest);
+        here += plan.already_here;
+        jobs += plan.jobs.len();
+        for job in plan.jobs {
+            apply(ui, st, Action::Run(job)); // queued behind a running job
+        }
+    }
+    if let Some((text, details)) = drop_notice(jobs, here) {
+        show_toast(ui, st, "", text, details, false, "");
+    }
+}
+
+/// The neutral notice after a drop that copied nothing because
+/// everything was already in the folder.
+pub fn drop_notice(jobs: usize, here: usize) -> Option<(String, Vec<String>)> {
+    (jobs == 0 && here > 0).then(|| {
+        (
+            "Nothing to copy".into(),
+            vec![format!("{} already in this folder", ops::count(here))],
+        )
+    })
+}
+
+/// The toast's leading glyph: warning, error, info, or a check for a
+/// finished action.
+pub fn toast_glyph(tone: &str) -> &'static str {
+    match tone {
+        "warning" => "󰀦",
+        "danger" => "󰅙",
+        "info" => "󰋽",
+        _ => "󰄬",
+    }
+}
+
+/// The one-time neutral notice for a folder without a live watch.
+pub fn watch_fallback_notice(dir: &Path) -> (String, Vec<String>) {
+    (
+        "Live refresh is unavailable here".into(),
+        vec![format!(
+            "{} can't be watched; checking it every {} s instead.",
+            dir.display(),
+            crate::watch::SLOW_POLL.as_secs()
+        )],
+    )
+}
+
+/// Follow the open folder and reread it, off the UI thread, once outside
+/// changes settle, keeping the selection (by name) and the scroll offset.
+fn poll_watch(ui: &AppWindow, st: &Shared) {
+    flush_drops(ui, st);
+    let now = std::time::Instant::now();
+    let warn = arm_watch(st, now);
+    if let Some(dir) = warn {
+        show_toast(
+            ui,
+            st,
+            "info",
+            watch_fallback_notice(&dir).0,
+            watch_fallback_notice(&dir).1,
+            false,
+            "",
+        );
+    }
+    let mut s = st.borrow_mut();
+    let s = &mut *s;
+    if let Some(w) = &s.watch {
+        if w.pending() {
+            s.debounce.push(now);
+        }
+    } else if let Some(f) = &mut s.fallback {
+        if f.poll_due(now) {
+            s.debounce.push(now);
+        }
+    }
+    if let Some((dir, rx)) = &s.reading {
+        let Ok(read) = rx.try_recv() else {
+            return; // still reading
+        };
+        let dir = dir.clone();
+        s.reading = None;
+        if dir != s.ctl.dir {
+            return; // navigated away meanwhile
+        }
+        let unchanged = matches!(&read, Ok(snap) if snap.entries == s.ctl.listing.entries()
+            && snap.counts == s.ctl.counts);
+        if unchanged {
+            return;
+        }
+        match s.ctl.apply_read(read) {
+            Ok(()) => s.read_error = None,
+            Err(e) => {
+                let text = e.to_string();
+                if s.read_error.as_deref() != Some(text.as_str()) {
+                    s.read_error = Some(text.clone());
+                    let st = st.clone();
+                    let ui = ui.as_weak();
+                    slint::Timer::single_shot(Duration::ZERO, move || {
+                        if let Some(ui) = ui.upgrade() {
+                            show_toast(&ui, &st, "danger", text, Vec::new(), false, "");
+                        }
+                    });
+                }
+                return;
+            }
+        }
+        let (list_y, grid_y) = (ui.get_list_scroll(), ui.get_grid_scroll());
+        redraw(ui, s);
+        if s.ctl.dir == dir {
+            ui.set_list_scroll(list_y);
+            ui.set_grid_scroll(grid_y);
+        } else {
+            ui.set_list_scroll(0.0);
+            ui.set_grid_scroll(0.0);
+        }
+        return;
+    }
+    if s.debounce.ready(now) {
+        let dir = s.ctl.dir.clone();
+        let (tx, rx) = mpsc::channel();
+        let path = dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Snapshot::read(&path));
+        });
+        s.reading = Some((dir, rx));
+    }
+}
+
+/// Keep a watch on the open folder: re-arm after navigation or when the
+/// folder was replaced, back off when it can't be watched. Returns the
+/// folder to warn about the first time its watch fails.
+fn arm_watch(st: &Shared, now: std::time::Instant) -> Option<PathBuf> {
+    let mut s = st.borrow_mut();
+    let s = &mut *s;
+    let dir = s.ctl.dir.clone();
+    if s.watch
+        .as_ref()
+        .is_some_and(|w| w.dir() == dir && !w.stale())
+    {
+        return None;
+    }
+    if s.watch
+        .as_ref()
+        .is_some_and(|w| w.dir() == dir && w.stale())
+    {
+        // Deleted, renamed or replaced: reread whatever is there now.
+        s.debounce.push(now);
+    } else if s.fallback.as_ref().map(|f| f.dir()) != Some(dir.as_path()) {
+        s.debounce = debounce();
+        s.fallback = None;
+        s.read_error = None;
+    }
+    s.watch = None;
+    if s.fallback.as_ref().is_some_and(|f| !f.may_retry(now)) {
+        return None;
+    }
+    match crate::watch::Watch::new(&dir) {
+        Ok(w) => {
+            s.watch = Some(w);
+            s.fallback = None;
+            None
+        }
+        Err(_) => {
+            let f = match &mut s.fallback {
+                Some(f) => {
+                    f.failed_again(now);
+                    f
+                }
+                None => s.fallback.insert(crate::watch::Fallback::new(&dir, now)),
+            };
+            f.take_warning().then_some(dir)
+        }
+    }
+}
+
 fn redraw(ui: &AppWindow, s: &State) {
     let ctl = &s.ctl;
+    if *s.drop_dest.borrow() != ctl.dir {
+        *s.drop_dest.borrow_mut() = ctl.dir.clone();
+    }
     ui.set_files(ModelRc::new(Rc::new(VecModel::from(ctl.rows()))));
+    let (column, desc) = ctl.sort_header();
+    ui.set_sort_column(column);
+    ui.set_sort_desc(desc);
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let crumbs: Vec<String> = crate::model::breadcrumbs(&ctl.dir, home.as_deref())
         .iter()
@@ -806,7 +1206,9 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
         Action::Navigate(dir) => {
             let mut s = st.borrow_mut();
             let old = std::mem::replace(&mut s.ctl.dir, dir);
+            let (key, order) = s.ctl.listing.sort();
             s.ctl.listing = Listing::default();
+            s.ctl.listing.set_sort(key, order);
             if let Err(e) = s.ctl.reload() {
                 s.ctl.dir = old;
                 let _ = s.ctl.reload();
@@ -815,6 +1217,8 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
                 return;
             }
             redraw(ui, &s);
+            ui.set_list_scroll(0.0);
+            ui.set_grid_scroll(0.0);
         }
         Action::Answer(choice) => {
             if let Some(tx) = st.borrow_mut().reply.take() {
@@ -996,6 +1400,60 @@ pub fn conflict_props(ui: &AppWindow, ask: &ConflictAsk, apply_all: bool) {
 
 /// A conflict side's size line: a file's size, or a folder's item count
 /// as the list view shows it.
+/// Thunar-style type names for the Type column; unknown extensions read
+/// as "XYZ file" and files without one as "File".
+/// The glyph and colour role for a row. Roles: 0 ink, 1 accent (cyan),
+/// 2 danger (red), 3 warning (amber), 4 muted, as in `ui/app.slint`.
+pub fn file_icon(is_dir: bool, ext: &str) -> (&'static str, i32) {
+    if is_dir {
+        return ("󰉋", 1);
+    }
+    match ext.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "heif" | "svg" | "tif" | "tiff"
+        | "raw" | "cr2" | "cr3" | "nef" | "arw" | "dng" => ("󰈟", 0),
+        "mp4" | "m4v" | "mkv" | "webm" | "mov" | "avi" => ("󰕧", 1),
+        "mp3" | "flac" | "ogg" | "opus" | "wav" | "m4a" => ("󰎆", 1),
+        "pdf" => ("󰈦", 2),
+        "zip" | "tar" | "gz" | "zst" | "xz" | "bz2" | "7z" | "rar" => ("󰗄", 3),
+        "toml" | "json" | "yaml" | "yml" | "ini" | "conf" => ("\u{e6b2}", 1),
+        "md" | "txt" => ("\u{f0354}", 0),
+        _ => ("󰈔", 4),
+    }
+}
+
+pub fn kind_name(ext: &str) -> String {
+    let ext = ext.to_ascii_lowercase();
+    let known = match ext.as_str() {
+        "jpg" | "jpeg" => "JPEG image",
+        "png" => "PNG image",
+        "gif" => "GIF image",
+        "webp" => "WebP image",
+        "heic" | "heif" => "HEIC image",
+        "svg" => "SVG image",
+        "tif" | "tiff" => "TIFF image",
+        "raw" | "cr2" | "nef" | "arw" | "dng" => "Raw image",
+        "mp4" | "m4v" => "MPEG-4 video",
+        "mkv" => "Matroska video",
+        "webm" => "WebM video",
+        "mov" => "QuickTime video",
+        "mp3" => "MP3 audio",
+        "flac" => "FLAC audio",
+        "ogg" | "opus" => "Ogg audio",
+        "wav" => "WAV audio",
+        "md" => "Markdown",
+        "txt" => "Plain text",
+        "toml" => "TOML",
+        "json" => "JSON",
+        "pdf" => "PDF document",
+        "zip" | "tar" | "gz" | "xz" | "zst" | "7z" => "Archive",
+        "rs" => "Rust source",
+        "sh" => "Shell script",
+        "" => "File",
+        _ => return format!("{} file", ext.to_uppercase()),
+    };
+    known.to_string()
+}
+
 pub fn size_line(dir: bool, size: u64, items: Option<usize>) -> String {
     match (dir, items) {
         (false, _) => human(size),
@@ -1145,6 +1603,7 @@ fn show_toast(
         s.toast_gen
     };
     ui.set_toast_tone(tone.into());
+    ui.set_toast_glyph(toast_glyph(tone).into());
     ui.set_toast_text(text.into());
     set_toast_rows(ui, &detail_rows(&details, pinned, false));
     ui.set_toast_action(action.into());
@@ -1748,5 +2207,217 @@ mod tests {
         assert_eq!(c.drag_label().unwrap().0, "Can't drop into itself");
         let row = &c.rows()[i];
         assert!(row.drop_refused && !row.drop);
+    }
+
+    #[test]
+    fn header_clicks_sort_and_reverse_with_folders_first() {
+        let mut c = setup("sort-header");
+        fs::write(c.dir.join("c.jpg"), b"ccccc").unwrap();
+        c.reload().unwrap();
+        let names = |c: &Controller| -> Vec<String> {
+            c.rows().iter().map(|r| r.name.to_string()).collect()
+        };
+        assert_eq!(c.sort_header(), (0, false));
+        assert_eq!(c.sort_by(1), Action::Redraw);
+        assert_eq!(c.sort_header(), (1, false));
+        assert_eq!(names(&c), ["raw-exports", "a.jpg", "b.jpg", "c.jpg"]);
+        c.sort_by(1);
+        assert_eq!(c.sort_header(), (1, true));
+        assert_eq!(names(&c), ["raw-exports", "c.jpg", "b.jpg", "a.jpg"]);
+        c.sort_by(0);
+        assert_eq!(c.sort_header(), (0, false));
+        c.sort_by(0);
+        assert_eq!(names(&c), ["raw-exports", "c.jpg", "b.jpg", "a.jpg"]);
+        assert_eq!(c.sort_by(9), Action::None);
+    }
+
+    #[test]
+    fn modified_column_is_filled_like_thunar() {
+        let mut c = setup("modified");
+        let now = secs(std::time::SystemTime::now());
+        let old = fs::File::options()
+            .write(true)
+            .open(c.dir.join("b.jpg"))
+            .unwrap();
+        old.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+            .unwrap();
+        c.clock = Some((now, 0));
+        c.reload().unwrap();
+        let rows = c.rows();
+        let get = |n: &str| {
+            rows.iter()
+                .find(|r| r.name == n)
+                .unwrap()
+                .modified
+                .to_string()
+        };
+        assert_eq!(get("b.jpg"), "2023-11-14");
+        let today = get("a.jpg");
+        assert_eq!(today.len(), 5, "{today}");
+        assert_eq!(&today[2..3], ":");
+    }
+
+    #[test]
+    fn refresh_picks_up_outside_changes_and_keeps_the_selection() {
+        let mut c = setup("refresh");
+        c.listing.select_only("b.jpg".into());
+        fs::write(c.dir.join("new.jpg"), b"n").unwrap();
+        fs::remove_file(c.dir.join("a.jpg")).unwrap();
+        c.refresh().unwrap();
+        let names: Vec<String> = c.rows().iter().map(|r| r.name.to_string()).collect();
+        assert_eq!(names, ["raw-exports", "b.jpg", "new.jpg"]);
+        let selected: Vec<String> = c
+            .rows()
+            .iter()
+            .filter(|r| r.selected)
+            .map(|r| r.name.to_string())
+            .collect();
+        assert_eq!(selected, ["b.jpg"]);
+        fs::remove_file(c.dir.join("b.jpg")).unwrap();
+        c.refresh().unwrap();
+        assert!(c.listing.selection().is_empty());
+    }
+
+    #[test]
+    fn refresh_falls_back_to_the_parent_when_the_folder_goes_away() {
+        let mut c = setup("refresh-gone");
+        c.sort_by(1);
+        let gone = c.dir.join("raw-exports");
+        c.dir = gone.clone();
+        c.reload().unwrap();
+        fs::remove_dir(&gone).unwrap();
+        c.refresh().unwrap();
+        assert_eq!(c.dir, gone.parent().unwrap());
+        assert_eq!(c.sort_header(), (1, false), "sort survives the fallback");
+    }
+
+    #[test]
+    fn file_types_get_distinct_glyphs_and_colours() {
+        let pdf = file_icon(false, "pdf");
+        let zst = file_icon(false, "ZST");
+        let mp4 = file_icon(false, "mp4");
+        let flac = file_icon(false, "flac");
+        let jpg = file_icon(false, "jpg");
+        let other = file_icon(false, "xcf");
+        assert_eq!(pdf.1, 2, "pdf is red");
+        assert_eq!(zst.1, 3, "archives are amber");
+        assert_eq!((mp4.1, flac.1), (1, 1), "video and audio are cyan");
+        assert_eq!(other.1, 4, "unknown is muted");
+        assert_eq!(file_icon(true, ""), ("󰉋", 1));
+        let glyphs = [pdf.0, zst.0, mp4.0, flac.0, jpg.0, other.0];
+        for (i, g) in glyphs.iter().enumerate() {
+            assert!(!glyphs[i + 1..].contains(g), "{g} reused");
+        }
+        let mut c = setup("icons");
+        fs::write(c.dir.join("m.pdf"), b"%").unwrap();
+        c.reload().unwrap();
+        let row = c.rows().into_iter().find(|r| r.name == "m.pdf").unwrap();
+        assert_eq!((row.glyph.as_str(), row.role), pdf, "rows use the map");
+    }
+
+    #[test]
+    fn counts_skip_other_devices_and_links() {
+        let c = setup("count-dev");
+        let dir = c.dir.clone();
+        fs::create_dir(dir.join("mnt")).unwrap();
+        fs::write(dir.join("mnt/x"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.join("raw-exports"), dir.join("link")).unwrap();
+        let fd = DirFd::open(&dir).unwrap();
+        let entries: Vec<_> = fd
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(crate::model::Entry::from_dirent)
+            .collect();
+        let key = |n: &str| OsString::from(n);
+        let all = subfolder_counts(&fd, &entries, |_, _| true);
+        assert_eq!(all.get(&key("mnt")), Some(&1));
+        assert!(!all.contains_key(&key("link")), "links aren't followed");
+        // A dev-mismatch seam: pretend "mnt" is a mount point.
+        let mnt_ino = rustix::fs::fstat(fd.open_dir_nofollow("mnt".as_ref()).unwrap().as_fd())
+            .unwrap()
+            .st_ino;
+        let split = subfolder_counts(&fd, &entries, |_, child| {
+            rustix::fs::fstat(child.as_fd()).unwrap().st_ino != mnt_ino
+        });
+        assert!(!split.contains_key(&key("mnt")), "other device stays blank");
+        assert_eq!(split.get(&key("raw-exports")), Some(&0));
+    }
+
+    #[test]
+    fn the_watch_notice_uses_the_info_glyph_not_the_check() {
+        assert_eq!(toast_glyph("info"), "󰋽");
+        assert_eq!(toast_glyph(""), "󰄬");
+        let glyphs = ["", "info", "warning", "danger"].map(toast_glyph);
+        for (i, g) in glyphs.iter().enumerate() {
+            assert!(!glyphs[i + 1..].contains(g));
+        }
+    }
+
+    #[test]
+    fn a_drop_onto_its_own_folder_says_nothing_was_copied() {
+        assert_eq!(drop_notice(2, 0), None);
+        assert_eq!(drop_notice(2, 1), None, "partial skips stay quiet");
+        assert_eq!(drop_notice(0, 3).unwrap().0, "Nothing to copy");
+    }
+
+    #[test]
+    fn a_reread_error_other_than_gone_keeps_the_folder() {
+        let mut c = setup("refresh-error");
+        let dir = c.dir.clone();
+        let denied = Error::io(&dir, std::io::Error::from_raw_os_error(libc::EACCES));
+        assert!(!denied.is_gone());
+        assert!(c.apply_read(Err(denied)).is_err());
+        assert_eq!(c.dir, dir, "no jump to the parent on EACCES");
+        assert!(!c.listing.entries().is_empty(), "old listing kept");
+        let gone = Error::io(&dir, std::io::Error::from_raw_os_error(libc::ENOTDIR));
+        assert!(gone.is_gone());
+        assert!(Error::io(&dir, std::io::Error::from_raw_os_error(libc::ENOENT)).is_gone());
+    }
+
+    /// `cargo test --release -- --ignored --nocapture big_folder`
+    #[test]
+    #[ignore]
+    fn big_folder_reread_timing() {
+        let c = setup("big");
+        for i in 0..100_000 {
+            fs::write(c.dir.join(format!("f{i:06}.jpg")), b"").unwrap();
+        }
+        let mut c = c;
+        let t = std::time::Instant::now();
+        let snap = Snapshot::read(&c.dir).unwrap();
+        let read = t.elapsed();
+        let t = std::time::Instant::now();
+        c.apply_snapshot(snap);
+        let apply = t.elapsed();
+        let t = std::time::Instant::now();
+        let rows = c.rows();
+        let rows_t = t.elapsed();
+        eprintln!(
+            "100k: read+stat (worker) {read:?}, sort/apply (UI) {apply:?}, rows (UI) {rows_t:?}, {} rows",
+            rows.len()
+        );
+        fs::remove_dir_all(c.dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn folders_show_item_counts_and_files_a_type_name() {
+        let mut c = setup("counts");
+        for n in ["1.raw", "2.raw", ".hidden"] {
+            fs::write(c.dir.join("raw-exports").join(n), b"x").unwrap();
+        }
+        fs::write(c.dir.join("notes.md"), b"#").unwrap();
+        fs::write(c.dir.join("blob.xyz"), b"?").unwrap();
+        c.reload().unwrap();
+        let rows = c.rows();
+        let get = |n: &str| rows.iter().find(|r| r.name == n).unwrap().clone();
+        assert_eq!(get("raw-exports").size, "3 items");
+        assert_eq!(get("raw-exports").kind, "Folder");
+        assert_eq!(get("a.jpg").kind, "JPEG image");
+        assert_eq!(get("notes.md").kind, "Markdown");
+        assert_eq!(get("blob.xyz").kind, "XYZ file");
+        fs::write(c.dir.join("raw-exports/3.raw"), b"x").unwrap();
+        c.refresh().unwrap();
+        assert_eq!(c.rows()[0].size, "4 items", "counts are retaken on refresh");
     }
 }

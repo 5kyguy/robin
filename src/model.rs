@@ -127,6 +127,21 @@ impl Listing {
         self.sort_dir = dir;
     }
 
+    pub fn sort(&self) -> (SortKey, SortDir) {
+        (self.sort_key, self.sort_dir)
+    }
+
+    /// A header click: the sorted column flips direction, another column
+    /// starts ascending, as Thunar does.
+    pub fn toggle_sort(&mut self, key: SortKey) {
+        self.sort_dir = if self.sort_key == key && self.sort_dir == SortDir::Asc {
+            SortDir::Desc
+        } else {
+            SortDir::Asc
+        };
+        self.sort_key = key;
+    }
+
     pub fn set_show_hidden(&mut self, show: bool) {
         self.show_hidden = show;
     }
@@ -160,6 +175,11 @@ impl Listing {
             .iter()
             .filter(|entry| entry.is_hidden())
             .count()
+    }
+
+    /// Everything read from the folder, hidden or filtered or not.
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
     }
 
     pub fn selection(&self) -> &BTreeSet<OsString> {
@@ -270,10 +290,91 @@ fn cmp_entries(
 }
 
 fn cmp_name(a: &Entry, b: &Entry) -> std::cmp::Ordering {
-    a.name
-        .to_string_lossy()
-        .to_lowercase()
-        .cmp(&b.name.to_string_lossy().to_lowercase())
+    natural_cmp(&a.name.to_string_lossy(), &b.name.to_string_lossy())
+        .then_with(|| a.name.cmp(&b.name))
+}
+
+/// Case-insensitive, with digit runs compared by value, so "img2"
+/// sorts before "img10".
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (x.peek().copied(), y.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(c), Some(d)) if c.is_ascii_digit() && d.is_ascii_digit() => {
+                let take = |it: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut run = String::new();
+                    while let Some(c) = it.peek().copied().filter(char::is_ascii_digit) {
+                        run.push(c);
+                        it.next();
+                    }
+                    run
+                };
+                let (m, n) = (take(&mut x), take(&mut y));
+                let (mt, nt) = (m.trim_start_matches('0'), n.trim_start_matches('0'));
+                let by_value = mt.len().cmp(&nt.len()).then_with(|| mt.cmp(nt));
+                // Equal values: fewer leading zeros first, so the order is total.
+                let ord = by_value.then_with(|| m.len().cmp(&n.len()));
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            (Some(c), Some(d)) => {
+                if c != d {
+                    return c.cmp(&d);
+                }
+                x.next();
+                y.next();
+            }
+        }
+    }
+}
+
+/// The Modified column, like Thunar: the time for today, the date for
+/// anything older or in the future (even later today). Missing or
+/// pre-1970 times (`mtime <= 0`) are blank. `offset` gives the local UTC
+/// offset in seconds at a Unix time.
+pub fn format_modified(mtime: i64, now: i64, offset: impl Fn(i64) -> i64) -> String {
+    if mtime <= 0 {
+        return String::new();
+    }
+    let local = mtime + offset(mtime);
+    let day = local.div_euclid(86_400);
+    if mtime <= now && day == (now + offset(now)).div_euclid(86_400) {
+        let secs = local.rem_euclid(86_400);
+        return format!("{:02}:{:02}", secs / 3600, secs % 3600 / 60);
+    }
+    let (y, m, d) = civil_from_days(day);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Days since 1970-01-01 to (year, month, day), proleptic Gregorian.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
+}
+
+/// The local UTC offset at a Unix time, from the C library's zone data.
+pub fn local_offset(t: i64) -> i64 {
+    let t = t as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: localtime_r only writes the tm we pass.
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return 0;
+    }
+    tm.tm_gmtoff
 }
 
 /// Subsequence match, case-insensitive. An empty query matches everything.
@@ -337,7 +438,11 @@ pub fn breadcrumbs(path: &Path, home: Option<&Path>) -> Vec<Crumb> {
 #[derive(Debug)]
 pub struct Debounce {
     delay: Duration,
+    /// Fire anyway this long after the first push of a burst, so a folder
+    /// that never goes quiet (a download, a build) still refreshes.
+    max_wait: Option<Duration>,
     dirty: bool,
+    first: Option<Instant>,
     last: Option<Instant>,
 }
 
@@ -345,13 +450,21 @@ impl Debounce {
     pub fn new(delay: Duration) -> Self {
         Self {
             delay,
+            max_wait: None,
             dirty: false,
+            first: None,
             last: None,
         }
     }
 
+    pub fn max_wait(mut self, max: Duration) -> Self {
+        self.max_wait = Some(max);
+        self
+    }
+
     pub fn push(&mut self, now: Instant) {
         self.dirty = true;
+        self.first.get_or_insert(now);
         self.last = Some(now);
     }
 
@@ -360,8 +473,14 @@ impl Debounce {
         let Some(last) = self.last else {
             return false;
         };
-        if self.dirty && now.saturating_duration_since(last) >= self.delay {
+        let quiet = now.saturating_duration_since(last) >= self.delay;
+        let overdue = match (self.first, self.max_wait) {
+            (Some(first), Some(max)) => now.saturating_duration_since(first) >= max,
+            _ => false,
+        };
+        if self.dirty && (quiet || overdue) {
             self.dirty = false;
+            self.first = None;
             self.last = None;
             true
         } else {
@@ -411,6 +530,61 @@ mod tests {
         assert_eq!(names(&listing)[0], "a-dir");
         let files: Vec<_> = names(&listing).into_iter().skip(1).collect();
         assert_eq!(files, ["b.txt", ".hidden", "c.txt"]);
+    }
+
+    #[test]
+    fn names_sort_naturally_and_headers_toggle() {
+        let mut listing = Listing::default();
+        listing.set_entries(vec![
+            entry("img10.png", false, 1, 3),
+            entry("IMG2.png", false, 5, 1),
+            entry("img1.png", false, 9, 2),
+            entry("zdir", true, 0, 0),
+            entry("Adir", true, 0, 9),
+        ]);
+        assert_eq!(
+            names(&listing),
+            ["Adir", "zdir", "img1.png", "IMG2.png", "img10.png"]
+        );
+        // Clicking Name again reverses it; folders stay first.
+        listing.toggle_sort(SortKey::Name);
+        assert_eq!(listing.sort(), (SortKey::Name, SortDir::Desc));
+        assert_eq!(
+            names(&listing),
+            ["zdir", "Adir", "img10.png", "IMG2.png", "img1.png"]
+        );
+        // Another column starts ascending.
+        listing.toggle_sort(SortKey::Size);
+        assert_eq!(listing.sort(), (SortKey::Size, SortDir::Asc));
+        assert_eq!(names(&listing)[2..], ["img10.png", "IMG2.png", "img1.png"]);
+        listing.toggle_sort(SortKey::Date);
+        assert_eq!(
+            names(&listing),
+            ["zdir", "Adir", "IMG2.png", "img1.png", "img10.png"]
+        );
+        listing.toggle_sort(SortKey::Date);
+        assert_eq!(names(&listing)[2..], ["img10.png", "img1.png", "IMG2.png"]);
+        assert_eq!(natural_cmp("a01", "a1"), std::cmp::Ordering::Greater);
+        assert_eq!(natural_cmp("a9", "a10"), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn modified_shows_the_time_today_and_the_date_before() {
+        // 2026-10-31 02:30 UTC; a +05:30 zone makes it 08:00 local.
+        let now = 1_793_413_800;
+        let ist = |_| 19_800;
+        assert_eq!(format_modified(now, now, ist), "08:00");
+        // 00:10 local today is still today.
+        assert_eq!(format_modified(now - 7 * 3600 - 50 * 60, now, ist), "00:10");
+        // 23:50 local yesterday shows its date.
+        assert_eq!(
+            format_modified(now - 8 * 3600 - 10 * 60, now, ist),
+            "2026-10-30"
+        );
+        // The same instant in UTC is still the 31st.
+        assert_eq!(format_modified(now - 2 * 3600, now, |_| 0), "00:30");
+        assert_eq!(format_modified(1, now, |_| 0), "1970-01-01");
+        assert_eq!(format_modified(951_782_400, now, |_| 0), "2000-02-29");
     }
 
     #[test]
@@ -500,5 +674,36 @@ mod tests {
         let listing = Listing::from_dir(&dir).unwrap();
         assert_eq!(names(&listing), ["sub", "note.txt"]);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn modified_is_blank_before_1970_and_a_date_when_later_today() {
+        let now = 1_793_413_800; // 08:00 at +05:30
+        let ist = |_| 19_800;
+        assert_eq!(format_modified(0, now, ist), "");
+        assert_eq!(format_modified(-86_400, now, ist), "");
+        assert_eq!(format_modified(now + 3_600, now, ist), "2026-10-31");
+        assert_eq!(format_modified(now - 60, now, ist), "07:59");
+    }
+
+    #[test]
+    fn debounce_fires_after_max_wait_even_if_events_keep_coming() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut d = Debounce::new(ms(200)).max_wait(ms(1500));
+        let mut fired = None;
+        for i in 0..40u64 {
+            let t = t0 + ms(i * 100);
+            d.push(t);
+            if d.ready(t) {
+                fired = Some(i * 100);
+                break;
+            }
+        }
+        assert_eq!(fired, Some(1500));
+        let mut quiet = Debounce::new(ms(200)).max_wait(ms(1500));
+        quiet.push(t0);
+        assert!(!quiet.ready(t0 + ms(100)));
+        assert!(quiet.ready(t0 + ms(200)));
     }
 }
