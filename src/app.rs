@@ -609,6 +609,10 @@ struct State {
     reply: Option<mpsc::Sender<Option<ConflictChoice>>>,
     toast_open: bool,
     toast_gen: u64,
+    /// Every detail line of the toast, its pinned flag, and whether the
+    /// "+N more" was expanded.
+    toast_all: Vec<String>,
+    toast_pinned: bool,
     arm_timer: slint::Timer,
 }
 
@@ -632,6 +636,8 @@ pub fn run(dir: PathBuf) -> Result<i32> {
         reply: None,
         toast_open: false,
         toast_gen: 0,
+        toast_all: Vec::new(),
+        toast_pinned: false,
         arm_timer: slint::Timer::default(),
     }));
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
@@ -689,9 +695,16 @@ pub fn run(dir: PathBuf) -> Result<i32> {
     });
     let w = ui.as_weak();
     let st = state.clone();
+    ui.on_toast_expand(move || {
+        let Some(ui) = w.upgrade() else { return };
+        let s = st.borrow();
+        set_toast_rows(&ui, &detail_rows(&s.toast_all, s.toast_pinned, true));
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
     ui.on_toast_link(move || {
         let Some(ui) = w.upgrade() else { return };
-        if ui.get_toast_details().row_count() > 0 {
+        if ui.get_toast_details().row_count() > 0 || !ui.get_toast_pin().is_empty() {
             let open = {
                 let mut s = st.borrow_mut();
                 s.toast_open = !s.toast_open;
@@ -798,7 +811,7 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
                 s.ctl.dir = old;
                 let _ = s.ctl.reload();
                 drop(s);
-                show_toast(ui, st, "danger", e.to_string(), Vec::new(), "");
+                show_toast(ui, st, "danger", e.to_string(), Vec::new(), false, "");
                 return;
             }
             redraw(ui, &s);
@@ -975,7 +988,8 @@ pub fn conflict_props(ui: &AppWindow, ask: &ConflictAsk, apply_all: bool) {
     } else {
         keep_both_name(&p.name)
     };
-    ui.set_conflict_hint(conflict_hint(&both, folders).into());
+    ui.set_conflict_hint(format!("Keep both saves it as {both}").into());
+    ui.set_conflict_note(cancel_note(folders).into());
     ui.set_conflict_apply_label(apply_label(p.kind, ask.left).into());
     ui.set_conflict_apply(apply_all);
 }
@@ -992,13 +1006,12 @@ pub fn size_line(dir: bool, size: u64, items: Option<usize>) -> String {
 
 /// Neither a Replace nor the overwrites inside a Merge are taken back by
 /// Cancel; the dialog says so where the choice is made.
-pub fn conflict_hint(both: &str, folders: bool) -> String {
-    let undo = if folders {
-        "Replaced files aren't restored on cancel"
+pub fn cancel_note(folders: bool) -> &'static str {
+    if folders {
+        "Replaced files aren't restored on cancel."
     } else {
-        "A replaced file isn't restored on cancel"
-    };
-    format!("Keep both: {both}. {undo}.")
+        "A replaced file isn't restored on cancel."
+    }
 }
 
 /// The apply-to-all toggle names the kind of clash it covers, since an
@@ -1082,6 +1095,7 @@ fn done(ui: &AppWindow, st: &Shared, job: Job, outcome: Outcome) {
             toast.tone,
             toast.text,
             toast.details,
+            toast.pinned,
             if toast.undo { "Undo" } else { "" },
         );
     }
@@ -1119,26 +1133,24 @@ fn show_toast(
     tone: &str,
     text: String,
     details: Vec<String>,
+    pinned: bool,
     action: &str,
 ) {
     let gen = {
         let mut s = st.borrow_mut();
         s.toast_gen += 1;
         s.toast_open = false;
+        s.toast_all = details.clone();
+        s.toast_pinned = pinned;
         s.toast_gen
     };
     ui.set_toast_tone(tone.into());
     ui.set_toast_text(text.into());
-    ui.set_toast_details(ModelRc::new(Rc::new(VecModel::from(
-        details
-            .into_iter()
-            .map(SharedString::from)
-            .collect::<Vec<_>>(),
-    ))));
+    set_toast_rows(ui, &detail_rows(&details, pinned, false));
     ui.set_toast_action(action.into());
     ui.set_toast_open(false);
     ui.set_toast_on(true);
-    let secs = if action.is_empty() && ui.get_toast_details().row_count() == 0 {
+    let secs = if action.is_empty() && st.borrow().toast_all.is_empty() {
         4
     } else {
         8
@@ -1154,6 +1166,50 @@ fn show_toast(
             }
         }
     });
+}
+
+/// Details shown before "+N more"; the pinned line doesn't count.
+pub const DETAILS_SHOWN: usize = 7;
+
+/// What the toast's Details list shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DetailRows {
+    /// Stays at the top, outside the scrolling list.
+    pub pin: String,
+    pub rows: Vec<String>,
+    /// Lines behind "+N more"; 0 once expanded or when all fit.
+    pub more: usize,
+    pub expanded: bool,
+}
+
+/// Collapsed, the list shows the pinned line, the first seven items and
+/// "+N more"; expanded, every item, scrolling past 240px.
+pub fn detail_rows(details: &[String], pinned: bool, expanded: bool) -> DetailRows {
+    let (pin, items) = match details.split_first() {
+        Some((first, rest)) if pinned => (first.clone(), rest),
+        _ => (String::new(), details),
+    };
+    // "+1 more" would take the same room as the line itself.
+    let cut = !expanded && items.len() > DETAILS_SHOWN + 1;
+    let shown = if cut { DETAILS_SHOWN } else { items.len() };
+    DetailRows {
+        pin,
+        rows: items[..shown].to_vec(),
+        more: items.len() - shown,
+        expanded: expanded && items.len() > DETAILS_SHOWN + 1,
+    }
+}
+
+pub fn set_toast_rows(ui: &AppWindow, d: &DetailRows) {
+    ui.set_toast_pin(d.pin.as_str().into());
+    ui.set_toast_more(d.more as i32);
+    ui.set_toast_expanded(d.expanded);
+    ui.set_toast_details(ModelRc::new(Rc::new(VecModel::from(
+        d.rows
+            .iter()
+            .map(|r| SharedString::from(r.as_str()))
+            .collect::<Vec<_>>(),
+    ))));
 }
 
 pub fn start_dir(arg: Option<&Path>) -> PathBuf {
@@ -1446,9 +1502,43 @@ mod tests {
         assert_eq!(size_line(true, 4096, None), "");
         assert_eq!(size_line(false, 6_200_000, None), human(6_200_000));
         assert_eq!(
-            conflict_hint("raw-exports (2)", true),
-            "Keep both: raw-exports (2). Replaced files aren't restored on cancel."
+            cancel_note(true),
+            "Replaced files aren't restored on cancel."
         );
+        assert_eq!(
+            cancel_note(false),
+            "A replaced file isn't restored on cancel."
+        );
+    }
+
+    fn lines(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("l{i}")).collect()
+    }
+
+    #[test]
+    fn details_pin_the_error_and_cut_after_seven() {
+        let mut d = vec!["disk full".to_string()];
+        d.extend(lines(18));
+        let c = detail_rows(&d, true, false);
+        assert_eq!(c.pin, "disk full");
+        assert_eq!(c.rows, lines(7));
+        assert_eq!(c.more, 11);
+        assert!(!c.expanded);
+        // Eight items fit without "+1 more"; unpinned, the first is an item.
+        assert_eq!(detail_rows(&lines(8), false, false).more, 0);
+        assert_eq!(detail_rows(&lines(9), false, false).more, 2);
+        assert_eq!(detail_rows(&lines(9), false, false).pin, "");
+    }
+
+    #[test]
+    fn more_expands_the_list_in_place() {
+        let mut d = vec!["disk full".to_string()];
+        d.extend(lines(18));
+        let e = detail_rows(&d, true, true);
+        assert_eq!(e.pin, "disk full");
+        assert_eq!(e.rows, lines(18));
+        assert_eq!(e.more, 0);
+        assert!(e.expanded, "scrolls past 240px");
     }
 
     fn prompt() -> ConflictPrompt {

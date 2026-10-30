@@ -536,7 +536,12 @@ pub struct PartialMerge {
     pub merged: usize,
     pub total: usize,
     pub error: String,
-    /// Source items that weren't merged, the failing one first.
+    /// Skipped before the error, at this level.
+    pub skipped: Vec<String>,
+    /// The failing child, when a merge inside it got partway.
+    pub partly: Vec<String>,
+    /// Items that weren't merged at all. merged + skipped + partly +
+    /// missing is the total.
     pub missing: Vec<String>,
 }
 
@@ -925,7 +930,9 @@ pub fn move_child(
     opts: &mut MoveOpts<'_>,
 ) -> Result<CopyOutcome> {
     let mark = LANDED.with(|l| l.borrow().len());
+    let outer = DEST_AT.with(|d| d.take());
     let out = move_child_untracked(parent, from, dest_parent, to, opts);
+    DEST_AT.with(|d| *d.borrow_mut() = outer);
     LANDED.with(|l| l.borrow_mut().truncate(mark));
     out
 }
@@ -1282,8 +1289,14 @@ fn move_directory_inner(
     // Children first; the mode and times are applied even if a child fails,
     // so a partial copy does not stay 0700 or carry the copy time.
     let mut merged = 0;
+    let mut skipped = Vec::new();
     let mut stopped_at = 0;
     let mut listing = Vec::new();
+    // Where this folder sits in the job's destination, for what the
+    // toast names.
+    let here = DEST_AT.with(|d| d.borrow().join(&dest_name));
+    let outer = DEST_AT.with(|d| std::mem::replace(&mut *d.borrow_mut(), here.clone()));
+    let merges_before = opts.report.merges.len();
     let children = (|| -> Result<()> {
         listing = src.list()?;
         for (i, entry) in listing.iter().enumerate() {
@@ -1304,22 +1317,33 @@ fn move_directory_inner(
             )?;
             if outcome == CopyOutcome::Skipped {
                 all_copied = false;
+                skipped.push(here.join(&entry.name).display().to_string());
             } else {
                 merged += 1;
             }
         }
         Ok(())
     })();
+    DEST_AT.with(|d| *d.borrow_mut() = outer);
     if let Err(err) = &children {
         if !created && !matches!(err, Error::Cancelled) && !listing.is_empty() {
+            let named = |e: &crate::safety::Dirent| here.join(&e.name).display().to_string();
+            // The failing child is partly merged when a merge inside it
+            // already reported how far it got.
+            let partly = opts.report.merges.len() > merges_before;
+            let (failing, rest) = listing[stopped_at..].split_first().unzip();
             opts.report.merges.push(PartialMerge {
-                into: dest_name.to_string_lossy().into_owned(),
+                into: here.display().to_string(),
                 merged,
                 total: listing.len(),
                 error: err.to_string(),
-                missing: listing[stopped_at..]
-                    .iter()
-                    .map(|e| rel.join(&e.name).display().to_string())
+                skipped: std::mem::take(&mut skipped),
+                partly: failing.filter(|_| partly).map(named).into_iter().collect(),
+                missing: failing
+                    .filter(|_| !partly)
+                    .into_iter()
+                    .chain(rest.into_iter().flatten())
+                    .map(named)
                     .collect(),
             });
         }
@@ -1329,7 +1353,7 @@ fn move_directory_inner(
     // half-built folder; in a merged folder it keeps what landed.
     if let Err(err) = &children {
         if created || matches!(err, Error::Cancelled) {
-            let shown = Path::new(&dest_name).to_path_buf();
+            let shown = here.clone();
             LANDED.with(|l| {
                 undo_landed(
                     &dst,
@@ -1709,6 +1733,9 @@ fn ident(st: &rustix::fs::Stat) -> (u64, u64) {
 /// Best effort: it runs while another error is already being returned.
 /// "path — not removed: reason", for the job's Details.
 fn leftover(path: &Path, e: rustix::io::Errno) -> String {
+    if matches!(e, Errno::NOTEMPTY | Errno::EXIST) {
+        return format!("{} — kept: contains other files", path.display());
+    }
     format!(
         "{} — not removed: {}",
         path.display(),
@@ -1786,6 +1813,12 @@ fn undo_landed(
             _ => {}
         }
     }
+}
+
+thread_local! {
+    /// The destination path of the folder being filled, relative to the
+    /// job's destination folder.
+    static DEST_AT: std::cell::RefCell<PathBuf> = const { std::cell::RefCell::new(PathBuf::new()) };
 }
 
 #[cfg(test)]
@@ -2318,19 +2351,91 @@ mod tests {
         to: &str,
         cancel: &Cancel,
     ) -> (Result<CopyOutcome>, TransferReport) {
+        // Folders merge; a file clash skips.
+        force_move_with(root, from, to, cancel, &mut |p: &ConflictPrompt| {
+            Ok(ConflictChoice {
+                action: if p.kind == ConflictKind::FolderFolder {
+                    Conflict::Replace
+                } else {
+                    Conflict::Skip
+                },
+                apply_all: false,
+            })
+        })
+    }
+
+    /// Names in the order the folder lists them, which is the order a
+    /// move walks them.
+    fn listed(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn skipped_items_before_an_error_are_counted() {
+        let root = scratch("merge-skip");
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        std::fs::create_dir_all(root.join("dest/sub")).unwrap();
+        for f in ["a", "b", "c", "d"] {
+            std::fs::write(root.join("src/sub").join(f), f).unwrap();
+        }
+        let order = listed(&root.join("src/sub"));
+        // The first one walked clashes and is skipped; the last fails.
+        std::fs::write(root.join("dest/sub").join(&order[0]), b"old").unwrap();
+        FAIL_LANDING.with(|f| *f.borrow_mut() = Some(order[3].clone().into()));
+        let (out, report) = force_move_report(&root, "src", "dest", &Cancel::new());
+        assert!(out.is_err(), "{out:?}");
+        let m = &report.merges[0];
+        assert_eq!(m.into, "dest/sub");
+        assert_eq!(m.skipped, [format!("dest/sub/{}", order[0])]);
+        assert_eq!(m.missing, [format!("dest/sub/{}", order[3])]);
+        assert_eq!(m.merged, 2);
+        assert_eq!(
+            m.merged + m.skipped.len() + m.partly.len() + m.missing.len(),
+            m.total
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_nested_merge_reports_where_the_error_happened() {
+        let root = scratch("merge-nested");
+        std::fs::create_dir_all(root.join("src/top/inner")).unwrap();
+        std::fs::create_dir_all(root.join("dest/top/inner")).unwrap();
+        for f in ["x", "y", "z"] {
+            std::fs::write(root.join("src/top/inner").join(f), f).unwrap();
+        }
+        let order = listed(&root.join("src/top/inner"));
+        FAIL_LANDING.with(|f| *f.borrow_mut() = Some(order[1].clone().into()));
+        let (out, report) = force_move_report(&root, "src", "dest", &Cancel::new());
+        assert!(out.is_err(), "{out:?}");
+        let inner = &report.merges[0];
+        assert_eq!(inner.into, "dest/top/inner", "{report:?}");
+        assert_eq!((inner.merged, inner.total), (1, 3));
+        assert_eq!(inner.missing.len(), 2);
+        let top = &report.merges[1];
+        assert_eq!(top.into, "dest/top");
+        assert_eq!(top.partly, ["dest/top/inner"]);
+        assert!(top.missing.is_empty(), "{top:?}");
+        assert_eq!(top.error, inner.error);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn force_move_with(
+        root: &Path,
+        from: &str,
+        to: &str,
+        cancel: &Cancel,
+        ask: &mut dyn FnMut(&ConflictPrompt) -> Result<ConflictChoice>,
+    ) -> (Result<CopyOutcome>, TransferReport) {
         let dir = DirFd::open(root).unwrap();
         let mut policy = ConflictPolicy::new();
-        let mut ask = |p: &ConflictPrompt| match p.kind {
-            ConflictKind::FolderFolder => Ok(ConflictChoice {
-                action: Conflict::Replace,
-                apply_all: false,
-            }),
-            _ => Err(Error::Cancelled),
-        };
         let mut mo = MoveOpts {
             force_copy: true,
             fail_before_unlink: false,
-            copy: opts(cancel, &mut policy, &mut ask),
+            copy: opts(cancel, &mut policy, ask),
             report: TransferReport::default(),
             check_removable: true,
             keep_source: false,
@@ -2363,7 +2468,7 @@ mod tests {
         let m = report
             .merges
             .iter()
-            .find(|m| m.into == "sub")
+            .find(|m| m.into == "dest/sub")
             .expect("merge noted");
         assert_eq!(m.total, 3);
         assert!(
@@ -2423,7 +2528,7 @@ mod tests {
             report
                 .leftovers
                 .iter()
-                .any(|l| l.starts_with("dest — not removed")),
+                .any(|l| l == "dest — kept: contains other files"),
             "{:?}",
             report.leftovers
         );
@@ -2494,8 +2599,9 @@ mod tests {
             let _ = std::fs::write(dir_path(dir).join("foreign"), b"theirs");
             c.cancel();
         });
-        let out = force_move(&root, "src", "dest", &cancel);
+        let (out, report) = force_move_report(&root, "src", "dest", &cancel);
         assert!(matches!(out, Err(Error::Cancelled)), "{out:?}");
+        assert_eq!(report.leftovers, ["dest — kept: contains other files"]);
         assert_eq!(
             walk(&root.join("dest")),
             ["foreign"],

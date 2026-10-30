@@ -505,6 +505,9 @@ export component AppWindow inherits Window {
     in property <[string]> menu-labels;
     in property <string> toast-text: "";
     in property <[string]> toast-details;
+    in property <string> toast-pin: "";
+    in property <int> toast-more: 0;
+    in property <bool> toast-expanded: false;
     // "" neutral, "warning" partial move, "danger" refused up front.
     in property <string> toast-tone: "";
     in property <string> refusal-title;
@@ -533,6 +536,7 @@ export component AppWindow inherits Window {
     in property <string> conflict-incoming-badge2: "";
     in property <string> conflict-incoming-badge: "Newer";
     in property <string> conflict-hint: "Keep both saves it as dune-sunset-0412 (2).jpg";
+    in property <string> conflict-note: "";
     in property <string> conflict-apply-label: "Apply to all 14 conflicts";
     in property <bool> conflict-apply: false;
     // Interactive window. Dialog buttons are numbered left to right and the
@@ -563,6 +567,7 @@ export component AppWindow inherits Window {
     callback dialog-button(int);
     callback job-cancel();
     callback toast-link();
+    callback toast-expand();
     forward-focus: keys;
 
     title: "Robin";
@@ -1176,10 +1181,12 @@ export component AppWindow inherits Window {
         property <length> line-h: 20px;
         // Fit the line, 520px to 800px, and never wider than the window.
         width: min(max(520px, min(800px, toast-line.preferred-width + 42px + 120px)), parent.width - side-w - 32px);
-        // At most eight detail lines show; the rest scroll, so the toast
-        // never grows over the listing.
-        property <length> list-h: min(8, toast-details.length) * line-h;
-        height: open ? 52px + 12px + list-h + 12px : 52px;
+        // A pinned line, then up to seven items and "+N more"; expanded,
+        // the items scroll past 240px so the toast never covers the list.
+        property <length> pin-h: toast-pin != "" ? line-h : 0px;
+        property <length> rows-h: toast-details.length * line-h + (toast-more > 0 ? line-h : 0px);
+        property <length> list-h: toast-expanded ? min(240px, rows-h) : rows-h;
+        height: open ? 52px + 12px + pin-h + list-h + 12px : 52px;
         x: side-w + (parent.width - side-w - self.width) / 2;
         y: parent.height - status-h - 16px - self.height;
         background: surface;
@@ -1240,12 +1247,23 @@ export component AppWindow inherits Window {
             height: 1px;
             background: hairline;
         }
-        if open: Flickable {
+        if open && toast-pin != "": Text {
             x: 42px;
             y: 52px + 12px;
             width: parent.width - 58px;
+            height: line-h;
+            text: toast-pin;
+            font-size: 11px;
+            color: text;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        if open: Flickable {
+            x: 42px;
+            y: 52px + 12px + pin-h;
+            width: parent.width - 58px;
             height: list-h;
-            viewport-height: toast-details.length * line-h;
+            viewport-height: rows-h;
             VerticalLayout {
                 spacing: 0px;
                 for detail in toast-details: Text {
@@ -1255,6 +1273,17 @@ export component AppWindow inherits Window {
                     color: muted;
                     overflow: elide;
                     vertical-alignment: center;
+                }
+                if toast-more > 0: Text {
+                    text: "+" + toast-more + " more";
+                    height: line-h;
+                    font-size: 11px;
+                    color: muted;
+                    vertical-alignment: center;
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.toast-expand(); }
+                    }
                 }
             }
         }
@@ -1512,7 +1541,7 @@ export component AppWindow inherits Window {
         TouchArea { }
         Rectangle {
             width: 480px;
-            height: 310px;
+            height: 328px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: surface;
@@ -1594,9 +1623,21 @@ export component AppWindow inherits Window {
                 font-size: 11px;
                 color: muted;
             }
+            // What Cancel doesn't take back, on its own line; 16px clear
+            // of the right edge.
+            Text {
+                text: conflict-note;
+                x: 16px;
+                y: 220px;
+                width: parent.width - 32px;
+                height: 16px;
+                font-size: 11px;
+                color: muted;
+                overflow: elide;
+            }
             Rectangle {
                 x: 16px;
-                y: 228px;
+                y: 246px;
                 width: 14px;
                 height: 14px;
                 border-radius: 2px;
@@ -1607,7 +1648,7 @@ export component AppWindow inherits Window {
             if apply: Text {
                 text: "󰄬";
                 x: 16px;
-                y: 226px;
+                y: 244px;
                 width: 14px;
                 height: 16px;
                 font-size: 12px;
@@ -1617,17 +1658,17 @@ export component AppWindow inherits Window {
             Text {
                 text: conflict-apply-label;
                 x: 36px;
-                y: 226px;
+                y: 244px;
                 width: 330px;
                 height: 18px;
                 font-size: 12px;
                 color: text;
                 vertical-alignment: center;
             }
-            TouchArea { x: 12px; y: 222px; width: 248px; height: 26px; clicked => { root.dialog-button(4); } }
+            TouchArea { x: 12px; y: 240px; width: 248px; height: 26px; clicked => { root.dialog-button(4); } }
             if live: Rectangle {
                 x: 16px;
-                y: 262px;
+                y: 280px;
                 width: 88px;
                 height: 32px;
                 border-radius: 6px;
@@ -1638,7 +1679,7 @@ export component AppWindow inherits Window {
             }
             Rectangle {
                 x: 176px;
-                y: 262px;
+                y: 280px;
                 width: 88px;
                 height: 32px;
                 border-radius: 6px;
@@ -1649,7 +1690,7 @@ export component AppWindow inherits Window {
             }
             Rectangle {
                 x: 272px;
-                y: 262px;
+                y: 280px;
                 width: 88px;
                 height: 32px;
                 border-radius: 6px;
@@ -1660,7 +1701,7 @@ export component AppWindow inherits Window {
             }
             Rectangle {
                 x: 368px;
-                y: 262px;
+                y: 280px;
                 width: 96px;
                 height: 32px;
                 border-radius: 6px;

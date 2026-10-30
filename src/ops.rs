@@ -324,6 +324,8 @@ pub struct Toast {
     pub tone: &'static str,
     pub text: String,
     pub details: Vec<String>,
+    /// The first detail stays at the top of the list, above any "+N more".
+    pub pinned: bool,
     /// Undo after trash.
     pub undo: bool,
 }
@@ -348,6 +350,7 @@ impl Outcome {
                     format!("{text}, {stayed} stayed in the trash")
                 },
                 details: self.failed.clone(),
+                pinned: false,
                 undo: false,
             };
         }
@@ -374,13 +377,25 @@ impl Outcome {
         if self.cancelled {
             text = format!("{text}, then cancelled");
         }
-        // An error that stopped a merge partway says how far it got; the
-        // error and what didn't make it go under Details.
-        if let Some(m) = self.report.merges.last() {
+        // An error that stopped a merge partway says how far the merge
+        // it happened in got; the error is pinned above what didn't make
+        // it, then the rest of the job's details.
+        if let Some(m) = self.report.merges.first() {
             let mut details = vec![m.error.clone()];
-            details.extend(m.missing.iter().map(|p| format!("{p} — not merged")));
+            for level in &self.report.merges {
+                details.extend(level.partly.iter().map(|p| format!("{p} — partly merged")));
+                details.extend(level.missing.iter().map(|p| format!("{p} — not merged")));
+                details.extend(level.skipped.iter().map(|p| format!("{p} — skipped")));
+            }
             details.extend(self.report.details());
             details.extend(self.report.leftovers.iter().cloned());
+            // The failure of the merged item itself repeats the error.
+            details.extend(
+                self.failed
+                    .iter()
+                    .filter(|f| !f.ends_with(&m.error))
+                    .cloned(),
+            );
             return Toast {
                 tone: "warning",
                 text: format!(
@@ -390,6 +405,7 @@ impl Outcome {
                     m.into
                 ),
                 details,
+                pinned: true,
                 undo: false,
             };
         }
@@ -413,6 +429,7 @@ impl Outcome {
             tone,
             text,
             details,
+            pinned: false,
             undo: kind == JobKind::Trash && !self.trashed.is_empty(),
         }
     }
@@ -752,16 +769,37 @@ mod tests {
 
     #[test]
     fn a_merge_stopped_by_an_error_says_how_far_it_got() {
+        use crate::fsops::PartialMerge;
         let out = Outcome {
-            failed: vec!["raw-exports: disk full".into()],
+            failed: vec![
+                "raw-exports: IMG_9.CR3: disk full".into(),
+                "notes.txt: Permission denied".into(),
+            ],
             report: crate::fsops::TransferReport {
-                merges: vec![crate::fsops::PartialMerge {
-                    into: "raw-exports".into(),
-                    merged: 31,
-                    total: 48,
-                    error: "IMG_9.CR3: disk full".into(),
-                    missing: vec!["raw-exports/IMG_9.CR3".into()],
-                }],
+                // Innermost first, as the job records them.
+                merges: vec![
+                    PartialMerge {
+                        into: "raw-exports/day2".into(),
+                        merged: 3,
+                        total: 6,
+                        error: "IMG_9.CR3: disk full".into(),
+                        skipped: vec!["raw-exports/day2/IMG_1.CR3".into()],
+                        missing: vec![
+                            "raw-exports/day2/IMG_9.CR3".into(),
+                            "raw-exports/day2/IMG_10.CR3".into(),
+                        ],
+                        ..Default::default()
+                    },
+                    PartialMerge {
+                        into: "raw-exports".into(),
+                        merged: 31,
+                        total: 33,
+                        error: "IMG_9.CR3: disk full".into(),
+                        partly: vec!["raw-exports/day2".into()],
+                        missing: vec!["raw-exports/day3".into()],
+                        ..Default::default()
+                    },
+                ],
                 leftovers: vec!["raw-exports/x — not removed: denied".into()],
                 ..Default::default()
             },
@@ -769,16 +807,22 @@ mod tests {
         };
         let t = out.toast(JobKind::Copy);
         assert_eq!(t.tone, "warning");
+        assert!(t.pinned);
         assert_eq!(
             t.text,
-            "Merged 31 of 48 items into raw-exports before an error"
+            "Merged 3 of 6 items into raw-exports/day2 before an error"
         );
         assert_eq!(
             t.details,
             [
                 "IMG_9.CR3: disk full",
-                "raw-exports/IMG_9.CR3 — not merged",
-                "raw-exports/x — not removed: denied"
+                "raw-exports/day2/IMG_9.CR3 — not merged",
+                "raw-exports/day2/IMG_10.CR3 — not merged",
+                "raw-exports/day2/IMG_1.CR3 — skipped",
+                "raw-exports/day2 — partly merged",
+                "raw-exports/day3 — not merged",
+                "raw-exports/x — not removed: denied",
+                "notes.txt: Permission denied",
             ]
         );
     }

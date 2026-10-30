@@ -47,6 +47,7 @@ pub fn known(view: &str) -> bool {
             | "skipped-details"
             | "move-partial"
             | "merge-partial"
+            | "merge-partial-expanded"
             | "move-refused"
             | "move-refused-unreadable"
             | "move-refused-unreadable-two"
@@ -260,15 +261,13 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             })
             .collect::<Vec<_>>(),
     ))));
-    let (tone, text, details) = toast(view);
+    let (tone, text, details, pinned) = toast(view);
     ui.set_toast_tone(tone.into());
     ui.set_toast_text(text.into());
-    ui.set_toast_details(ModelRc::new(Rc::new(VecModel::from(
-        details
-            .into_iter()
-            .map(slint::SharedString::from)
-            .collect::<Vec<_>>(),
-    ))));
+    crate::app::set_toast_rows(
+        ui,
+        &crate::app::detail_rows(&details, pinned, view == "merge-partial-expanded"),
+    );
     ui.set_overlay(
         match view {
             "path-edit" => "path-edit",
@@ -287,7 +286,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "progress-error" => "progress-error",
             "skipped" => "skipped",
             "skipped-details" => "skipped-details",
-            "move-partial" | "merge-partial" => "toast-details",
+            "move-partial" | "merge-partial" | "merge-partial-expanded" => "toast-details",
             "move-refused"
             | "move-refused-unreadable"
             | "move-refused-unreadable-two"
@@ -379,7 +378,7 @@ fn stats_cells(drilled: bool) -> Vec<MapCell> {
 }
 
 /// Tone, line, and details for the transfer toasts.
-fn toast(view: &str) -> (&'static str, String, Vec<String>) {
+fn toast(view: &str) -> (&'static str, String, Vec<String>, bool) {
     use crate::fsops::{KeepReason, KeptEntry};
     let kept = |path: &str, reason| KeptEntry {
         path: path.into(),
@@ -396,9 +395,9 @@ fn toast(view: &str) -> (&'static str, String, Vec<String>) {
                 ],
                 ..Default::default()
             };
-            ("warning", report.summary(), report.details())
+            ("warning", report.summary(), report.details(), false)
         }
-        "merge-partial" => {
+        "merge-partial" | "merge-partial-expanded" => {
             let mut missing = vec!["raw-exports/IMG_4432.CR3".to_string()];
             missing.extend((4433..4449).map(|n| format!("raw-exports/IMG_{n}.CR3")));
             let out = crate::ops::Outcome {
@@ -411,17 +410,18 @@ fn toast(view: &str) -> (&'static str, String, Vec<String>) {
                         error: "raw-exports/IMG_4432.CR3: No space left on device (os error 28)"
                             .into(),
                         missing,
+                        ..Default::default()
                     }],
                     ..Default::default()
                 },
                 ..Default::default()
             };
             let t = out.toast(crate::ops::JobKind::Copy);
-            (t.tone, t.text, t.details)
+            (t.tone, t.text, t.details, t.pinned)
         }
         _ => {
             let report = skipped_report();
-            ("", report.summary(), report.details())
+            ("", report.summary(), report.details(), false)
         }
     }
 }
