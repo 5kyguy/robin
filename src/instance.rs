@@ -63,13 +63,13 @@ impl Drop for Lock {
 pub fn runtime_socket() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir());
+        .unwrap_or_else(std::env::temp_dir);
     base.join("robin.sock")
 }
 
 pub fn send_select(socket: &Path, file: &Path) -> Result<()> {
     let mut stream = UnixStream::connect(socket).map_err(|e| Error::io(socket, e))?;
-    write!(stream, "select {}\n", file.display()).map_err(|e| Error::io(socket, e))?;
+    writeln!(stream, "select {}", file.display()).map_err(|e| Error::io(socket, e))?;
     Ok(())
 }
 
