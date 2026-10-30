@@ -218,8 +218,10 @@ component JobRow inherits Rectangle {
         border-radius: 2px;
         background: ink.with-alpha(0.12);
         Rectangle {
+            x: 0px;
+            y: 0px;
             width: parent.width * amount;
-            height: 4px;
+            height: parent.height;
             border-radius: 2px;
             background: failed ? danger-ink : accent-ink;
         }
@@ -422,17 +424,20 @@ export component AppWindow inherits Window {
                         accent: root.accent;
                         selected-bg: root.selected;
                     }
-                    if !root.collapsed && place.usage >= 0: HorizontalLayout {
-                        padding-left: 38px;
-                        padding-right: 12px;
+                    if !root.collapsed && place.usage >= 0: Rectangle {
+                        height: 4px;
                         Rectangle {
-                            horizontal-stretch: 1;
+                            x: 38px;
+                            y: 0px;
+                            width: parent.width - 38px - 8px;
                             height: 3px;
                             border-radius: 2px;
                             background: root.text.with-alpha(0.12);
                             Rectangle {
+                                x: 0px;
+                                y: 0px;
                                 width: parent.width * place.usage;
-                                height: 3px;
+                                height: parent.height;
                                 border-radius: 2px;
                                 background: place.level == 2 ? root.danger : place.level == 1 ? root.warning : root.accent;
                             }
@@ -855,16 +860,30 @@ export component AppWindow inherits Window {
             Rectangle {
                 height: status-h;
                 background: bg;
-                HorizontalLayout {
-                    padding-left: 12px;
-                    padding-right: 12px;
-                    spacing: 16px;
-                    alignment: start;
-                    Rectangle {
-                        horizontal-stretch: 1;
-                        Text { text: status-left; font-size: 11px; color: muted; vertical-alignment: center; overflow: elide; }
-                    }
-                    Text { text: status-right; font-size: 11px; color: muted; vertical-alignment: center; }
+                property <length> free-w: 188px;
+                Text {
+                    text: status-left;
+                    x: 12px;
+                    y: 0px;
+                    width: parent.width - 24px - free-w;
+                    height: parent.height;
+                    font-size: 11px;
+                    color: muted;
+                    horizontal-alignment: left;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    text: status-right;
+                    x: parent.width - 12px - free-w;
+                    y: 0px;
+                    width: free-w;
+                    height: parent.height;
+                    font-size: 11px;
+                    color: muted;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    overflow: elide;
                 }
             }
         }
