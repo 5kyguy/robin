@@ -20,7 +20,7 @@ use rustix::io::Errno;
 use crate::error::{Error, Result};
 use crate::safety::DirFd;
 
-const MAX_DEPTH: u32 = 32;
+const MAX_DEPTH: u32 = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrashChoice {
@@ -40,6 +40,13 @@ pub fn choose_trash(same_filesystem_as_home: bool, volume_trash_creatable: bool)
     } else {
         TrashChoice::Ask
     }
+}
+
+/// Whether a copy transferred bytes. A move deletes the source only for [`Copied`](CopyOutcome::Copied).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyOutcome {
+    Copied,
+    Skipped,
 }
 
 /// What the user picked in the conflict dialog.
@@ -193,7 +200,8 @@ pub fn rename_child(parent: &DirFd, from: &std::ffi::OsStr, to: &std::ffi::OsStr
 }
 
 /// Remove `name` inside `parent`. Symlinks are unlinked, not followed.
-/// `before` runs after the entry is stat'd, so a test can swap it.
+/// `before` runs after the stat that decides how to delete, so a test can
+/// swap the entry before it is opened or unlinked.
 pub fn remove_child(
     parent: &DirFd,
     name: &std::ffi::OsStr,
@@ -203,7 +211,31 @@ pub fn remove_child(
     let root_dev = rustix::fs::fstat(parent.as_fd())
         .map_err(|e| Error::from_errno(name, e))?
         .st_dev;
+    // Depth is known before the first unlink, so a too-deep tree is left whole.
+    ensure_depth(parent, name, root_dev, 0)?;
     remove_tree(parent, name, before, cancel, root_dev, 0)
+}
+
+fn ensure_depth(parent: &DirFd, name: &std::ffi::OsStr, root_dev: u64, depth: u32) -> Result<()> {
+    if depth >= MAX_DEPTH {
+        return Err(Error::Message("directory is too deep".into()));
+    }
+    let c = component(name)?;
+    let stat = rustix::fs::statat(parent.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(name, e))?;
+    if stat.st_dev != root_dev {
+        return Err(Error::Message(
+            "refusing to cross filesystems while deleting".into(),
+        ));
+    }
+    if is_lnk(stat.st_mode) || !is_dir(stat.st_mode) {
+        return Ok(());
+    }
+    let child = parent.open_dir_nofollow(name)?;
+    for entry in child.list()? {
+        ensure_depth(&child, &entry.name, root_dev, depth + 1)?;
+    }
+    Ok(())
 }
 
 fn remove_tree(
@@ -217,13 +249,10 @@ fn remove_tree(
     if cancel.is_cancelled() {
         return Err(Error::Cancelled);
     }
-    if depth > MAX_DEPTH {
+    if depth >= MAX_DEPTH {
         return Err(Error::Message("directory is too deep".into()));
     }
     let c = component(name)?;
-    rustix::fs::statat(parent.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(|e| Error::from_errno(name, e))?;
-    before(name);
     let stat = rustix::fs::statat(parent.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|e| Error::from_errno(name, e))?;
     if stat.st_dev != root_dev {
@@ -231,6 +260,7 @@ fn remove_tree(
             "refusing to cross filesystems while deleting".into(),
         ));
     }
+    before(name);
     if is_lnk(stat.st_mode) || !is_dir(stat.st_mode) {
         rustix::fs::unlinkat(parent.as_fd(), c.as_c_str(), AtFlags::empty())
             .map_err(|e| Error::from_errno(name, e))?;
@@ -253,7 +283,7 @@ pub fn copy_file(
     dest_parent: &DirFd,
     to: &std::ffi::OsStr,
     opts: &mut CopyOpts<'_>,
-) -> Result<()> {
+) -> Result<CopyOutcome> {
     if opts.cancel.is_cancelled() {
         return Err(Error::Cancelled);
     }
@@ -274,7 +304,7 @@ pub fn copy_file(
     }
     let dest_name = resolve_dest_name(dest_parent, to, &stat, opts)?;
     let Some(dest_name) = dest_name else {
-        return Ok(());
+        return Ok(CopyOutcome::Skipped);
     };
     let to_c = component(dest_name.as_os_str())?;
     let tmp_name = partial_name();
@@ -319,17 +349,17 @@ pub fn copy_file(
         }
         rustix::fs::fchmod(&output, Mode::from_raw_mode(stat.st_mode & 0o777))
             .map_err(|e| Error::from_errno(&dest_name, e))?;
-        set_mtime(&output, &stat).map_err(|e| Error::from_errno(&dest_name, e))?;
+        set_times(&output, &stat).map_err(|e| Error::from_errno(&dest_name, e))?;
         output.sync_all().map_err(|e| Error::io(&dest_name, e))?;
-        copy_xattrs(&input, &output);
+        copy_xattrs(&input, &output)?;
         drop(output);
     } else {
         let output = File::from(dest);
         rustix::fs::fchmod(&output, Mode::from_raw_mode(stat.st_mode & 0o777))
             .map_err(|e| Error::from_errno(&dest_name, e))?;
-        set_mtime(&output, &stat).map_err(|e| Error::from_errno(&dest_name, e))?;
+        set_times(&output, &stat).map_err(|e| Error::from_errno(&dest_name, e))?;
         output.sync_all().map_err(|e| Error::io(&dest_name, e))?;
-        copy_xattrs(&src, output.as_fd());
+        copy_xattrs(&src, output.as_fd())?;
         drop(output);
     }
     let replace = exists(dest_parent, dest_name.as_os_str())?;
@@ -346,7 +376,7 @@ pub fn copy_file(
             .map_err(|e| Error::from_errno(&dest_name, e))?;
     }
     guard.live = false;
-    Ok(())
+    Ok(CopyOutcome::Copied)
 }
 
 pub struct MoveOpts<'a> {
@@ -356,46 +386,102 @@ pub struct MoveOpts<'a> {
 }
 
 /// Move by rename when it works. `force_copy` exercises the cross-device path.
+/// The source is removed only when the transfer completed. Skip leaves it.
 pub fn move_child(
     parent: &DirFd,
     from: &std::ffi::OsStr,
     dest_parent: &DirFd,
     to: &std::ffi::OsStr,
     opts: &mut MoveOpts<'_>,
-) -> Result<()> {
+) -> Result<CopyOutcome> {
     if !opts.force_copy {
         let from_c = component(from)?;
         let to_c = component(to)?;
-        if exists(dest_parent, to)? {
-            let _ = settle_conflict(parent, from, dest_parent, to, &mut opts.copy)?;
-        }
         match rename_noreplace(parent.as_fd(), &from_c, dest_parent.as_fd(), &to_c) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(CopyOutcome::Copied),
             Err(err) if err == Errno::XDEV => {}
             Err(err) if err == Errno::EXIST => {
                 return replace_or_rename(parent, from, dest_parent, to, &mut opts.copy);
-            }
-            Err(err) if err == Errno::ISDIR => {
-                return Err(Error::Message(
-                    "refusing to move a directory across devices".into(),
-                ));
             }
             Err(err) => return Err(Error::from_errno(to, err)),
         }
     }
     if is_directory(parent, from)? {
-        return Err(Error::Message(
-            "refusing to move a directory across devices".into(),
-        ));
+        return move_directory(parent, from, dest_parent, to, opts, 0);
     }
-    copy_file(parent, from, dest_parent, to, &mut opts.copy)?;
+    if copy_file(parent, from, dest_parent, to, &mut opts.copy)? == CopyOutcome::Skipped {
+        return Ok(CopyOutcome::Skipped);
+    }
     rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(to, e))?;
     if opts.fail_before_unlink {
         return Err(Error::Message(
             "injected failure before unlinking the source".into(),
         ));
     }
-    remove_child(parent, from, &mut |_| {}, opts.copy.cancel)
+    remove_child(parent, from, &mut |_| {}, opts.copy.cancel)?;
+    Ok(CopyOutcome::Copied)
+}
+
+/// Copy a directory across devices. The source directory is removed only when
+/// every child was [`CopyOutcome::Copied`].
+fn move_directory(
+    parent: &DirFd,
+    from: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    to: &std::ffi::OsStr,
+    opts: &mut MoveOpts<'_>,
+    depth: u32,
+) -> Result<CopyOutcome> {
+    if opts.copy.cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    if depth >= MAX_DEPTH {
+        return Err(Error::Message("directory is too deep".into()));
+    }
+    let from_c = component(from)?;
+    let stat = rustix::fs::statat(parent.as_fd(), from_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(from, e))?;
+    let dest_name = resolve_dest_name(dest_parent, to, &stat, &mut opts.copy)?;
+    let Some(dest_name) = dest_name else {
+        return Ok(CopyOutcome::Skipped);
+    };
+    if exists(dest_parent, dest_name.as_os_str())? {
+        if !is_directory(dest_parent, dest_name.as_os_str())? {
+            return Err(Error::Message(format!(
+                "refusing to replace a file with directory {}",
+                dest_name.to_string_lossy()
+            )));
+        }
+    } else {
+        let c = component(dest_name.as_os_str())?;
+        rustix::fs::mkdirat(
+            dest_parent.as_fd(),
+            c.as_c_str(),
+            Mode::from_raw_mode(stat.st_mode & 0o777),
+        )
+        .map_err(|e| Error::from_errno(&dest_name, e))?;
+    }
+    let src = parent.open_dir_nofollow(from)?;
+    let dst = dest_parent.open_dir_nofollow(dest_name.as_os_str())?;
+    let mut all_copied = true;
+    for entry in src.list()? {
+        let outcome = if is_directory(&src, &entry.name)? {
+            move_directory(&src, &entry.name, &dst, &entry.name, opts, depth + 1)?
+        } else {
+            move_child(&src, &entry.name, &dst, &entry.name, opts)?
+        };
+        if outcome == CopyOutcome::Skipped {
+            all_copied = false;
+        }
+    }
+    rustix::fs::fsync(dst.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
+    if !all_copied {
+        return Ok(CopyOutcome::Skipped);
+    }
+    rustix::fs::unlinkat(parent.as_fd(), from_c.as_c_str(), AtFlags::REMOVEDIR)
+        .map_err(|e| Error::from_errno(from, e))?;
+    rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
+    Ok(CopyOutcome::Copied)
 }
 
 /// Where a removable volume keeps its trash.
@@ -424,6 +510,110 @@ pub fn volume_trash_plan(top: &DirFd) -> Result<VolumeTrash> {
     }
 }
 
+/// Open the volume trash, creating `$topdir/.Trash/$uid` or `$topdir/.Trash-$uid`.
+/// `files/` and `info/` are created the same way: `O_NOFOLLOW`, mode `0700`, owned by the user.
+pub fn open_volume_trash(top: &DirFd) -> Result<DirFd> {
+    let uid = rustix::process::getuid().as_raw();
+    let root = match open_sticky_trash(top)? {
+        Some(dot) => open_or_create_owned(&dot, &std::ffi::OsString::from(uid.to_string()), 0o700)?,
+        None => open_or_create_owned(
+            top,
+            &std::ffi::OsString::from(format!(".Trash-{uid}")),
+            0o700,
+        )?,
+    };
+    let _files = open_or_create_owned(&root, std::ffi::OsStr::new("files"), 0o700)?;
+    let _info = open_or_create_owned(&root, std::ffi::OsStr::new("info"), 0o700)?;
+    Ok(root)
+}
+
+fn open_sticky_trash(top: &DirFd) -> Result<Option<DirFd>> {
+    let name = std::ffi::OsStr::new(".Trash");
+    match top.open_dir_nofollow(name) {
+        Ok(dir) => {
+            let stat = rustix::fs::fstat(dir.as_fd()).map_err(|e| Error::from_errno(name, e))?;
+            if is_dir(stat.st_mode) && !is_lnk(stat.st_mode) && stat.st_mode & 0o1000 != 0 {
+                Ok(Some(dir))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(err)
+            if io_is(&err, Errno::NOENT)
+                || io_is(&err, Errno::LOOP)
+                || io_is(&err, Errno::NOTDIR) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn open_or_create_owned(parent: &DirFd, name: &std::ffi::OsStr, mode: u32) -> Result<DirFd> {
+    match parent.open_dir_nofollow(name) {
+        Ok(dir) => {
+            verify_owned(&dir, name, mode)?;
+            Ok(dir)
+        }
+        Err(err) if io_is(&err, Errno::NOENT) => {
+            let c = component(name)?;
+            let created = match rustix::fs::mkdirat(
+                parent.as_fd(),
+                c.as_c_str(),
+                Mode::from_raw_mode(mode),
+            ) {
+                Ok(()) => true,
+                Err(Errno::EXIST) => false,
+                Err(err) => return Err(Error::from_errno(name, err)),
+            };
+            let dir = parent.open_dir_nofollow(name)?;
+            if created {
+                rustix::fs::fchmod(dir.as_fd(), Mode::from_raw_mode(mode))
+                    .map_err(|e| Error::from_errno(name, e))?;
+            }
+            verify_owned(&dir, name, mode)?;
+            Ok(dir)
+        }
+        Err(err) if io_is(&err, Errno::LOOP) => Err(Error::Message(format!(
+            "{} is a symlink",
+            name.to_string_lossy()
+        ))),
+        Err(err) => Err(err),
+    }
+}
+
+fn verify_owned(dir: &DirFd, name: &std::ffi::OsStr, mode: u32) -> Result<()> {
+    let stat = rustix::fs::fstat(dir.as_fd()).map_err(|e| Error::from_errno(name, e))?;
+    let uid = rustix::process::getuid().as_raw();
+    if !is_dir(stat.st_mode) || is_lnk(stat.st_mode) {
+        return Err(Error::Message(format!(
+            "{} is not a directory",
+            name.to_string_lossy()
+        )));
+    }
+    if stat.st_uid != uid {
+        return Err(Error::Message(format!(
+            "{} is not owned by uid {uid}",
+            name.to_string_lossy()
+        )));
+    }
+    if stat.st_mode & 0o777 != mode {
+        return Err(Error::Message(format!(
+            "{} mode is {:o}, want {mode:o}",
+            name.to_string_lossy(),
+            stat.st_mode & 0o777
+        )));
+    }
+    Ok(())
+}
+
+fn io_is(err: &Error, errno: Errno) -> bool {
+    match err {
+        Error::Io { source, .. } => source.raw_os_error() == Some(errno.raw_os_error()),
+        _ => false,
+    }
+}
+
 pub fn place_in_trash(
     parent: &DirFd,
     name: &std::ffi::OsStr,
@@ -436,66 +626,63 @@ pub fn place_in_trash(
             "this drive has no trash and files are not copied home".into(),
         ));
     }
-    let files = ensure_subdir(trash, "files")?;
-    let info_dir = ensure_subdir(trash, "info")?;
-    let unique = unique_trash_name(&files, name)?;
-    let info_name = format!("{}.trashinfo", unique.to_string_lossy());
-    let info = std::ffi::OsString::from(&info_name);
+    let files = open_or_create_owned(trash, std::ffi::OsStr::new("files"), 0o700)?;
+    let info_dir = open_or_create_owned(trash, std::ffi::OsStr::new("info"), 0o700)?;
     let body = format!(
         "[Trash Info]\nPath={}\nDeletionDate={}\n",
         percent_encode(info_path.as_bytes()),
         deletion_date()
     );
-    let info_c = component(info.as_os_str())?;
-    let fd = rustix::fs::openat(
-        info_dir.as_fd(),
-        info_c.as_c_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o600),
-    )
-    .map_err(|e| Error::from_errno(&info, e))?;
-    {
-        let mut file = File::from(fd);
-        file.write_all(body.as_bytes())
-            .map_err(|e| Error::io(&info, e))?;
-        file.sync_all().map_err(|e| Error::io(&info, e))?;
-    }
-    let data_c = component(unique.as_os_str())?;
     let from_c = component(name)?;
-    if let Err(err) = rename_noreplace(parent.as_fd(), &from_c, files.as_fd(), &data_c) {
-        let _ = rustix::fs::unlinkat(info_dir.as_fd(), info_c.as_c_str(), AtFlags::empty());
-        return Err(Error::from_errno(name, err));
-    }
-    rustix::fs::fsync(files.as_fd()).map_err(|e| Error::from_errno(name, e))?;
-    Ok(())
-}
-
-fn ensure_subdir(parent: &DirFd, name: &str) -> Result<DirFd> {
-    let os = std::ffi::OsStr::new(name);
-    match parent.open_dir_nofollow(os) {
-        Ok(dir) => Ok(dir),
-        Err(_) => {
-            let c = component(os)?;
-            match rustix::fs::mkdirat(parent.as_fd(), c.as_c_str(), Mode::from_raw_mode(0o700)) {
-                Ok(()) | Err(Errno::EXIST) => {}
-                Err(err) => return Err(Error::from_errno(os, err)),
-            }
-            parent.open_dir_nofollow(os)
+    for candidate in trash_candidates(name) {
+        let info_label = format!("{}.trashinfo", candidate.to_string_lossy());
+        let info_name = std::ffi::OsString::from(&info_label);
+        let info_c = component(info_name.as_os_str())?;
+        let fd = match rustix::fs::openat(
+            info_dir.as_fd(),
+            info_c.as_c_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::EXIST) => continue,
+            Err(err) => return Err(Error::from_errno(&info_name, err)),
+        };
+        {
+            let mut file = File::from(fd);
+            file.write_all(body.as_bytes())
+                .map_err(|e| Error::io(&info_name, e))?;
+            file.sync_all().map_err(|e| Error::io(&info_name, e))?;
         }
-    }
-}
-
-fn unique_trash_name(files: &DirFd, name: &std::ffi::OsStr) -> Result<std::ffi::OsString> {
-    if !exists(files, name)? {
-        return Ok(name.to_os_string());
-    }
-    for n in 1..1000 {
-        let candidate = std::ffi::OsString::from(format!("{}.{n}", name.to_string_lossy()));
-        if !exists(files, &candidate)? {
-            return Ok(candidate);
+        rustix::fs::fsync(info_dir.as_fd()).map_err(|e| Error::from_errno(&info_name, e))?;
+        let data_c = component(candidate.as_os_str())?;
+        match rename_noreplace(parent.as_fd(), &from_c, files.as_fd(), &data_c) {
+            Ok(()) => {
+                rustix::fs::fsync(files.as_fd()).map_err(|e| Error::from_errno(name, e))?;
+                return Ok(());
+            }
+            Err(Errno::EXIST) => {
+                let _ = rustix::fs::unlinkat(info_dir.as_fd(), info_c.as_c_str(), AtFlags::empty());
+            }
+            Err(err) => {
+                let _ = rustix::fs::unlinkat(info_dir.as_fd(), info_c.as_c_str(), AtFlags::empty());
+                return Err(Error::from_errno(name, err));
+            }
         }
     }
     Err(Error::Message("trash name is exhausted".into()))
+}
+
+fn trash_candidates(name: &std::ffi::OsStr) -> Vec<std::ffi::OsString> {
+    let mut out = Vec::with_capacity(1000);
+    out.push(name.to_os_string());
+    for n in 1..1000 {
+        out.push(std::ffi::OsString::from(format!(
+            "{}.{n}",
+            name.to_string_lossy()
+        )));
+    }
+    out
 }
 
 struct UnlinkOnDrop<'a> {
@@ -571,9 +758,9 @@ fn replace_or_rename(
     dest_parent: &DirFd,
     to: &std::ffi::OsStr,
     opts: &mut CopyOpts<'_>,
-) -> Result<()> {
+) -> Result<CopyOutcome> {
     match settle_conflict(parent, from, dest_parent, to, opts)? {
-        Conflict::Skip => Ok(()),
+        Conflict::Skip => Ok(CopyOutcome::Skipped),
         Conflict::Replace => {
             let from_c = component(from)?;
             let to_c = component(to)?;
@@ -583,14 +770,16 @@ fn replace_or_rename(
                 dest_parent.as_fd(),
                 to_c.as_c_str(),
             )
-            .map_err(|e| Error::from_errno(to, e))
+            .map_err(|e| Error::from_errno(to, e))?;
+            Ok(CopyOutcome::Copied)
         }
         Conflict::Rename => {
             let name = fresh_name(dest_parent, to)?;
             let from_c = component(from)?;
             let to_c = component(name.as_os_str())?;
             rename_noreplace(parent.as_fd(), &from_c, dest_parent.as_fd(), &to_c)
-                .map_err(|e| Error::from_errno(&name, e))
+                .map_err(|e| Error::from_errno(&name, e))?;
+            Ok(CopyOutcome::Copied)
         }
     }
 }
@@ -673,38 +862,57 @@ fn try_copy_range(src: impl AsFd, dst: impl AsFd, cancel: &Cancel) -> Result<boo
     }
 }
 
-fn copy_xattrs(src: impl AsFd, dst: impl AsFd) {
+/// `ENOTSUP` means this filesystem has no xattrs. Every other error is returned.
+fn xattr_errno(err: Errno) -> Result<()> {
+    if err == Errno::NOTSUP {
+        Ok(())
+    } else {
+        Err(Error::from_errno("xattr", err))
+    }
+}
+
+fn copy_xattrs(src: impl AsFd, dst: impl AsFd) -> Result<()> {
     let len = match rustix::fs::flistxattr_query(&src) {
-        Ok(0) | Err(_) => return,
+        Ok(0) => return Ok(()),
         Ok(n) => n,
+        Err(err) => return xattr_errno(err),
     };
     let mut buf = vec![0u8; len];
-    if rustix::fs::flistxattr(&src, buf.as_mut_slice()).is_err() {
-        return;
+    if let Err(err) = rustix::fs::flistxattr(&src, buf.as_mut_slice()) {
+        return xattr_errno(err);
     }
     for name in buf.split(|b| *b == 0) {
         if name.is_empty() {
             continue;
         }
-        let Ok(size) = rustix::fs::fgetxattr_query(&src, name) else {
-            continue;
+        let size = match rustix::fs::fgetxattr_query(&src, name) {
+            Ok(n) => n,
+            Err(err) => return xattr_errno(err),
         };
         let mut value = vec![0u8; size];
-        if rustix::fs::fgetxattr(&src, name, value.as_mut_slice()).is_err() {
-            continue;
+        if size > 0 {
+            if let Err(err) = rustix::fs::fgetxattr(&src, name, value.as_mut_slice()) {
+                return xattr_errno(err);
+            }
         }
-        let _ = rustix::fs::fsetxattr(&dst, name, &value, rustix::fs::XattrFlags::empty());
+        if let Err(err) = rustix::fs::fsetxattr(&dst, name, &value, rustix::fs::XattrFlags::empty())
+        {
+            return xattr_errno(err);
+        }
     }
+    Ok(())
 }
 
-fn set_mtime(file: impl AsFd, stat: &rustix::fs::Stat) -> std::result::Result<(), Errno> {
-    let mtime = rustix::fs::Timespec {
-        tv_sec: stat.st_mtime,
-        tv_nsec: stat.st_mtime_nsec as _,
-    };
+fn set_times(file: impl AsFd, stat: &rustix::fs::Stat) -> std::result::Result<(), Errno> {
     let times = rustix::fs::Timestamps {
-        last_access: mtime,
-        last_modification: mtime,
+        last_access: rustix::fs::Timespec {
+            tv_sec: stat.st_atime,
+            tv_nsec: stat.st_atime_nsec as _,
+        },
+        last_modification: rustix::fs::Timespec {
+            tv_sec: stat.st_mtime,
+            tv_nsec: stat.st_mtime_nsec as _,
+        },
     };
     rustix::fs::futimens(file, &times)
 }
@@ -756,28 +964,21 @@ fn deletion_date() -> String {
 }
 
 fn format_deletion_date(secs: i64) -> String {
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400) as u32;
-    let (year, month, day) = civil_from_days(days);
-    let hour = tod / 3600;
-    let minute = (tod % 3600) / 60;
-    let second = tod % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
-}
-
-/// Howard Hinnant's civil_from_days.
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m as u32, d as u32)
+    let t = secs as libc::time_t;
+    let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
+    let ok = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
+    if !ok {
+        return String::from("1970-01-01T00:00:00");
+    }
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
 }
 
 /// Refuse to operate if `path`'s directory is a pseudo filesystem.
@@ -880,15 +1081,13 @@ mod tests {
     }
 
     #[test]
-    fn devtmpfs_is_refused_and_a_normal_dir_is_not() {
-        let root = scratch("allow");
-        DirFd::open(&root).unwrap();
+    fn dev_shm_opens_and_dev_is_refused() {
+        DirFd::open(Path::new("/dev/shm")).expect("/dev/shm is tmpfs and must open");
         match DirFd::open(Path::new("/dev")) {
-            Ok(_) => {}
             Err(Error::Pseudo { kind: "devtmpfs" }) => {}
-            Err(err) => panic!("unexpected /dev error: {err}"),
+            Ok(_) => panic!("/dev opened; devtmpfs must be refused"),
+            Err(err) => panic!("/dev failed for the wrong reason: {err}"),
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1084,28 +1283,160 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_is_not_moved_across_devices_with_eisdir() {
-        let root = scratch("dirmove");
-        std::fs::create_dir(root.join("folder")).unwrap();
+    fn skip_on_exdev_move_leaves_the_source() {
+        let root = scratch("skip-exdev");
+        std::fs::write(root.join("src"), b"keep").unwrap();
+        std::fs::write(root.join("dest"), b"old").unwrap();
         let dir = DirFd::open(&root).unwrap();
         let cancel = Cancel::new();
         let mut policy = ConflictPolicy::new();
-        let mut ask = replace_ask;
-        let err = move_child(
+        let mut skip = |_: &ConflictPrompt| {
+            Ok(ConflictChoice {
+                action: Conflict::Skip,
+                apply_all: false,
+            })
+        };
+        let outcome = move_child(
             &dir,
+            std::ffi::OsStr::new("src"),
+            &dir,
+            std::ffi::OsStr::new("dest"),
+            &mut MoveOpts {
+                force_copy: true,
+                fail_before_unlink: false,
+                copy: opts(&cancel, &mut policy, &mut skip),
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, CopyOutcome::Skipped);
+        assert_eq!(std::fs::read(root.join("src")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(root.join("dest")).unwrap(), b"old");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn directory_move_deletes_the_source_only_when_every_child_is_copied() {
+        let root = scratch("dirmove");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        std::fs::create_dir_all(src.join("folder")).unwrap();
+        std::fs::create_dir_all(dst.join("folder")).unwrap();
+        std::fs::write(src.join("folder").join("keep.txt"), b"stay").unwrap();
+        std::fs::write(src.join("folder").join("go.txt"), b"move").unwrap();
+        std::fs::write(dst.join("folder").join("keep.txt"), b"old").unwrap();
+        let parent = DirFd::open(&src).unwrap();
+        let dest = DirFd::open(&dst).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = |prompt: &ConflictPrompt| {
+            let action = if prompt.name == "keep.txt" {
+                Conflict::Skip
+            } else {
+                Conflict::Replace
+            };
+            Ok(ConflictChoice {
+                action,
+                apply_all: false,
+            })
+        };
+        let outcome = move_child(
+            &parent,
             std::ffi::OsStr::new("folder"),
-            &dir,
-            std::ffi::OsStr::new("elsewhere"),
+            &dest,
+            std::ffi::OsStr::new("folder"),
             &mut MoveOpts {
                 force_copy: true,
                 fail_before_unlink: false,
                 copy: opts(&cancel, &mut policy, &mut ask),
             },
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("directory"), "{err}");
-        assert!(!err.to_string().contains("EISDIR"));
-        assert!(root.join("folder").is_dir());
+        .unwrap();
+        assert_eq!(outcome, CopyOutcome::Skipped);
+        assert_eq!(
+            std::fs::read(src.join("folder").join("keep.txt")).unwrap(),
+            b"stay"
+        );
+        assert!(!src.join("folder").join("go.txt").exists());
+        assert!(src.join("folder").is_dir());
+        assert_eq!(
+            std::fs::read(dst.join("folder").join("keep.txt")).unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("folder").join("go.txt")).unwrap(),
+            b"move"
+        );
+
+        std::fs::create_dir(src.join("whole")).unwrap();
+        std::fs::write(src.join("whole").join("a.txt"), b"a").unwrap();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = replace_ask;
+        let outcome = move_child(
+            &parent,
+            std::ffi::OsStr::new("whole"),
+            &dest,
+            std::ffi::OsStr::new("whole"),
+            &mut MoveOpts {
+                force_copy: true,
+                fail_before_unlink: false,
+                copy: opts(&cancel, &mut policy, &mut ask),
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, CopyOutcome::Copied);
+        assert!(!src.join("whole").exists());
+        assert_eq!(
+            std::fs::read(dst.join("whole").join("a.txt")).unwrap(),
+            b"a"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn same_fs_move_asks_about_a_conflict_once() {
+        let root = scratch("once");
+        std::fs::write(root.join("a"), b"new").unwrap();
+        std::fs::write(root.join("b"), b"old").unwrap();
+        std::fs::write(root.join("c"), b"c").unwrap();
+        let dir = DirFd::open(&root).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let asks = AtomicUsize::new(0);
+        let mut ask = |_: &ConflictPrompt| {
+            asks.fetch_add(1, Ordering::Relaxed);
+            Ok(ConflictChoice {
+                action: Conflict::Replace,
+                apply_all: false,
+            })
+        };
+        move_child(
+            &dir,
+            std::ffi::OsStr::new("c"),
+            &dir,
+            std::ffi::OsStr::new("d"),
+            &mut MoveOpts {
+                force_copy: false,
+                fail_before_unlink: false,
+                copy: opts(&cancel, &mut policy, &mut ask),
+            },
+        )
+        .unwrap();
+        assert_eq!(asks.load(Ordering::Relaxed), 0);
+        move_child(
+            &dir,
+            std::ffi::OsStr::new("a"),
+            &dir,
+            std::ffi::OsStr::new("b"),
+            &mut MoveOpts {
+                force_copy: false,
+                fail_before_unlink: false,
+                copy: opts(&cancel, &mut policy, &mut ask),
+            },
+        )
+        .unwrap();
+        assert_eq!(asks.load(Ordering::Relaxed), 1);
+        assert_eq!(std::fs::read(root.join("b")).unwrap(), b"new");
+        assert!(!root.join("a").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1207,8 +1538,278 @@ mod tests {
     }
 
     #[test]
-    fn deletion_date_is_iso_local() {
+    fn deletion_date_is_local_not_utc() {
+        let prev = std::env::var_os("TZ");
+        std::env::set_var("TZ", "EST5");
+        reload_tz();
+        assert_eq!(
+            format_deletion_date(1_700_000_000),
+            "2023-11-14T17:13:20",
+            "DeletionDate must be local time"
+        );
+        std::env::set_var("TZ", "UTC0");
+        reload_tz();
         assert_eq!(format_deletion_date(1_700_000_000), "2023-11-14T22:13:20");
+        match prev {
+            Some(value) => std::env::set_var("TZ", value),
+            None => std::env::remove_var("TZ"),
+        }
+        reload_tz();
+    }
+
+    fn reload_tz() {
+        extern "C" {
+            fn tzset();
+        }
+        unsafe { tzset() }
+    }
+
+    #[test]
+    fn depth_limit_is_1024_and_checked_before_deletion() {
+        let root = scratch("depth-ok");
+        let mut deep = root.join("top");
+        std::fs::create_dir(&deep).unwrap();
+        for i in 0..40 {
+            deep.push(format!("d{i}"));
+            std::fs::create_dir(&deep).unwrap();
+        }
+        std::fs::write(deep.join("leaf"), b"x").unwrap();
+        let parent = DirFd::open(&root).unwrap();
+        remove_child(
+            &parent,
+            std::ffi::OsStr::new("top"),
+            &mut |_| {},
+            &Cancel::new(),
+        )
+        .unwrap();
+        assert!(!root.join("top").exists());
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root = std::env::temp_dir().join(format!("rd{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let top = root.join("t");
+        std::fs::create_dir(&top).unwrap();
+        std::fs::write(top.join("keep"), b"stay").unwrap();
+        let mut deep = top.clone();
+        for _ in 0..1024 {
+            deep.push("a");
+            std::fs::create_dir(&deep).unwrap();
+        }
+        let parent = DirFd::open(&root).unwrap();
+        let err = remove_child(
+            &parent,
+            std::ffi::OsStr::new("t"),
+            &mut |_| {},
+            &Cancel::new(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("too deep"), "{err}");
+        assert_eq!(std::fs::read(top.join("keep")).unwrap(), b"stay");
+        assert!(deep.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn swapping_a_directory_for_a_symlink_does_not_follow_it() {
+        let root = scratch("swapdir");
+        let outside = scratch("swapout");
+        std::fs::write(outside.join("keep"), b"safe").unwrap();
+        let box_dir = root.join("box");
+        std::fs::create_dir(&box_dir).unwrap();
+        std::fs::create_dir(box_dir.join("nested")).unwrap();
+        let parent = DirFd::open(&root).unwrap();
+        let err = remove_child(
+            &parent,
+            std::ffi::OsStr::new("box"),
+            &mut |name| {
+                if name == "nested" {
+                    let nested = box_dir.join("nested");
+                    std::fs::remove_dir(&nested).unwrap();
+                    std::os::unix::fs::symlink(&outside, &nested).unwrap();
+                }
+            },
+            &Cancel::new(),
+        )
+        .unwrap_err();
+        assert!(
+            io_is(&err, Errno::LOOP) || io_is(&err, Errno::NOTDIR),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"safe");
+        assert!(outside.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn volume_trash_dirs_are_created_owned_and_private() {
+        let uid = rustix::process::getuid().as_raw();
+        let sticky = scratch("sticky-open");
+        let dot = sticky.join(".Trash");
+        std::fs::create_dir(&dot).unwrap();
+        std::fs::set_permissions(&dot, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let top = DirFd::open(&sticky).unwrap();
+        open_volume_trash(&top).unwrap();
+        let uid_dir = dot.join(uid.to_string());
+        assert_eq!(mode_bits(&uid_dir), 0o700);
+        assert_eq!(owner_uid(&uid_dir), uid);
+        assert_eq!(mode_bits(&uid_dir.join("files")), 0o700);
+        assert_eq!(mode_bits(&uid_dir.join("info")), 0o700);
+        assert_eq!(owner_uid(&uid_dir.join("files")), uid);
+        assert_eq!(owner_uid(&uid_dir.join("info")), uid);
+
+        let plain = scratch("private-open");
+        let outside = scratch("trash-outside");
+        std::os::unix::fs::symlink(&outside, plain.join(".Trash")).unwrap();
+        let top = DirFd::open(&plain).unwrap();
+        open_volume_trash(&top).unwrap();
+        let private = plain.join(format!(".Trash-{uid}"));
+        assert_eq!(mode_bits(&private), 0o700);
+        assert_eq!(owner_uid(&private), uid);
+        assert!(private.join("files").is_dir());
+        assert!(private.join("info").is_dir());
+        assert!(!outside.join("files").exists());
+        assert!(!outside.join(uid.to_string()).exists());
+
+        let bad = scratch("bad-mode");
+        let wrong = bad.join(format!(".Trash-{uid}"));
+        std::fs::create_dir(&wrong).unwrap();
+        std::fs::set_permissions(&wrong, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let top = DirFd::open(&bad).unwrap();
+        let err = open_volume_trash(&top).unwrap_err();
+        assert!(err.to_string().contains("mode"), "{err}");
+        let _ = std::fs::remove_dir_all(&sticky);
+        let _ = std::fs::remove_dir_all(&plain);
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&bad);
+    }
+
+    #[test]
+    fn trashinfo_is_reserved_exclusively() {
+        let root = scratch("reserve");
+        let files = root.join("files");
+        let trash = root.join("trash");
+        std::fs::create_dir(&files).unwrap();
+        std::fs::create_dir(&trash).unwrap();
+        std::fs::write(files.join("song.flac"), b"music").unwrap();
+        let info = trash.join("info");
+        std::fs::create_dir(&info).unwrap();
+        std::fs::set_permissions(&info, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(info.join("song.flac.trashinfo"), b"original").unwrap();
+        let src = DirFd::open(&files).unwrap();
+        let bin = DirFd::open(&trash).unwrap();
+        place_in_trash(
+            &src,
+            std::ffi::OsStr::new("song.flac"),
+            &bin,
+            TrashChoice::Volume,
+            "files/song.flac",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(info.join("song.flac.trashinfo")).unwrap(),
+            b"original"
+        );
+        assert!(trash.join("files").join("song.flac.1").is_file());
+        assert!(info.join("song.flac.1.trashinfo").is_file());
+        assert!(!trash.join("files").join("song.flac").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copy_keeps_atime_separate_from_mtime() {
+        let root = scratch("atime");
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::create_dir(root.join("dst")).unwrap();
+        let file = root.join("src").join("note.txt");
+        std::fs::write(&file, b"hello robin").unwrap();
+        let opened = File::open(&file).unwrap();
+        let atime = rustix::fs::Timespec {
+            tv_sec: 1_600_000_000,
+            tv_nsec: 0,
+        };
+        let mtime = rustix::fs::Timespec {
+            tv_sec: 1_700_000_000,
+            tv_nsec: 0,
+        };
+        rustix::fs::futimens(
+            &opened,
+            &rustix::fs::Timestamps {
+                last_access: atime,
+                last_modification: mtime,
+            },
+        )
+        .unwrap();
+        drop(opened);
+        let parent = DirFd::open(&root.join("src")).unwrap();
+        let dest = DirFd::open(&root.join("dst")).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = replace_ask;
+        copy_file(
+            &parent,
+            std::ffi::OsStr::new("note.txt"),
+            &dest,
+            std::ffi::OsStr::new("note.txt"),
+            &mut opts(&cancel, &mut policy, &mut ask),
+        )
+        .unwrap();
+        let copied = rustix::fs::stat(root.join("dst").join("note.txt")).unwrap();
+        assert_eq!(copied.st_atime, 1_600_000_000);
+        assert_eq!(copied.st_mtime, 1_700_000_000);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copy_preserves_user_xattr() {
+        let root = scratch("xattr");
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::create_dir(root.join("dst")).unwrap();
+        let file = root.join("src").join("note.txt");
+        std::fs::write(&file, b"hello robin").unwrap();
+        let opened = File::options().read(true).write(true).open(&file).unwrap();
+        rustix::fs::fsetxattr(
+            &opened,
+            "user.robin",
+            b"amber",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+        drop(opened);
+        let parent = DirFd::open(&root.join("src")).unwrap();
+        let dest = DirFd::open(&root.join("dst")).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = replace_ask;
+        copy_file(
+            &parent,
+            std::ffi::OsStr::new("note.txt"),
+            &dest,
+            std::ffi::OsStr::new("note.txt"),
+            &mut opts(&cancel, &mut policy, &mut ask),
+        )
+        .unwrap();
+        let copied = File::open(root.join("dst").join("note.txt")).unwrap();
+        let mut value = [0u8; 8];
+        let n = rustix::fs::fgetxattr(&copied, "user.robin", &mut value).unwrap();
+        assert_eq!(&value[..n], b"amber");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn xattr_enotsup_is_tolerated_and_other_errors_propagate() {
+        assert!(xattr_errno(Errno::NOTSUP).is_ok());
+        let err = xattr_errno(Errno::PERM).unwrap_err();
+        assert!(err.to_string().contains("xattr"), "{err}");
+    }
+
+    fn mode_bits(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn owner_uid(path: &Path) -> u32 {
+        rustix::fs::stat(path).unwrap().st_uid
     }
 
     #[test]

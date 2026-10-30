@@ -4110,6 +4110,7 @@ name = "robin"
 version = "0.1.0"
 dependencies = [
  "image",
+ "libc",
  "md-5",
  "png 0.17.16",
  "rustix 1.1.6",
