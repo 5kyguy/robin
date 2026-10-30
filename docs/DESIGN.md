@@ -337,3 +337,15 @@ Checked against the 1.17.1 sources rather than assumed.
   modifiers and no hover events, so the target is always the open
   folder. winit 0.30 has no Wayland implementation, so nothing arrives
   there.
+- Upstream status (checked 2026-10-31): winit 0.31 replaces
+  `DroppedFile` with `DragEntered`/`DragMoved`/`DragDropped`/`DragLeft`
+  carrying all paths plus the pointer position, and implements them on
+  Wayland ([winit#4571](https://github.com/rust-windowing/winit/pull/4571),
+  merged 2026-07-16, shipped in 0.31 betas). Slint 1.17's release notes
+  say cross-app drag and drop is "in development upstream in winit", and
+  Slint's docs still expose only `winit_030`. Once Slint moves to winit
+  0.31, Robin can switch to `DragDropped` and target the row under the
+  pointer.
+- XWayland: winit 0.30 chooses X11 when `WAYLAND_DISPLAY` is empty and
+  `DISPLAY` is set, so `WAYLAND_DISPLAY= robin` is a documented opt-in,
+  not the default.
