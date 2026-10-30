@@ -324,6 +324,8 @@ pub struct Toast {
     pub tone: &'static str,
     pub text: String,
     pub details: Vec<String>,
+    /// The first detail stays at the top of the list, above any "+N more".
+    pub pinned: bool,
     /// Undo after trash.
     pub undo: bool,
 }
@@ -348,6 +350,7 @@ impl Outcome {
                     format!("{text}, {stayed} stayed in the trash")
                 },
                 details: self.failed.clone(),
+                pinned: false,
                 undo: false,
             };
         }
@@ -374,7 +377,44 @@ impl Outcome {
         if self.cancelled {
             text = format!("{text}, then cancelled");
         }
+        // An error that stopped a merge partway says how far the merge
+        // it happened in got; the error is pinned above what didn't make
+        // it, then the rest of the job's details.
+        if let Some(m) = self.report.merges.first() {
+            let mut details = vec![m.error.clone()];
+            for level in &self.report.merges {
+                details.extend(level.partly.iter().map(|p| format!("{p} — partly merged")));
+                details.extend(level.missing.iter().map(|p| format!("{p} — not merged")));
+                details.extend(level.skipped.iter().cloned());
+            }
+            // Job-level skips a merge already showed aren't repeated.
+            let mut rest = self.report.clone();
+            let covered: Vec<_> = self.report.merges.iter().flat_map(|m| &m.covers).collect();
+            rest.skipped.retain(|s| !covered.contains(&&s.path));
+            details.extend(rest.details());
+            details.extend(self.report.leftovers.iter().cloned());
+            // The failure of the merged item itself repeats the error.
+            details.extend(
+                self.failed
+                    .iter()
+                    .filter(|f| !f.ends_with(&m.error))
+                    .cloned(),
+            );
+            return Toast {
+                tone: "warning",
+                text: format!(
+                    "Merged {} of {} into {} before an error",
+                    m.merged,
+                    count(m.total),
+                    m.into
+                ),
+                details,
+                pinned: true,
+                undo: false,
+            };
+        }
         let mut details = self.report.details();
+        details.extend(self.report.leftovers.iter().cloned());
         details.extend(self.failed.iter().cloned());
         details.extend(
             self.refused
@@ -393,6 +433,7 @@ impl Outcome {
             tone,
             text,
             details,
+            pinned: false,
             undo: kind == JobKind::Trash && !self.trashed.is_empty(),
         }
     }
@@ -729,6 +770,71 @@ fn restore_one(t: &Trashed) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_merge_stopped_by_an_error_says_how_far_it_got() {
+        use crate::fsops::PartialMerge;
+        let out = Outcome {
+            failed: vec![
+                "raw-exports: IMG_9.CR3: disk full".into(),
+                "notes.txt: Permission denied".into(),
+            ],
+            report: crate::fsops::TransferReport {
+                // Innermost first, as the job records them.
+                merges: vec![
+                    PartialMerge {
+                        into: "raw-exports/day2".into(),
+                        merged: 3,
+                        total: 6,
+                        error: "IMG_9.CR3: disk full".into(),
+                        skipped: vec!["raw-exports/day2/pipe — named pipes are not copied".into()],
+                        covers: vec!["raw-exports/day2/pipe".into()],
+                        missing: vec![
+                            "raw-exports/day2/IMG_9.CR3".into(),
+                            "raw-exports/day2/IMG_10.CR3".into(),
+                        ],
+                        ..Default::default()
+                    },
+                    PartialMerge {
+                        into: "raw-exports".into(),
+                        merged: 31,
+                        total: 33,
+                        error: "IMG_9.CR3: disk full".into(),
+                        partly: vec!["raw-exports/day2".into()],
+                        missing: vec!["raw-exports/day3".into()],
+                        ..Default::default()
+                    },
+                ],
+                leftovers: vec!["raw-exports/x — not removed: denied".into()],
+                skipped: vec![crate::fsops::SkippedEntry {
+                    path: "raw-exports/day2/pipe".into(),
+                    reason: crate::fsops::SkipReason::Fifo,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let t = out.toast(JobKind::Copy);
+        assert_eq!(t.tone, "warning");
+        assert!(t.pinned);
+        assert_eq!(
+            t.text,
+            "Merged 3 of 6 items into raw-exports/day2 before an error"
+        );
+        assert_eq!(
+            t.details,
+            [
+                "IMG_9.CR3: disk full",
+                "raw-exports/day2/IMG_9.CR3 — not merged",
+                "raw-exports/day2/IMG_10.CR3 — not merged",
+                "raw-exports/day2/pipe — named pipes are not copied",
+                "raw-exports/day2 — partly merged",
+                "raw-exports/day3 — not merged",
+                "raw-exports/x — not removed: denied",
+                "notes.txt: Permission denied",
+            ]
+        );
+    }
     use std::fs;
 
     fn scratch(label: &str) -> PathBuf {
