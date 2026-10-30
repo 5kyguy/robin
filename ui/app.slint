@@ -474,6 +474,8 @@ export component AppWindow inherits Window {
     in property <[string]> menu-labels;
     in property <string> toast-text: "";
     in property <[string]> toast-details;
+    // "" neutral, "warning" partial move, "danger" refused up front.
+    in property <string> toast-tone: "";
 
     title: "Robin";
     default-font-family: "JetBrainsMono Nerd Font";
@@ -1870,27 +1872,37 @@ export component AppWindow inherits Window {
     }
 
     // Neutral completion toast. Skipped entries are listed, never dropped.
-    if !harness && (overlay == "skipped" || overlay == "skipped-details"): Rectangle {
-        property <bool> open: overlay == "skipped-details";
+    if !harness && (overlay == "skipped" || overlay == "skipped-details" || overlay == "toast-details"): Rectangle {
+        property <bool> open: overlay == "skipped-details" || overlay == "toast-details";
+        property <color> tone: toast-tone == "warning" ? warning : toast-tone == "danger" ? danger : muted;
         property <length> line-h: 20px;
-        width: 520px;
+        width: 800px;
         height: open ? 52px + 12px + toast-details.length * line-h + 12px : 52px;
         x: side-w + (parent.width - side-w - self.width) / 2;
         y: parent.height - status-h - 16px - self.height;
         background: surface;
         border-radius: 8px;
         border-width: 1px;
-        border-color: hairline;
+        border-color: toast-tone == "" ? hairline : tone;
         drop-shadow-blur: 16px;
         drop-shadow-color: #000000.with-alpha(0.35);
+        if toast-tone != "": Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 4px;
+            height: parent.height;
+            border-top-left-radius: 8px;
+            border-bottom-left-radius: 8px;
+            background: tone;
+        }
         Text {
-            text: "󰄬";
+            text: toast-tone == "warning" ? "󰀦" : toast-tone == "danger" ? "󰅙" : "󰄬";
             x: 16px;
             y: 0px;
             width: 18px;
             height: 52px;
             font-size: 14px;
-            color: muted;
+            color: tone;
             vertical-alignment: center;
         }
         Text {

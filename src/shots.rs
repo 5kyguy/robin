@@ -45,6 +45,8 @@ pub fn known(view: &str) -> bool {
             | "progress-error"
             | "skipped"
             | "skipped-details"
+            | "move-partial"
+            | "move-blocked"
             | "menu-file"
             | "shortcuts-browser"
             | "reduce-motion"
@@ -196,11 +198,11 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         }
         .into(),
     );
-    let report = skipped_report();
-    ui.set_toast_text(report.summary().into());
+    let (tone, text, details) = toast(view);
+    ui.set_toast_tone(tone.into());
+    ui.set_toast_text(text.into());
     ui.set_toast_details(ModelRc::new(Rc::new(VecModel::from(
-        report
-            .details()
+        details
             .into_iter()
             .map(slint::SharedString::from)
             .collect::<Vec<_>>(),
@@ -221,6 +223,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "progress-error" => "progress-error",
             "skipped" => "skipped",
             "skipped-details" => "skipped-details",
+            "move-partial" | "move-blocked" => "toast-details",
             "menu-file" => "menu-file",
             "shortcuts-browser" | "shortcuts-viewer" => "shortcuts",
             _ => "",
@@ -307,6 +310,45 @@ fn stats_cells(drilled: bool) -> Vec<MapCell> {
         .collect()
 }
 
+/// Tone, line, and details for the transfer toasts.
+fn toast(view: &str) -> (&'static str, String, Vec<String>) {
+    use crate::fsops::{KeepReason, KeptEntry};
+    let kept = |path: &str, reason| KeptEntry {
+        path: path.into(),
+        reason,
+    };
+    match view {
+        "move-partial" => {
+            let report = crate::fsops::TransferReport {
+                moved: 212,
+                skipped: Vec::new(),
+                left_behind: vec![
+                    kept("Projects/robin/vendor/fonts", KeepReason::ReadOnlyFolder),
+                    kept("Projects/robin/vendor/icons", KeepReason::ReadOnlyFolder),
+                ],
+            };
+            ("warning", report.summary(), report.details())
+        }
+        "move-blocked" => {
+            let (title, lines) = crate::fsops::refusal_text(
+                "Projects",
+                &[
+                    kept(
+                        "Projects/robin/vendor/fonts/Inter.ttf",
+                        KeepReason::ReadOnlyFolder,
+                    ),
+                    kept("Projects/shared/notes.md", KeepReason::StickyFolder),
+                ],
+            );
+            ("danger", title, lines)
+        }
+        _ => {
+            let report = skipped_report();
+            ("", report.summary(), report.details())
+        }
+    }
+}
+
 /// The report a cross-device move of ~/Projects to SANDISK would produce.
 fn skipped_report() -> crate::fsops::TransferReport {
     use crate::fsops::{SkipReason, SkippedEntry, TransferReport};
@@ -321,6 +363,7 @@ fn skipped_report() -> crate::fsops::TransferReport {
             skip("Projects/robin/.cache/build.fifo", SkipReason::Fifo),
             skip("Projects/r2-d2/run/agent.sock", SkipReason::Socket),
         ],
+        left_behind: Vec::new(),
     }
 }
 
