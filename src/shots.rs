@@ -11,7 +11,7 @@ use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::error::{Error, Result};
 use crate::theme::Theme;
-use crate::{AppWindow, GridLine, Place, Row};
+use crate::{AppWindow, GridLine, MapCell, Place, Row};
 
 pub fn known(view: &str) -> bool {
     matches!(
@@ -228,15 +228,63 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         }
         .into(),
     );
-    ui.set_stats_mode(
-        match view {
-            "stats-overview" | "theme-black-stats" => "overview",
-            "stats-treemap-drilled" => "drilled",
-            "stats-empty-trash" => "empty-trash",
-            _ => "",
-        }
-        .into(),
-    );
+    let stats_mode = match view {
+        "stats-overview" | "theme-black-stats" => "overview",
+        "stats-treemap-drilled" => "drilled",
+        "stats-empty-trash" => "empty-trash",
+        _ => "",
+    };
+    ui.set_stats_mode(stats_mode.into());
+    if !stats_mode.is_empty() {
+        ui.set_map_cells(ModelRc::new(Rc::new(VecModel::from(stats_cells(
+            stats_mode == "drilled",
+        )))));
+    }
+}
+
+fn stats_cells(drilled: bool) -> Vec<MapCell> {
+    let weights: Vec<(String, u64)> = if drilled {
+        vec![
+            ("raw-exports".into(), 180),
+            ("tatooine-trip".into(), 140),
+            ("speeder-run.mp4".into(), 52),
+            ("cantina-band.heic".into(), 40),
+        ]
+    } else {
+        vec![
+            ("Videos".into(), 412),
+            ("Projects".into(), 188),
+            ("Pictures".into(), 141),
+            ("Downloads".into(), 96),
+            ("Games".into(), 61),
+            ("Music".into(), 58),
+            (".cache".into(), 22),
+            ("Documents".into(), 31),
+            ("Mail".into(), 9),
+            ("other".into(), 24),
+        ]
+    };
+    let mut ranked = weights.clone();
+    ranked.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
+    let steps = ranked.len().saturating_sub(1).max(1) as f32;
+    let shade: std::collections::HashMap<String, f32> = ranked
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| (name.clone(), 0.70 - (index as f32 / steps) * 0.45))
+        .collect();
+    let labels: std::collections::HashMap<_, _> = weights.iter().cloned().collect();
+    crate::stats::squarify(&weights, 623.0, 300.0)
+        .into_iter()
+        .map(|rect| MapCell {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+            name: rect.name.clone().into(),
+            detail: format!("{} GB", labels[&rect.name]).into(),
+            shade: shade[&rect.name],
+        })
+        .collect()
 }
 
 fn places(view: &str) -> Vec<Place> {
