@@ -401,6 +401,8 @@ pub enum KeepReason {
     /// The folder is sticky and neither it nor the entry is ours.
     StickyFolder,
     ReadOnlyFilesystem,
+    /// A folder we can't open, so nothing inside it can be removed.
+    UnreadableFolder,
 }
 
 impl KeepReason {
@@ -409,6 +411,7 @@ impl KeepReason {
             KeepReason::ReadOnlyFolder => "read-only folder",
             KeepReason::StickyFolder => "shared folder owned by someone else",
             KeepReason::ReadOnlyFilesystem => "read-only drive",
+            KeepReason::UnreadableFolder => "folder can't be opened",
         }
     }
 }
@@ -430,8 +433,10 @@ pub enum TransferStatus {
     Partial,
 }
 
-fn keep_reason(err: &Error) -> Option<KeepReason> {
-    if io_is(err, Errno::ACCESS) || io_is(err, Errno::PERM) {
+fn keep_reason(err: &Error, sticky: bool) -> Option<KeepReason> {
+    if io_is(err, Errno::PERM) && sticky {
+        Some(KeepReason::StickyFolder)
+    } else if io_is(err, Errno::ACCESS) || io_is(err, Errno::PERM) {
         Some(KeepReason::ReadOnlyFolder)
     } else if io_is(err, Errno::ROFS) {
         Some(KeepReason::ReadOnlyFilesystem)
@@ -560,6 +565,7 @@ pub fn refusal(name: &str, blocked: &[KeptEntry]) -> Refusal {
     let mut folders: Vec<std::path::PathBuf> = Vec::new();
     let mut shared = Vec::new();
     let mut drive = Vec::new();
+    let mut locked = Vec::new();
     for k in blocked {
         match k.reason {
             KeepReason::ReadOnlyFolder => {
@@ -570,6 +576,7 @@ pub fn refusal(name: &str, blocked: &[KeptEntry]) -> Refusal {
             }
             KeepReason::StickyFolder => shared.push(k.path.clone()),
             KeepReason::ReadOnlyFilesystem => drive.push(k.path.clone()),
+            KeepReason::UnreadableFolder => locked.push(k.path.clone()),
         }
     }
     let mut parts = Vec::new();
@@ -578,6 +585,12 @@ pub fn refusal(name: &str, blocked: &[KeptEntry]) -> Refusal {
         parts.push(format!(
             "{} inside {verb} read-only",
             plural(folders.len(), "folder", "folders")
+        ));
+    }
+    if !locked.is_empty() {
+        parts.push(format!(
+            "{} inside can't be opened",
+            plural(locked.len(), "folder", "folders")
         ));
     }
     if !shared.is_empty() {
@@ -596,6 +609,7 @@ pub fn refusal(name: &str, blocked: &[KeptEntry]) -> Refusal {
     }
     let paths = folders
         .iter()
+        .chain(&locked)
         .chain(&shared)
         .chain(&drive)
         .map(|p| p.display().to_string())
@@ -669,15 +683,29 @@ fn removal_blockers(
     if let EntryKind::Skip(_) = kind {
         return Ok(());
     }
-    if let Some(reason) = removal_denied(parent, &stat) {
+    if let Some(reason) = removal_denied(parent, &stat, rel)? {
         out.push(KeptEntry {
             path: rel.to_path_buf(),
             reason,
         });
     }
     if kind == EntryKind::Dir {
-        let child = parent.open_dir_nofollow(from)?;
-        for entry in child.list()? {
+        let opened = parent.open_dir_nofollow(from).and_then(|child| {
+            let entries = child.list()?;
+            Ok((child, entries))
+        });
+        let (child, entries) = match opened {
+            Ok(v) => v,
+            Err(e) if io_is(&e, Errno::ACCESS) || io_is(&e, Errno::PERM) => {
+                out.push(KeptEntry {
+                    path: rel.to_path_buf(),
+                    reason: KeepReason::UnreadableFolder,
+                });
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
             removal_blockers(
                 &child,
                 &entry.name,
@@ -692,28 +720,62 @@ fn removal_blockers(
 }
 
 /// Whether unlinking an entry with `stat` from `parent` would be refused.
-fn removal_denied(parent: &DirFd, stat: &rustix::fs::Stat) -> Option<KeepReason> {
+/// Only a permission answer is a reason; any other failure is an error.
+fn removal_denied(
+    parent: &DirFd,
+    stat: &rustix::fs::Stat,
+    rel: &Path,
+) -> Result<Option<KeepReason>> {
     match rustix::fs::accessat(
         parent.as_fd(),
         c".",
         rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
-        AtFlags::empty(),
+        AtFlags::EACCESS,
     ) {
         Ok(()) => {}
-        Err(Errno::ROFS) => return Some(KeepReason::ReadOnlyFilesystem),
-        Err(_) => return Some(KeepReason::ReadOnlyFolder),
+        Err(Errno::ROFS) => return Ok(Some(KeepReason::ReadOnlyFilesystem)),
+        Err(Errno::ACCESS | Errno::PERM) => return Ok(Some(KeepReason::ReadOnlyFolder)),
+        Err(e) => return Err(Error::from_errno(rel, e)),
     }
-    let dir = rustix::fs::fstat(parent.as_fd()).ok()?;
+    let dir = rustix::fs::fstat(parent.as_fd()).map_err(|e| Error::from_errno(rel, e))?;
+    if sticky_blocks(&dir, stat) {
+        return Ok(Some(KeepReason::StickyFolder));
+    }
+    Ok(None)
+}
+
+/// A sticky folder lets only the entry's owner, the folder's owner, or root
+/// remove an entry.
+fn sticky_blocks(dir: &rustix::fs::Stat, entry: &rustix::fs::Stat) -> bool {
     let uid = rustix::process::geteuid().as_raw();
-    if dir.st_mode & 0o1000 != 0 && uid != 0 && uid != stat.st_uid && uid != dir.st_uid {
-        return Some(KeepReason::StickyFolder);
-    }
-    None
+    dir.st_mode & 0o1000 != 0 && uid != 0 && uid != entry.st_uid && uid != dir.st_uid
+}
+
+/// Whether `from` in `parent` is held by sticky-folder rules.
+fn sticky_denies(parent: &DirFd, from: &std::ffi::OsStr) -> bool {
+    let Ok(c) = component(from) else {
+        return false;
+    };
+    let (Ok(dir), Ok(entry)) = (
+        rustix::fs::fstat(parent.as_fd()),
+        rustix::fs::statat(parent.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW),
+    ) else {
+        return false;
+    };
+    sticky_blocks(&dir, &entry)
 }
 
 impl TransferReport {
-    fn keep(&mut self, rel: &Path, err: Error) -> Result<CopyOutcome> {
-        match keep_reason(&err) {
+    /// Record a removal that failed after the copy. `parent` and `from`
+    /// are used to tell a sticky folder's EPERM from a read-only one.
+    fn keep(
+        &mut self,
+        parent: &DirFd,
+        from: &std::ffi::OsStr,
+        rel: &Path,
+        err: Error,
+    ) -> Result<CopyOutcome> {
+        match keep_reason(&err, sticky_denies(parent, from)) {
             Some(reason) => {
                 self.left_behind.push(KeptEntry {
                     path: rel.to_path_buf(),
@@ -838,7 +900,7 @@ fn move_entry(
             }
             match remove_child(parent, from, &mut |_| {}, opts.copy.cancel) {
                 Ok(()) => Ok(CopyOutcome::Copied),
-                Err(err) => opts.report.keep(rel, err),
+                Err(err) => opts.report.keep(parent, from, rel, err),
             }
         }
     }
@@ -899,7 +961,9 @@ fn move_symlink(
     }
     match rustix::fs::unlinkat(parent.as_fd(), from_c.as_c_str(), AtFlags::empty()) {
         Ok(()) => Ok(CopyOutcome::Copied),
-        Err(e) => opts.report.keep(rel, Error::from_errno(from, e)),
+        Err(e) => opts
+            .report
+            .keep(parent, from, rel, Error::from_errno(from, e)),
     }
 }
 
@@ -974,7 +1038,7 @@ fn move_directory(
         Ok(())
     })();
     if created {
-        rustix::fs::fchmod(dst.as_fd(), Mode::from_raw_mode(stat.st_mode & 0o7777))
+        rustix::fs::fchmod(dst.as_fd(), Mode::from_raw_mode(stat.st_mode & 0o777))
             .map_err(|e| Error::from_errno(&dest_name, e))?;
         set_times(dst.as_fd(), &stat).map_err(|e| Error::from_errno(&dest_name, e))?;
     }
@@ -987,7 +1051,9 @@ fn move_directory(
         return Ok(CopyOutcome::Copied);
     }
     if let Err(e) = rustix::fs::unlinkat(parent.as_fd(), from_c.as_c_str(), AtFlags::REMOVEDIR) {
-        return opts.report.keep(rel, Error::from_errno(from, e));
+        return opts
+            .report
+            .keep(parent, from, rel, Error::from_errno(from, e));
     }
     rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
     Ok(CopyOutcome::Copied)
@@ -2624,13 +2690,14 @@ mod tests {
         let tmp = DirFd::open(Path::new("/tmp")).unwrap();
         let mut ours = rustix::fs::fstat(tmp.as_fd()).unwrap();
         ours.st_uid = rustix::process::geteuid().as_raw();
-        assert_eq!(removal_denied(&tmp, &ours), None);
+        let rel = Path::new("x");
+        assert_eq!(removal_denied(&tmp, &ours, rel).unwrap(), None);
         let mut theirs = ours;
         theirs.st_uid = ours.st_uid.wrapping_add(4242);
         let dir = rustix::fs::fstat(tmp.as_fd()).unwrap();
         if dir.st_mode & 0o1000 != 0 && dir.st_uid != ours.st_uid {
             assert_eq!(
-                removal_denied(&tmp, &theirs),
+                removal_denied(&tmp, &theirs, rel).unwrap(),
                 Some(KeepReason::StickyFolder)
             );
         }
@@ -2730,6 +2797,53 @@ mod tests {
         assert!(result.is_none());
         assert!(!root.join("dest").exists());
         cleanup_read_only(&root);
+    }
+
+    #[test]
+    fn unopenable_subfolder_is_a_refusal_not_an_io_error() {
+        if running_as_root() {
+            return;
+        }
+        for mode in [0o300, 0o000] {
+            let root = scratch("unopenable");
+            let src = root.join("src");
+            std::fs::create_dir_all(src.join("locked")).unwrap();
+            std::fs::write(src.join("locked/f"), b"x").unwrap();
+            std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            let (result, _) = move_src(&root, true);
+            std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            match result {
+                Err(Error::NotRemovable(blocked)) => {
+                    assert_eq!(
+                        blocked,
+                        vec![KeptEntry {
+                            path: "src/locked".into(),
+                            reason: KeepReason::UnreadableFolder,
+                        }],
+                        "mode {mode:o}"
+                    );
+                    assert_eq!(
+                        refusal("src", &blocked).title,
+                        "Can't move src: 1 folder inside can't be opened"
+                    );
+                }
+                other => panic!("mode {mode:o}: expected a refusal, got {other:?}"),
+            }
+            assert!(!root.join("dest").exists());
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn sticky_eperm_after_copy_is_a_sticky_reason() {
+        let err = Error::from_errno("x", Errno::PERM);
+        assert_eq!(keep_reason(&err, true), Some(KeepReason::StickyFolder));
+        assert_eq!(keep_reason(&err, false), Some(KeepReason::ReadOnlyFolder));
+        let acc = Error::from_errno("x", Errno::ACCESS);
+        assert_eq!(keep_reason(&acc, true), Some(KeepReason::ReadOnlyFolder));
+        assert_eq!(keep_reason(&Error::from_errno("x", Errno::IO), false), None);
     }
 
     fn mode_bits(path: &Path) -> u32 {
