@@ -374,7 +374,27 @@ impl Outcome {
         if self.cancelled {
             text = format!("{text}, then cancelled");
         }
+        // An error that stopped a merge partway says how far it got; the
+        // error and what didn't make it go under Details.
+        if let Some(m) = self.report.merges.last() {
+            let mut details = vec![m.error.clone()];
+            details.extend(m.missing.iter().map(|p| format!("{p} — not merged")));
+            details.extend(self.report.details());
+            details.extend(self.report.leftovers.iter().cloned());
+            return Toast {
+                tone: "warning",
+                text: format!(
+                    "Merged {} of {} into {} before an error",
+                    m.merged,
+                    count(m.total),
+                    m.into
+                ),
+                details,
+                undo: false,
+            };
+        }
         let mut details = self.report.details();
+        details.extend(self.report.leftovers.iter().cloned());
         details.extend(self.failed.iter().cloned());
         details.extend(
             self.refused
@@ -729,6 +749,39 @@ fn restore_one(t: &Trashed) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_merge_stopped_by_an_error_says_how_far_it_got() {
+        let out = Outcome {
+            failed: vec!["raw-exports: disk full".into()],
+            report: crate::fsops::TransferReport {
+                merges: vec![crate::fsops::PartialMerge {
+                    into: "raw-exports".into(),
+                    merged: 31,
+                    total: 48,
+                    error: "IMG_9.CR3: disk full".into(),
+                    missing: vec!["raw-exports/IMG_9.CR3".into()],
+                }],
+                leftovers: vec!["raw-exports/x — not removed: denied".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let t = out.toast(JobKind::Copy);
+        assert_eq!(t.tone, "warning");
+        assert_eq!(
+            t.text,
+            "Merged 31 of 48 items into raw-exports before an error"
+        );
+        assert_eq!(
+            t.details,
+            [
+                "IMG_9.CR3: disk full",
+                "raw-exports/IMG_9.CR3 — not merged",
+                "raw-exports/x — not removed: denied"
+            ]
+        );
+    }
     use std::fs;
 
     fn scratch(label: &str) -> PathBuf {

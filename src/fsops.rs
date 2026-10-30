@@ -83,7 +83,7 @@ pub fn choice_from_buttons(
     Ok(ConflictChoice { action, apply_all })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConflictPrompt {
     pub name: String,
     pub kind: ConflictKind,
@@ -91,6 +91,10 @@ pub struct ConflictPrompt {
     pub existing_mtime: i64,
     pub incoming_size: u64,
     pub incoming_mtime: i64,
+    /// Items directly inside, for folders; None for files or when the
+    /// folder can't be read.
+    pub existing_items: Option<usize>,
+    pub incoming_items: Option<usize>,
 }
 
 /// What clashes with what, (existing, incoming). An "apply to all"
@@ -332,7 +336,7 @@ pub fn copy_file(
     if is_dir(stat.st_mode) {
         return Err(Error::Message("refusing to copy a directory".into()));
     }
-    let dest = resolve_dest_name(dest_parent, to, &stat, opts)?;
+    let dest = resolve_dest_name(dest_parent, to, &stat, None, opts)?;
     let Some(DestName {
         name: dest_name,
         replace,
@@ -519,6 +523,21 @@ pub struct TransferReport {
     /// Source entries copied in full, for removing the originals of a
     /// folder move once its copy is done.
     pub copied: Vec<Copied>,
+    /// Merges an error stopped partway, innermost first.
+    pub merges: Vec<PartialMerge>,
+    /// Things a cancel or error cleanup landed but couldn't take back.
+    pub leftovers: Vec<String>,
+}
+
+/// A merge into an existing folder that an error stopped partway.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PartialMerge {
+    pub into: String,
+    pub merged: usize,
+    pub total: usize,
+    pub error: String,
+    /// Source items that weren't merged, the failing one first.
+    pub missing: Vec<String>,
 }
 
 /// A source entry copied in full, and which inode it was, so removing the
@@ -1029,7 +1048,7 @@ fn move_symlink(
     let Some(DestName {
         name: dest_name,
         replace,
-    }) = resolve_dest_name(dest_parent, to, stat, &mut opts.copy)?
+    }) = resolve_dest_name(dest_parent, to, stat, None, &mut opts.copy)?
     else {
         return Ok(CopyOutcome::Skipped);
     };
@@ -1226,7 +1245,7 @@ fn move_directory_inner(
     let from_c = component(from)?;
     let stat = rustix::fs::statat(parent.as_fd(), from_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|e| Error::from_errno(from, e))?;
-    let dest = resolve_dest_name(dest_parent, to, &stat, &mut opts.copy)?;
+    let dest = resolve_dest_name(dest_parent, to, &stat, Some((parent, from)), &mut opts.copy)?;
     let Some(DestName {
         name: dest_name,
         replace,
@@ -1262,8 +1281,13 @@ fn move_directory_inner(
     let mut all_copied = true;
     // Children first; the mode and times are applied even if a child fails,
     // so a partial copy does not stay 0700 or carry the copy time.
+    let mut merged = 0;
+    let mut stopped_at = 0;
+    let mut listing = Vec::new();
     let children = (|| -> Result<()> {
-        for entry in src.list()? {
+        listing = src.list()?;
+        for (i, entry) in listing.iter().enumerate() {
+            stopped_at = i;
             if opts.copy.cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -1280,16 +1304,41 @@ fn move_directory_inner(
             )?;
             if outcome == CopyOutcome::Skipped {
                 all_copied = false;
+            } else {
+                merged += 1;
             }
         }
         Ok(())
     })();
+    if let Err(err) = &children {
+        if !created && !matches!(err, Error::Cancelled) && !listing.is_empty() {
+            opts.report.merges.push(PartialMerge {
+                into: dest_name.to_string_lossy().into_owned(),
+                merged,
+                total: listing.len(),
+                error: err.to_string(),
+                missing: listing[stopped_at..]
+                    .iter()
+                    .map(|e| rel.join(&e.name).display().to_string())
+                    .collect(),
+            });
+        }
+    }
     // A Cancel takes back what this job landed here. Any other error does
     // too in a folder this job created, so a failed copy leaves no
     // half-built folder; in a merged folder it keeps what landed.
     if let Err(err) = &children {
         if created || matches!(err, Error::Cancelled) {
-            LANDED.with(|l| undo_landed(&dst, dst_id, &l.borrow()[mark..]));
+            let shown = Path::new(&dest_name).to_path_buf();
+            LANDED.with(|l| {
+                undo_landed(
+                    &dst,
+                    dst_id,
+                    &l.borrow()[mark..],
+                    &shown,
+                    &mut opts.report.leftovers,
+                )
+            });
             if created {
                 drop(dst);
                 if let Ok(c) = component(dest_name.as_os_str()) {
@@ -1299,11 +1348,9 @@ fn move_directory_inner(
                         AtFlags::SYMLINK_NOFOLLOW,
                     ) {
                         Ok(st) if ident(&st) == dst_id => {
-                            let _ = rustix::fs::unlinkat(
-                                dest_parent.as_fd(),
-                                c.as_c_str(),
-                                AtFlags::REMOVEDIR,
-                            );
+                            if let Err(e) = unlink_landed(dest_parent, &c, AtFlags::REMOVEDIR) {
+                                opts.report.leftovers.push(leftover(&shown, e));
+                            }
                         }
                         _ => {}
                     }
@@ -1611,6 +1658,7 @@ fn resolve_dest_name(
     dest_parent: &DirFd,
     to: &std::ffi::OsStr,
     incoming: &rustix::fs::Stat,
+    incoming_dir: Option<(&DirFd, &std::ffi::OsStr)>,
     opts: &mut CopyOpts<'_>,
 ) -> Result<Option<DestName>> {
     if !exists(dest_parent, to)? {
@@ -1619,7 +1667,7 @@ fn resolve_dest_name(
             replace: false,
         }));
     }
-    let action = settle_conflict_stat(dest_parent, to, incoming, opts)?;
+    let action = settle_conflict_stat(dest_parent, to, incoming, incoming_dir, opts)?;
     match action {
         Conflict::Skip => Ok(None),
         Conflict::Replace => Ok(Some(DestName {
@@ -1659,7 +1707,39 @@ fn ident(st: &rustix::fs::Stat) -> (u64, u64) {
 /// first. Each entry goes only while it is still the inode we made, and
 /// a folder only once empty, so anything another program put there stays.
 /// Best effort: it runs while another error is already being returned.
-fn undo_landed(dir: &DirFd, id: (u64, u64), landed: &[Landed]) {
+/// "path — not removed: reason", for the job's Details.
+fn leftover(path: &Path, e: rustix::io::Errno) -> String {
+    format!(
+        "{} — not removed: {}",
+        path.display(),
+        std::io::Error::from(e)
+    )
+}
+
+fn unlink_landed(
+    dir: &DirFd,
+    c: &std::ffi::CStr,
+    flags: AtFlags,
+) -> std::result::Result<(), rustix::io::Errno> {
+    #[cfg(test)]
+    #[cfg(test)]
+    if FAIL_UNDO.with(|f| f.borrow().as_deref() == Some(std::ffi::OsStr::from_bytes(c.to_bytes())))
+    {
+        return Err(rustix::io::Errno::ACCESS);
+    }
+    match rustix::fs::unlinkat(dir.as_fd(), c, flags) {
+        Err(rustix::io::Errno::NOENT) => Ok(()),
+        r => r,
+    }
+}
+
+fn undo_landed(
+    dir: &DirFd,
+    id: (u64, u64),
+    landed: &[Landed],
+    at: &Path,
+    leftovers: &mut Vec<String>,
+) {
     for entry in landed.iter().rev().filter(|e| e.parent == id) {
         let Ok(c) = component(&entry.name) else {
             continue;
@@ -1685,7 +1765,7 @@ fn undo_landed(dir: &DirFd, id: (u64, u64), landed: &[Landed]) {
                             Mode::from_raw_mode((st.st_mode & 0o777) | 0o700),
                         );
                     }
-                    undo_landed(&sub, entry.id, landed)
+                    undo_landed(&sub, entry.id, landed, &at.join(&entry.name), leftovers)
                 }
                 _ => continue,
             }
@@ -1699,7 +1779,9 @@ fn undo_landed(dir: &DirFd, id: (u64, u64), landed: &[Landed]) {
         // empty folder.
         match rustix::fs::statat(dir.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
             Ok(st) if ident(&st) == entry.id => {
-                let _ = rustix::fs::unlinkat(dir.as_fd(), c.as_c_str(), flags);
+                if let Err(e) = unlink_landed(dir, &c, flags) {
+                    leftovers.push(leftover(&at.join(&entry.name), e));
+                }
             }
             _ => {}
         }
@@ -1710,6 +1792,13 @@ fn undo_landed(dir: &DirFd, id: (u64, u64), landed: &[Landed]) {
 thread_local! {
     /// Fail the landing of this name with EIO, like a disk error.
     pub(crate) static FAIL_LANDING: std::cell::RefCell<Option<std::ffi::OsString>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Refuse taking back this name, like a permission error.
+    pub(crate) static FAIL_UNDO: std::cell::RefCell<Option<std::ffi::OsString>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1786,13 +1875,14 @@ fn settle_conflict(
     let from_c = component(from)?;
     let stat = rustix::fs::statat(parent.as_fd(), from_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|e| Error::from_errno(from, e))?;
-    settle_conflict_stat(dest_parent, to, &stat, opts)
+    settle_conflict_stat(dest_parent, to, &stat, Some((parent, from)), opts)
 }
 
 fn settle_conflict_stat(
     dest_parent: &DirFd,
     to: &std::ffi::OsStr,
     incoming: &rustix::fs::Stat,
+    incoming_dir: Option<(&DirFd, &std::ffi::OsStr)>,
     opts: &mut CopyOpts<'_>,
 ) -> Result<Conflict> {
     let to_c = component(to)?;
@@ -1809,8 +1899,24 @@ fn settle_conflict_stat(
         existing_mtime: existing.st_mtime,
         incoming_size: incoming.st_size as u64,
         incoming_mtime: incoming.st_mtime,
+        existing_items: is_dir(existing.st_mode)
+            .then(|| items_in(dest_parent, to))
+            .flatten(),
+        incoming_items: is_dir(incoming.st_mode)
+            .then(|| incoming_dir.and_then(|(d, n)| items_in(d, n)))
+            .flatten(),
     };
     opts.policy.choose(&prompt, opts.ask)
+}
+
+/// How many entries a folder holds, for the conflict dialog.
+fn items_in(parent: &DirFd, name: &std::ffi::OsStr) -> Option<usize> {
+    parent
+        .open_dir_nofollow(name)
+        .ok()?
+        .list()
+        .ok()
+        .map(|l| l.len())
 }
 
 fn replace_or_rename(
@@ -2127,6 +2233,7 @@ mod tests {
             existing_mtime: 1,
             incoming_size: 1,
             incoming_mtime: 1,
+            ..Default::default()
         };
         for kind in [
             ConflictKind::FileFile,
@@ -2202,6 +2309,15 @@ mod tests {
     }
 
     fn force_move(root: &Path, from: &str, to: &str, cancel: &Cancel) -> Result<CopyOutcome> {
+        force_move_report(root, from, to, cancel).0
+    }
+
+    fn force_move_report(
+        root: &Path,
+        from: &str,
+        to: &str,
+        cancel: &Cancel,
+    ) -> (Result<CopyOutcome>, TransferReport) {
         let dir = DirFd::open(root).unwrap();
         let mut policy = ConflictPolicy::new();
         let mut ask = |p: &ConflictPrompt| match p.kind {
@@ -2211,22 +2327,107 @@ mod tests {
             }),
             _ => Err(Error::Cancelled),
         };
+        let mut mo = MoveOpts {
+            force_copy: true,
+            fail_before_unlink: false,
+            copy: opts(cancel, &mut policy, &mut ask),
+            report: TransferReport::default(),
+            check_removable: true,
+            keep_source: false,
+        };
         let out = move_child(
             &dir,
             std::ffi::OsStr::new(from),
             &dir,
             std::ffi::OsStr::new(to),
-            &mut MoveOpts {
-                force_copy: true,
-                fail_before_unlink: false,
-                copy: opts(cancel, &mut policy, &mut ask),
-                report: TransferReport::default(),
-                check_removable: true,
-                keep_source: false,
-            },
+            &mut mo,
         );
         BEFORE_LANDING.with(|h| *h.borrow_mut() = None);
-        out
+        FAIL_LANDING.with(|f| *f.borrow_mut() = None);
+        FAIL_UNDO.with(|f| *f.borrow_mut() = None);
+        (out, mo.report)
+    }
+
+    #[test]
+    fn an_error_mid_merge_says_how_far_it_got() {
+        let root = scratch("merge-partial");
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        std::fs::create_dir_all(root.join("dest/sub")).unwrap();
+        for f in ["a", "b", "c"] {
+            std::fs::write(root.join("src/sub").join(f), f).unwrap();
+        }
+        std::fs::write(root.join("dest/sub/keep"), b"old").unwrap();
+        FAIL_LANDING.with(|f| *f.borrow_mut() = Some("b".into()));
+        let (out, report) = force_move_report(&root, "src", "dest", &Cancel::new());
+        assert!(out.is_err(), "{out:?}");
+        let m = report
+            .merges
+            .iter()
+            .find(|m| m.into == "sub")
+            .expect("merge noted");
+        assert_eq!(m.total, 3);
+        assert!(
+            m.error.contains('b') || m.error.contains("I/O"),
+            "{}",
+            m.error
+        );
+        assert!(m.missing[0].ends_with("sub/b"), "{m:?}");
+        assert_eq!(m.merged + m.missing.len(), 3, "{m:?}");
+        // What merged stays; what didn't is still in the source.
+        for f in &m.missing {
+            let name = Path::new(f).file_name().unwrap();
+            assert!(root.join("src/sub").join(name).exists(), "{f}");
+        }
+        assert!(root.join("dest/sub/keep").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_reports_what_it_could_not_take_back() {
+        let root = scratch("undo-leftover");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for f in ["a", "b", "c"] {
+            std::fs::write(root.join("src").join(f), f).unwrap();
+        }
+        let cancel = std::rc::Rc::new(Cancel::new());
+        let c = cancel.clone();
+        let stuck = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let s = stuck.clone();
+        on_landing(move |_, name| {
+            if name == "dest" {
+                return;
+            }
+            // The first file to land can't be taken back.
+            if s.borrow().is_none() {
+                *s.borrow_mut() = Some(name.to_os_string());
+                FAIL_UNDO.with(|f| *f.borrow_mut() = Some(name.to_os_string()));
+            } else {
+                c.cancel();
+            }
+        });
+        let (out, report) = force_move_report(&root, "src", "dest", &cancel);
+        assert!(matches!(out, Err(Error::Cancelled)), "{out:?}");
+        let name = stuck.borrow().clone().unwrap();
+        let name = name.to_string_lossy();
+        assert!(
+            report
+                .leftovers
+                .iter()
+                .any(|l| l.starts_with(&format!("dest/{name} — not removed"))),
+            "{:?}",
+            report.leftovers
+        );
+        assert_eq!(walk(&root.join("dest")), [name.to_string()]);
+        // The folder holding it stays, and says so too.
+        assert!(
+            report
+                .leftovers
+                .iter()
+                .any(|l| l.starts_with("dest — not removed")),
+            "{:?}",
+            report.leftovers
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -952,9 +952,12 @@ pub fn conflict_props(ui: &AppWindow, ask: &ConflictAsk, apply_all: bool) {
         ConflictKind::FileFolder => (false, true),
         ConflictKind::FolderFile => (true, false),
     };
-    let size = |dir: bool, n: u64| if dir { String::new() } else { human(n) };
-    ui.set_conflict_existing_size(size(existing_dir, p.existing_size).into());
-    ui.set_conflict_incoming_size(size(incoming_dir, p.incoming_size).into());
+    ui.set_conflict_existing_size(
+        size_line(existing_dir, p.existing_size, p.existing_items).into(),
+    );
+    ui.set_conflict_incoming_size(
+        size_line(incoming_dir, p.incoming_size, p.incoming_items).into(),
+    );
     ui.set_conflict_existing_folder(existing_dir);
     ui.set_conflict_incoming_folder(incoming_dir);
     // Replacing a folder with a folder merges into it; the button says so.
@@ -972,9 +975,30 @@ pub fn conflict_props(ui: &AppWindow, ask: &ConflictAsk, apply_all: bool) {
     } else {
         keep_both_name(&p.name)
     };
-    ui.set_conflict_hint(format!("Keep both saves it as {both}").into());
+    ui.set_conflict_hint(conflict_hint(&both, folders).into());
     ui.set_conflict_apply_label(apply_label(p.kind, ask.left).into());
     ui.set_conflict_apply(apply_all);
+}
+
+/// A conflict side's size line: a file's size, or a folder's item count
+/// as the list view shows it.
+pub fn size_line(dir: bool, size: u64, items: Option<usize>) -> String {
+    match (dir, items) {
+        (false, _) => human(size),
+        (true, Some(i)) => crate::ops::count(i),
+        (true, None) => String::new(),
+    }
+}
+
+/// Neither a Replace nor the overwrites inside a Merge are taken back by
+/// Cancel; the dialog says so where the choice is made.
+pub fn conflict_hint(both: &str, folders: bool) -> String {
+    let undo = if folders {
+        "Replaced files aren't restored on cancel"
+    } else {
+        "A replaced file isn't restored on cancel"
+    };
+    format!("Keep both: {both}. {undo}.")
 }
 
 /// The apply-to-all toggle names the kind of clash it covers, since an
@@ -1415,6 +1439,18 @@ mod tests {
         assert_eq!(noun(&many[..1]), "“f0”");
     }
 
+    #[test]
+    fn folder_sides_show_item_counts_and_the_hint_names_replace() {
+        assert_eq!(size_line(true, 4096, Some(48)), "48 items");
+        assert_eq!(size_line(true, 4096, Some(1)), "1 item");
+        assert_eq!(size_line(true, 4096, None), "");
+        assert_eq!(size_line(false, 6_200_000, None), human(6_200_000));
+        assert_eq!(
+            conflict_hint("raw-exports (2)", true),
+            "Keep both: raw-exports (2). Replaced files aren't restored on cancel."
+        );
+    }
+
     fn prompt() -> ConflictPrompt {
         ConflictPrompt {
             name: "dune.jpg".into(),
@@ -1423,6 +1459,7 @@ mod tests {
             existing_mtime: 100,
             incoming_size: 4_100_000,
             incoming_mtime: 200,
+            ..Default::default()
         }
     }
 

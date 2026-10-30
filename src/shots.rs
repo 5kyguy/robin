@@ -46,6 +46,7 @@ pub fn known(view: &str) -> bool {
             | "skipped"
             | "skipped-details"
             | "move-partial"
+            | "merge-partial"
             | "move-refused"
             | "move-refused-unreadable"
             | "move-refused-unreadable-two"
@@ -286,7 +287,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "progress-error" => "progress-error",
             "skipped" => "skipped",
             "skipped-details" => "skipped-details",
-            "move-partial" => "toast-details",
+            "move-partial" | "merge-partial" => "toast-details",
             "move-refused"
             | "move-refused-unreadable"
             | "move-refused-unreadable-two"
@@ -396,6 +397,27 @@ fn toast(view: &str) -> (&'static str, String, Vec<String>) {
                 ..Default::default()
             };
             ("warning", report.summary(), report.details())
+        }
+        "merge-partial" => {
+            let mut missing = vec!["raw-exports/IMG_4432.CR3".to_string()];
+            missing.extend((4433..4449).map(|n| format!("raw-exports/IMG_{n}.CR3")));
+            let out = crate::ops::Outcome {
+                report: crate::fsops::TransferReport {
+                    moved: 31,
+                    merges: vec![crate::fsops::PartialMerge {
+                        into: "raw-exports".into(),
+                        merged: 31,
+                        total: 48,
+                        error: "raw-exports/IMG_4432.CR3: No space left on device (os error 28)"
+                            .into(),
+                        missing,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let t = out.toast(crate::ops::JobKind::Copy);
+            (t.tone, t.text, t.details)
         }
         _ => {
             let report = skipped_report();
@@ -976,6 +998,8 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
                     existing_mtime: 1_792_000_000,
                     incoming_size: 4096,
                     incoming_mtime: 1_793_400_000,
+                    existing_items: Some(48),
+                    incoming_items: Some(31),
                 },
                 dest: "SANDISK".into(),
                 left: 4,
