@@ -536,8 +536,11 @@ pub struct PartialMerge {
     pub merged: usize,
     pub total: usize,
     pub error: String,
-    /// Skipped before the error, at this level.
+    /// Skipped before the error, at this level, as "path — why".
     pub skipped: Vec<String>,
+    /// The job-level skipped entries those lines already show, so the
+    /// toast lists each path once.
+    pub covers: Vec<PathBuf>,
     /// The failing child, when a merge inside it got partway.
     pub partly: Vec<String>,
     /// Items that weren't merged at all. merged + skipped + partly +
@@ -1290,6 +1293,8 @@ fn move_directory_inner(
     // so a partial copy does not stay 0700 or carry the copy time.
     let mut merged = 0;
     let mut skipped = Vec::new();
+    let mut partly_kids = Vec::new();
+    let mut covers = Vec::new();
     let mut stopped_at = 0;
     let mut listing = Vec::new();
     // Where this folder sits in the job's destination, for what the
@@ -1305,6 +1310,8 @@ fn move_directory_inner(
                 return Err(Error::Cancelled);
             }
             let child_rel = rel.join(&entry.name);
+            let landed_before = LANDED.with(|l| l.borrow().len());
+            let skips_before = opts.report.skipped.len();
             let outcome = move_entry(
                 &src,
                 &entry.name,
@@ -1317,7 +1324,18 @@ fn move_directory_inner(
             )?;
             if outcome == CopyOutcome::Skipped {
                 all_copied = false;
-                skipped.push(here.join(&entry.name).display().to_string());
+                let shown = here.join(&entry.name).display().to_string();
+                // A folder that skipped some items but landed others
+                // was partly merged, not skipped.
+                if LANDED.with(|l| l.borrow().len()) > landed_before {
+                    partly_kids.push(shown);
+                } else if let Some(s) = opts.report.skipped.get(skips_before) {
+                    // A special file: say why, and cover the job's line.
+                    skipped.push(format!("{shown} — {}", s.reason.describe()));
+                    covers.push(s.path.clone());
+                } else {
+                    skipped.push(format!("{shown} — skipped, kept the existing one"));
+                }
             } else {
                 merged += 1;
             }
@@ -1338,7 +1356,11 @@ fn move_directory_inner(
                 total: listing.len(),
                 error: err.to_string(),
                 skipped: std::mem::take(&mut skipped),
-                partly: failing.filter(|_| partly).map(named).into_iter().collect(),
+                covers: std::mem::take(&mut covers),
+                partly: std::mem::take(&mut partly_kids)
+                    .into_iter()
+                    .chain(failing.filter(|_| partly).map(named))
+                    .collect(),
                 missing: failing
                     .filter(|_| !partly)
                     .into_iter()
@@ -2389,9 +2411,60 @@ mod tests {
         assert!(out.is_err(), "{out:?}");
         let m = &report.merges[0];
         assert_eq!(m.into, "dest/sub");
-        assert_eq!(m.skipped, [format!("dest/sub/{}", order[0])]);
+        assert_eq!(
+            m.skipped,
+            [format!(
+                "dest/sub/{} — skipped, kept the existing one",
+                order[0]
+            )]
+        );
         assert_eq!(m.missing, [format!("dest/sub/{}", order[3])]);
         assert_eq!(m.merged, 2);
+        // Each skipped path shows once in Details, with its reason.
+        let shown = crate::ops::Outcome {
+            report: report.clone(),
+            ..Default::default()
+        };
+        let details = shown.toast(crate::ops::JobKind::Move).details;
+        let mut unique = details.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), details.len(), "{details:?}");
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains(&format!("sub/{} — ", order[0]))),
+            "{details:?}"
+        );
+        assert_eq!(
+            m.merged + m.skipped.len() + m.partly.len() + m.missing.len(),
+            m.total
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_folder_that_skipped_some_but_landed_others_is_partly_merged() {
+        let root = scratch("merge-partly-skip");
+        // Readdir order is up to the filesystem; enough siblings make it
+        // all but certain one is walked after inner, and that one fails.
+        std::fs::create_dir_all(root.join("src/sub/inner")).unwrap();
+        std::fs::create_dir_all(root.join("dest/sub/inner")).unwrap();
+        std::fs::write(root.join("src/sub/inner/a"), b"a").unwrap();
+        std::fs::write(root.join("src/sub/inner/b"), b"b").unwrap();
+        std::fs::write(root.join("dest/sub/inner/a"), b"old").unwrap();
+        for n in 0..8 {
+            std::fs::write(root.join(format!("src/sub/f{n}")), b"f").unwrap();
+        }
+        let order = listed(&root.join("src/sub"));
+        let at = order.iter().position(|n| n == "inner").unwrap();
+        let after = order.get(at + 1).cloned().expect("inner listed last");
+        FAIL_LANDING.with(|f| *f.borrow_mut() = Some(after.into()));
+        let (out, report) = force_move_report(&root, "src", "dest", &Cancel::new());
+        assert!(out.is_err(), "{out:?}");
+        let m = report.merges.iter().find(|m| m.into == "dest/sub").unwrap();
+        assert_eq!(m.partly, ["dest/sub/inner"], "{m:?}");
+        assert!(m.skipped.is_empty(), "{m:?}");
         assert_eq!(
             m.merged + m.skipped.len() + m.partly.len() + m.missing.len(),
             m.total

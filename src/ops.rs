@@ -385,9 +385,13 @@ impl Outcome {
             for level in &self.report.merges {
                 details.extend(level.partly.iter().map(|p| format!("{p} — partly merged")));
                 details.extend(level.missing.iter().map(|p| format!("{p} — not merged")));
-                details.extend(level.skipped.iter().map(|p| format!("{p} — skipped")));
+                details.extend(level.skipped.iter().cloned());
             }
-            details.extend(self.report.details());
+            // Job-level skips a merge already showed aren't repeated.
+            let mut rest = self.report.clone();
+            let covered: Vec<_> = self.report.merges.iter().flat_map(|m| &m.covers).collect();
+            rest.skipped.retain(|s| !covered.contains(&&s.path));
+            details.extend(rest.details());
             details.extend(self.report.leftovers.iter().cloned());
             // The failure of the merged item itself repeats the error.
             details.extend(
@@ -783,7 +787,8 @@ mod tests {
                         merged: 3,
                         total: 6,
                         error: "IMG_9.CR3: disk full".into(),
-                        skipped: vec!["raw-exports/day2/IMG_1.CR3".into()],
+                        skipped: vec!["raw-exports/day2/pipe — named pipes are not copied".into()],
+                        covers: vec!["raw-exports/day2/pipe".into()],
                         missing: vec![
                             "raw-exports/day2/IMG_9.CR3".into(),
                             "raw-exports/day2/IMG_10.CR3".into(),
@@ -801,6 +806,10 @@ mod tests {
                     },
                 ],
                 leftovers: vec!["raw-exports/x — not removed: denied".into()],
+                skipped: vec![crate::fsops::SkippedEntry {
+                    path: "raw-exports/day2/pipe".into(),
+                    reason: crate::fsops::SkipReason::Fifo,
+                }],
                 ..Default::default()
             },
             ..Default::default()
@@ -818,7 +827,7 @@ mod tests {
                 "IMG_9.CR3: disk full",
                 "raw-exports/day2/IMG_9.CR3 — not merged",
                 "raw-exports/day2/IMG_10.CR3 — not merged",
-                "raw-exports/day2/IMG_1.CR3 — skipped",
+                "raw-exports/day2/pipe — named pipes are not copied",
                 "raw-exports/day2 — partly merged",
                 "raw-exports/day3 — not merged",
                 "raw-exports/x — not removed: denied",
