@@ -518,7 +518,16 @@ pub struct TransferReport {
     pub left_behind: Vec<KeptEntry>,
     /// Source entries copied in full, for removing the originals of a
     /// folder move once its copy is done.
-    pub copied: Vec<PathBuf>,
+    pub copied: Vec<Copied>,
+}
+
+/// A source entry copied in full, and which inode it was, so removing the
+/// original never takes something that replaced it meanwhile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Copied {
+    pub path: PathBuf,
+    pub dev: u64,
+    pub ino: u64,
 }
 
 impl TransferReport {
@@ -981,7 +990,11 @@ fn move_entry(
         }
     };
     if let Ok(CopyOutcome::Copied) = out {
-        opts.report.copied.push(rel.to_path_buf());
+        opts.report.copied.push(Copied {
+            path: rel.to_path_buf(),
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        });
     }
     out
 }
@@ -1080,16 +1093,23 @@ fn move_directory(
     // The top folder copies its whole tree first and removes the source
     // only once all of it landed, so a Cancel part-way can drop what it
     // copied and leave the source untouched: nothing is half-moved.
+    let from_c = component(from)?;
+    let top = rustix::fs::statat(parent.as_fd(), from_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(from, e))?;
     let move_source = !opts.keep_source;
     opts.keep_source = true;
     let out = move_directory_inner(parent, from, dest_parent, to, opts, root_dev, rel, depth);
     opts.keep_source = !move_source;
     if move_source && out.is_ok() {
-        let copied: std::collections::HashSet<PathBuf> = std::mem::take(&mut opts.report.copied)
-            .into_iter()
-            .collect();
-        let all = matches!(out, Ok(CopyOutcome::Copied));
-        let gone = remove_copied(parent, from, rel, all, &copied, opts)?;
+        let mut copied = std::mem::take(&mut opts.report.copied);
+        if let Ok(CopyOutcome::Copied) = out {
+            copied.push(Copied {
+                path: rel.to_path_buf(),
+                dev: top.st_dev,
+                ino: top.st_ino,
+            });
+        }
+        let gone = remove_copied(parent, rel, copied, root_dev, opts)?;
         rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(to, e))?;
         if !gone {
             return Ok(CopyOutcome::Skipped);
@@ -1098,44 +1118,79 @@ fn move_directory(
     out
 }
 
-/// Remove the originals a deferred folder move copied in full. Returns
-/// whether `from` itself is gone. What can't be removed is reported as
-/// left behind, as if it had been removed right after its copy.
+/// Remove the originals a deferred folder move copied in full: exactly
+/// the entries in `copied`, deepest first, each only while it is still the
+/// same inode on the same filesystem. Nothing else in the source is
+/// looked at, so a file added meanwhile stays, and so does its folder.
+/// Returns whether `top` itself is gone. A removal that fails for a
+/// reason the user can act on is reported as left behind.
 fn remove_copied(
     parent: &DirFd,
-    from: &std::ffi::OsStr,
-    rel: &Path,
-    all: bool,
-    copied: &std::collections::HashSet<PathBuf>,
+    top: &Path,
+    mut copied: Vec<Copied>,
+    root_dev: u64,
     opts: &mut MoveOpts<'_>,
 ) -> Result<bool> {
-    let covered = all || copied.contains(rel);
-    let c = component(from)?;
-    let stat = rustix::fs::statat(parent.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(|e| Error::from_errno(from, e))?;
-    let flags = if is_dir(stat.st_mode) && !is_lnk(stat.st_mode) {
-        let dir = parent.open_dir_nofollow(from)?;
-        let mut empty = true;
-        for entry in dir.list()? {
-            let child = rel.join(&entry.name);
-            empty &= remove_copied(&dir, &entry.name, &child, covered, copied, opts)?;
+    copied.sort_by_key(|c| std::cmp::Reverse(c.path.components().count()));
+    let mut gone = false;
+    for entry in copied {
+        let Ok(rest) = entry.path.strip_prefix(top) else {
+            continue;
+        };
+        let Some(name) = entry.path.file_name() else {
+            continue;
+        };
+        // Walk down from `parent` without following links; a folder that
+        // vanished, changed or sits on another filesystem is not ours.
+        let mut dir = None;
+        let mut ok = true;
+        let mut chain: Vec<&std::ffi::OsStr> = std::iter::once(top.as_os_str())
+            .chain(rest.iter())
+            .collect();
+        chain.pop();
+        for part in chain {
+            let next = match dir.as_ref().unwrap_or(parent).open_dir_nofollow(part) {
+                Ok(d) => d,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            };
+            match rustix::fs::fstat(next.as_fd()) {
+                Ok(st) if st.st_dev == root_dev => dir = Some(next),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
         }
-        if !covered || !empty {
-            return Ok(false);
+        if !ok {
+            continue;
         }
-        AtFlags::REMOVEDIR
-    } else if covered {
-        AtFlags::empty()
-    } else {
-        return Ok(false);
-    };
-    match rustix::fs::unlinkat(parent.as_fd(), c.as_c_str(), flags) {
-        Ok(()) => Ok(true),
-        Err(e) => opts
-            .report
-            .keep(parent, from, rel, Error::from_errno(from, e))
-            .map(|_| false),
+        let at = dir.as_ref().unwrap_or(parent);
+        let c = component(name)?;
+        let Ok(st) = rustix::fs::statat(at.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) else {
+            continue;
+        };
+        if st.st_dev != entry.dev || st.st_ino != entry.ino || st.st_dev != root_dev {
+            continue;
+        }
+        let flags = if is_dir(st.st_mode) && !is_lnk(st.st_mode) {
+            AtFlags::REMOVEDIR
+        } else {
+            AtFlags::empty()
+        };
+        match rustix::fs::unlinkat(at.as_fd(), c.as_c_str(), flags) {
+            Ok(()) => gone |= entry.path == top,
+            // Something we didn't copy is inside, or it is already gone.
+            Err(Errno::NOTEMPTY | Errno::EXIST | Errno::NOENT) => {}
+            Err(e) => {
+                opts.report
+                    .keep(at, name, &entry.path, Error::from_errno(name, e))?;
+            }
+        }
     }
+    Ok(gone)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2018,6 +2073,63 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    /// Run `f` right before each no-replace landing.
+    fn on_landing(f: impl FnMut(&DirFd, &std::ffi::OsStr) + 'static) {
+        BEFORE_LANDING.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    fn force_move(root: &Path, from: &str, to: &str, cancel: &Cancel) -> Result<CopyOutcome> {
+        let dir = DirFd::open(root).unwrap();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = |p: &ConflictPrompt| match p.kind {
+            ConflictKind::FolderFolder => Ok(ConflictChoice {
+                action: Conflict::Replace,
+                apply_all: false,
+            }),
+            _ => Err(Error::Cancelled),
+        };
+        let out = move_child(
+            &dir,
+            std::ffi::OsStr::new(from),
+            &dir,
+            std::ffi::OsStr::new(to),
+            &mut MoveOpts {
+                force_copy: true,
+                fail_before_unlink: false,
+                copy: opts(cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
+                check_removable: true,
+                keep_source: false,
+            },
+        );
+        BEFORE_LANDING.with(|h| *h.borrow_mut() = None);
+        out
+    }
+
+    #[test]
+    fn a_file_added_to_the_source_mid_move_survives() {
+        let root = scratch("late-source");
+        std::fs::create_dir_all(root.join("src/inner")).unwrap();
+        std::fs::write(root.join("src/a"), b"a").unwrap();
+        std::fs::write(root.join("src/inner/b"), b"b").unwrap();
+        let late = root.join("src/inner/late");
+        let mut once = Some(late.clone());
+        on_landing(move |_, name| {
+            if name != "b" {
+                return;
+            }
+            if let Some(p) = once.take() {
+                std::fs::write(p, b"late").unwrap();
+            }
+        });
+        let out = force_move(&root, "src", "dest", &Cancel::new()).unwrap();
+        assert_eq!(out, CopyOutcome::Skipped, "the source folder stays");
+        assert_eq!(std::fs::read(&late).unwrap(), b"late");
+        assert!(!root.join("src/a").exists(), "copied originals still go");
+        assert_eq!(std::fs::read(root.join("dest/a")).unwrap(), b"a");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn walk(dir: &Path) -> Vec<String> {
