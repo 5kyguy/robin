@@ -4,6 +4,7 @@
 //! after the parent directory has been checked.
 
 pub mod cli;
+pub mod delegate;
 pub mod error;
 pub mod fixture;
 pub mod fsops;
