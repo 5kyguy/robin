@@ -971,6 +971,17 @@ pub fn drop_notice(jobs: usize, here: usize) -> Option<(String, Vec<String>)> {
     })
 }
 
+/// The toast's leading glyph: warning, error, info, or a check for a
+/// finished action.
+pub fn toast_glyph(tone: &str) -> &'static str {
+    match tone {
+        "warning" => "󰀦",
+        "danger" => "󰅙",
+        "info" => "󰋽",
+        _ => "󰄬",
+    }
+}
+
 /// The one-time neutral notice for a folder without a live watch.
 pub fn watch_fallback_notice(dir: &Path) -> (String, Vec<String>) {
     (
@@ -993,7 +1004,7 @@ fn poll_watch(ui: &AppWindow, st: &Shared) {
         show_toast(
             ui,
             st,
-            "",
+            "info",
             watch_fallback_notice(&dir).0,
             watch_fallback_notice(&dir).1,
             false,
@@ -1592,6 +1603,7 @@ fn show_toast(
         s.toast_gen
     };
     ui.set_toast_tone(tone.into());
+    ui.set_toast_glyph(toast_glyph(tone).into());
     ui.set_toast_text(text.into());
     set_toast_rows(ui, &detail_rows(&details, pinned, false));
     ui.set_toast_action(action.into());
@@ -2330,6 +2342,16 @@ mod tests {
         });
         assert!(!split.contains_key(&key("mnt")), "other device stays blank");
         assert_eq!(split.get(&key("raw-exports")), Some(&0));
+    }
+
+    #[test]
+    fn the_watch_notice_uses_the_info_glyph_not_the_check() {
+        assert_eq!(toast_glyph("info"), "󰋽");
+        assert_eq!(toast_glyph(""), "󰄬");
+        let glyphs = ["", "info", "warning", "danger"].map(toast_glyph);
+        for (i, g) in glyphs.iter().enumerate() {
+            assert!(!glyphs[i + 1..].contains(g));
+        }
     }
 
     #[test]

@@ -267,6 +267,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
     ))));
     let (tone, text, details, pinned) = toast(view);
     ui.set_toast_tone(tone.into());
+    ui.set_toast_glyph(crate::app::toast_glyph(tone).into());
     ui.set_toast_text(text.into());
     crate::app::set_toast_rows(
         ui,
@@ -1163,7 +1164,9 @@ fn list_scene(ui: &AppWindow, view: &str) {
         _ => None,
     };
     if let Some((text, details)) = notice {
-        ui.set_toast_tone("".into());
+        let tone = if view == "watch-fallback" { "info" } else { "" };
+        ui.set_toast_tone(tone.into());
+        ui.set_toast_glyph(crate::app::toast_glyph(tone).into());
         ui.set_toast_text(text.into());
         crate::app::set_toast_rows(ui, &crate::app::detail_rows(&details, false, false));
         ui.set_toast_on(true);

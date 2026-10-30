@@ -547,6 +547,8 @@ export component AppWindow inherits Window {
     in property <bool> toast-expanded: false;
     // "" neutral, "warning" partial move, "danger" refused up front.
     in property <string> toast-tone: "";
+    // Set from Rust by `app::toast_glyph`.
+    in property <string> toast-glyph: "󰄬";
     in property <string> refusal-title;
     in property <[RefusalLine]> refusal-lines;
     // False when a folder can't be read: only Close is offered.
@@ -1230,10 +1232,10 @@ export component AppWindow inherits Window {
         background: surface;
         border-radius: 8px;
         border-width: 1px;
-        border-color: toast-tone == "" ? hairline : tone;
+        border-color: toast-tone == "" || toast-tone == "info" ? hairline : tone;
         drop-shadow-blur: 16px;
         drop-shadow-color: #000000.with-alpha(0.35);
-        if toast-tone != "": Rectangle {
+        if toast-tone == "warning" || toast-tone == "danger": Rectangle {
             x: 0px;
             y: 0px;
             width: 4px;
@@ -1243,7 +1245,7 @@ export component AppWindow inherits Window {
             background: tone;
         }
         Text {
-            text: toast-tone == "warning" ? "󰀦" : toast-tone == "danger" ? "󰅙" : "󰄬";
+            text: toast-glyph;
             x: 16px;
             y: 0px;
             width: 18px;
