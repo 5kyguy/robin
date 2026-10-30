@@ -335,12 +335,16 @@ pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 /// The Modified column, like Thunar: the time for today, the date for
-/// anything older (or in the future). `offset` gives the local UTC
+/// anything older or in the future (even later today). Missing or
+/// pre-1970 times (`mtime <= 0`) are blank. `offset` gives the local UTC
 /// offset in seconds at a Unix time.
 pub fn format_modified(mtime: i64, now: i64, offset: impl Fn(i64) -> i64) -> String {
+    if mtime <= 0 {
+        return String::new();
+    }
     let local = mtime + offset(mtime);
     let day = local.div_euclid(86_400);
-    if day == (now + offset(now)).div_euclid(86_400) {
+    if mtime <= now && day == (now + offset(now)).div_euclid(86_400) {
         let secs = local.rem_euclid(86_400);
         return format!("{:02}:{:02}", secs / 3600, secs % 3600 / 60);
     }
@@ -434,7 +438,11 @@ pub fn breadcrumbs(path: &Path, home: Option<&Path>) -> Vec<Crumb> {
 #[derive(Debug)]
 pub struct Debounce {
     delay: Duration,
+    /// Fire anyway this long after the first push of a burst, so a folder
+    /// that never goes quiet (a download, a build) still refreshes.
+    max_wait: Option<Duration>,
     dirty: bool,
+    first: Option<Instant>,
     last: Option<Instant>,
 }
 
@@ -442,13 +450,21 @@ impl Debounce {
     pub fn new(delay: Duration) -> Self {
         Self {
             delay,
+            max_wait: None,
             dirty: false,
+            first: None,
             last: None,
         }
     }
 
+    pub fn max_wait(mut self, max: Duration) -> Self {
+        self.max_wait = Some(max);
+        self
+    }
+
     pub fn push(&mut self, now: Instant) {
         self.dirty = true;
+        self.first.get_or_insert(now);
         self.last = Some(now);
     }
 
@@ -457,8 +473,14 @@ impl Debounce {
         let Some(last) = self.last else {
             return false;
         };
-        if self.dirty && now.saturating_duration_since(last) >= self.delay {
+        let quiet = now.saturating_duration_since(last) >= self.delay;
+        let overdue = match (self.first, self.max_wait) {
+            (Some(first), Some(max)) => now.saturating_duration_since(first) >= max,
+            _ => false,
+        };
+        if self.dirty && (quiet || overdue) {
             self.dirty = false;
+            self.first = None;
             self.last = None;
             true
         } else {
@@ -561,7 +583,7 @@ mod tests {
         );
         // The same instant in UTC is still the 31st.
         assert_eq!(format_modified(now - 2 * 3600, now, |_| 0), "00:30");
-        assert_eq!(format_modified(0, now, |_| 0), "1970-01-01");
+        assert_eq!(format_modified(1, now, |_| 0), "1970-01-01");
         assert_eq!(format_modified(951_782_400, now, |_| 0), "2000-02-29");
     }
 
@@ -652,5 +674,36 @@ mod tests {
         let listing = Listing::from_dir(&dir).unwrap();
         assert_eq!(names(&listing), ["sub", "note.txt"]);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn modified_is_blank_before_1970_and_a_date_when_later_today() {
+        let now = 1_793_413_800; // 08:00 at +05:30
+        let ist = |_| 19_800;
+        assert_eq!(format_modified(0, now, ist), "");
+        assert_eq!(format_modified(-86_400, now, ist), "");
+        assert_eq!(format_modified(now + 3_600, now, ist), "2026-10-31");
+        assert_eq!(format_modified(now - 60, now, ist), "07:59");
+    }
+
+    #[test]
+    fn debounce_fires_after_max_wait_even_if_events_keep_coming() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut d = Debounce::new(ms(200)).max_wait(ms(1500));
+        let mut fired = None;
+        for i in 0..40u64 {
+            let t = t0 + ms(i * 100);
+            d.push(t);
+            if d.ready(t) {
+                fired = Some(i * 100);
+                break;
+            }
+        }
+        assert_eq!(fired, Some(1500));
+        let mut quiet = Debounce::new(ms(200)).max_wait(ms(1500));
+        quiet.push(t0);
+        assert!(!quiet.ready(t0 + ms(100)));
+        assert!(quiet.ready(t0 + ms(200)));
     }
 }
