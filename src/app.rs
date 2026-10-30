@@ -595,6 +595,7 @@ fn redraw(ui: &AppWindow, s: &State) {
                 Dialog::Trash(names) | Dialog::TrashNo(names) | Dialog::Delete(names) => {
                     ui.set_confirm_noun(noun(names).into());
                     ui.set_confirm_names(names_text(names).into());
+                    ui.set_confirm_names_count(names.len().min(6) as i32);
                 }
                 Dialog::Refused { .. } => {}
             }
@@ -1021,7 +1022,13 @@ mod tests {
     #[test]
     fn names_list_is_capped() {
         let many: Vec<OsString> = (0..7).map(|i| format!("f{i}").into()).collect();
-        assert!(names_text(&many).ends_with("and 2 more"));
+        assert_eq!(names_text(&many), "f0\nf1\nf2\nf3\nf4\nand 2 more");
+        assert_eq!(
+            names_text(&many[..5]),
+            "f0\nf1\nf2\nf3\nf4",
+            "five fit without a tail"
+        );
+        assert_eq!(names_text(&many[..6]).lines().count(), 6);
         assert_eq!(noun(&many[..1]), "“f0”");
     }
 }

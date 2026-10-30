@@ -961,6 +961,23 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
             ui.set_danger_armed(true);
         }
         "confirm-delete" => {
+            // Eight items: five names, then "and 3 more".
+            let names: Vec<std::ffi::OsString> = [
+                "dune-sunset-0412.jpg",
+                "dune-sunset-0413.jpg",
+                "speeder-run.mp4",
+                "cantina-band.heic",
+                "droid-manual.pdf",
+                "holo-backup.tar.zst",
+                "palette.toml",
+                "shot-list.md",
+            ]
+            .iter()
+            .map(Into::into)
+            .collect();
+            ui.set_confirm_noun("8 items".into());
+            ui.set_confirm_names(crate::app::names_text(&names).into());
+            ui.set_confirm_names_count(6);
             ui.set_dialog_focus(0);
             ui.set_danger_armed(true);
         }
