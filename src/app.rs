@@ -9,12 +9,14 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
-use crate::fsops::{self, Cancel, KeptEntry, TrashChoice};
+use crate::fsops::{
+    self, Cancel, Conflict, ConflictChoice, ConflictKind, ConflictPrompt, KeptEntry, TrashChoice,
+};
 use crate::model::{Listing, Nav};
 use crate::ops::{self, Clipboard, Env, Job, JobKind, Mods, Op, Outcome, Progress, Trashed};
 use crate::safety::DirFd;
@@ -27,12 +29,31 @@ pub enum Dialog {
     /// The drive has no trash: Delete permanently is the only way.
     TrashNo(Vec<OsString>),
     Delete(Vec<OsString>),
-    /// A move left `name` where it was. Button 1 is Copy instead when allowed.
+    /// A move left `names` where they were. Button 1 is Copy instead when
+    /// any of them can be copied; it copies `copy`, the ones that can.
     Refused {
         job: Job,
-        name: OsString,
+        names: Vec<OsString>,
+        copy: Vec<OsString>,
         can_copy: bool,
     },
+    /// A paste, drop or move found the name taken. Buttons: 0 Cancel,
+    /// 1 Skip, 2 Keep both, 3 Replace, 4 the apply-to-all toggle.
+    Conflict {
+        ask: ConflictAsk,
+        apply_all: bool,
+    },
+}
+
+/// One name clash the job thread is waiting on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConflictAsk {
+    pub prompt: ConflictPrompt,
+    /// The destination folder's name for the title.
+    pub dest: String,
+    /// Items left in the job, including this one; the toggle offers to
+    /// answer them all.
+    pub left: usize,
 }
 
 impl Dialog {
@@ -42,6 +63,7 @@ impl Dialog {
             Dialog::TrashNo(_) => "trash-no",
             Dialog::Delete(_) => "delete",
             Dialog::Refused { .. } => "move-refused",
+            Dialog::Conflict { .. } => "conflict-live",
         }
     }
 
@@ -50,6 +72,7 @@ impl Dialog {
             Dialog::Refused {
                 can_copy: false, ..
             } => 1,
+            Dialog::Conflict { .. } => 5,
             _ => 2,
         }
     }
@@ -61,6 +84,7 @@ impl Dialog {
             Dialog::Delete(_) | Dialog::TrashNo(_) => 0,
             Dialog::Trash(_) => 1,
             Dialog::Refused { can_copy, .. } => i32::from(*can_copy),
+            Dialog::Conflict { .. } => 1,
         }
     }
 }
@@ -75,6 +99,8 @@ pub enum Action {
     Open(Dialog),
     Navigate(PathBuf),
     CancelJob,
+    /// Reply to the job thread's conflict question; `None` cancels the job.
+    Answer(Option<ConflictChoice>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +108,9 @@ pub struct Drag {
     pub names: Vec<OsString>,
     pub target: Option<usize>,
     pub op: Option<Op>,
+    /// A folder under the pointer that is one of the dragged items or
+    /// inside one: shown muted, never dropped on.
+    pub refused: Option<usize>,
 }
 
 pub struct Controller {
@@ -233,6 +262,15 @@ impl Controller {
             }
             keys::RETURN | " " => self.button(self.focus),
             keys::ESCAPE => self.button(0),
+            _ if matches!(self.dialog, Some(Dialog::Conflict { .. })) => {
+                match text.to_ascii_lowercase().as_str() {
+                    "s" => self.button(1),
+                    "k" => self.button(2),
+                    "r" => self.button(3),
+                    "a" => self.button(4),
+                    _ => Action::None,
+                }
+            }
             _ => Action::None,
         }
     }
@@ -242,6 +280,25 @@ impl Controller {
         let Some(dialog) = self.dialog.clone() else {
             return Action::None;
         };
+        if let Dialog::Conflict { ask, apply_all } = dialog {
+            let action = match index {
+                0 => None,
+                1 => Some(Conflict::Skip),
+                2 => Some(Conflict::Rename),
+                3 => Some(Conflict::Replace),
+                4 => {
+                    self.focus = 4;
+                    self.dialog = Some(Dialog::Conflict {
+                        ask,
+                        apply_all: !apply_all,
+                    });
+                    return Action::Redraw;
+                }
+                _ => return Action::None,
+            };
+            self.dialog = None;
+            return Action::Answer(action.map(|action| ConflictChoice { action, apply_all }));
+        }
         if index == 0 {
             self.dialog = None;
             return Action::Redraw;
@@ -259,10 +316,11 @@ impl Controller {
             }
             Dialog::Refused {
                 job,
-                name,
+                copy,
                 can_copy,
-            } if can_copy => Action::Run(Job::new(JobKind::Copy, &job.src, vec![name], &job.dest)),
-            Dialog::Refused { .. } => Action::Redraw,
+                ..
+            } if can_copy => Action::Run(Job::new(JobKind::Copy, &job.src, copy, &job.dest)),
+            Dialog::Refused { .. } | Dialog::Conflict { .. } => Action::Redraw,
         }
     }
 
@@ -291,19 +349,32 @@ impl Controller {
                     None => self.names(),
                 };
                 let at = start as i64 + i64::from(dy);
-                let target = usize::try_from(at).ok().and_then(|t| {
+                let folder = usize::try_from(at).ok().and_then(|t| {
                     let (name, is_dir) = self.row_name(t)?;
-                    (is_dir && !names.contains(&name)).then_some(t)
+                    is_dir.then_some((t, name))
                 });
-                let op = target.and_then(|t| {
-                    let dest = self.dir.join(self.row_name(t)?.0);
+                let mut refused = None;
+                let op = folder.as_ref().and_then(|(t, name)| {
+                    if names.contains(name) {
+                        refused = Some(*t);
+                        return None;
+                    }
+                    let dest = self.dir.join(name);
                     let op = ops::drop_op(mods, ops::same_filesystem(&self.dir, &dest))?;
-                    ops::drop_allowed(op, &self.dir, &names, &dest).then_some(op)
+                    match ops::drop_check(op, &self.dir, &names, &dest) {
+                        ops::DropCheck::Ok => Some(op),
+                        ops::DropCheck::IntoItself => {
+                            refused = Some(*t);
+                            None
+                        }
+                        ops::DropCheck::Nothing => None,
+                    }
                 });
                 let next = Drag {
                     names,
-                    target: op.and(target),
+                    target: op.and(folder.map(|f| f.0)),
                     op,
+                    refused,
                 };
                 let changed = self.drag.as_ref() != Some(&next);
                 self.drag = Some(next);
@@ -338,6 +409,9 @@ impl Controller {
 
     pub fn drag_label(&self) -> Option<(String, &'static str)> {
         let drag = self.drag.as_ref()?;
+        if drag.refused.is_some() {
+            return Some(("Can't drop into itself".into(), "󰜺"));
+        }
         let (Some(t), Some(op)) = (drag.target, drag.op) else {
             return Some(("Drop on a folder".into(), "󰆏"));
         };
@@ -361,17 +435,26 @@ impl Controller {
         {
             self.clip.cut_moved(job);
         }
-        let (name, kept) = outcome.refused.first()?;
-        let refusal = fsops::refusal(&name.to_string_lossy(), kept);
+        if outcome.refused.is_empty() {
+            return None;
+        }
+        let view = refusal_view(&outcome.refused);
         Some(Dialog::Refused {
             job: job.clone(),
-            name: name.clone(),
-            can_copy: refusal.can_copy_instead,
+            names: outcome.refused.iter().map(|r| r.0.clone()).collect(),
+            copy: outcome
+                .refused
+                .iter()
+                .filter(|(n, k)| fsops::refusal(&n.to_string_lossy(), k).can_copy_instead)
+                .map(|r| r.0.clone())
+                .collect(),
+            can_copy: view.can_copy,
         })
     }
 
     pub fn rows(&self) -> Vec<Row> {
         let target = self.drag.as_ref().and_then(|d| d.target);
+        let refused = self.drag.as_ref().and_then(|d| d.refused);
         self.listing
             .view()
             .iter()
@@ -399,8 +482,84 @@ impl Controller {
                 badge: SharedString::new(),
                 cut: self.clip.is_cut(&self.dir, &e.name),
                 drop: target == Some(i),
+                drop_refused: refused == Some(i),
             })
             .collect()
+    }
+}
+
+/// The move-refused dialog's contents for every refused item. One item
+/// reads as before; several get a "Can't move N items" title with each
+/// item's reason as a heading over its blocking paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusalView {
+    pub title: String,
+    /// (path, note, heading) rows.
+    pub lines: Vec<(String, String, bool)>,
+    pub can_copy: bool,
+    /// Set when only some items can be copied: says which stay behind.
+    pub body: String,
+    pub dismiss: &'static str,
+    pub notes: usize,
+    pub items: usize,
+}
+
+pub fn refusal_view(refused: &[(OsString, Vec<KeptEntry>)]) -> RefusalView {
+    let parts: Vec<fsops::Refusal> = refused
+        .iter()
+        .map(|(n, k)| fsops::refusal(&n.to_string_lossy(), k))
+        .collect();
+    let can_copy = parts.iter().any(|r| r.can_copy_instead);
+    let stuck: Vec<String> = refused
+        .iter()
+        .zip(&parts)
+        .filter(|(_, r)| !r.can_copy_instead)
+        .map(|((n, _), _)| n.to_string_lossy().into_owned())
+        .collect();
+    let body = if can_copy && !stuck.is_empty() {
+        let n = parts.len() - stuck.len();
+        format!(
+            "Robin can copy the other {} there instead. {} can't be read, so {} not be copied either.",
+            ops::count(n),
+            stuck.join(", "),
+            if stuck.len() == 1 { "it will" } else { "they will" },
+        )
+    } else {
+        String::new()
+    };
+    let rows = |r: &fsops::Refusal| {
+        r.lines
+            .iter()
+            .map(|l| (l.path.clone(), l.note.clone().unwrap_or_default(), false))
+            .collect::<Vec<_>>()
+    };
+    if let [one] = parts.as_slice() {
+        return RefusalView {
+            title: one.title.clone(),
+            lines: rows(one),
+            can_copy,
+            body,
+            dismiss: one.dismiss_label,
+            notes: one.note_count(),
+            items: 1,
+        };
+    }
+    let mut lines = Vec::new();
+    let mut notes = 0;
+    for r in &parts {
+        let head = r.title.strip_prefix("Can't move ").unwrap_or(&r.title);
+        lines.push((head.to_string(), String::new(), true));
+        lines.extend(rows(r));
+        notes += r.note_count();
+    }
+    RefusalView {
+        title: format!("Can't move {}", ops::count(parts.len())),
+        lines,
+        can_copy,
+        body,
+        dismiss: if can_copy { "Cancel" } else { "Close" },
+        notes,
+        items: parts.len(),
     }
 }
 
@@ -446,6 +605,8 @@ struct State {
     queue: VecDeque<Job>,
     cancel: Option<Arc<Cancel>>,
     undo: Vec<Trashed>,
+    /// Where the waiting job thread's conflict answer goes.
+    reply: Option<mpsc::Sender<Option<ConflictChoice>>>,
     toast_open: bool,
     toast_gen: u64,
     arm_timer: slint::Timer,
@@ -468,6 +629,7 @@ pub fn run(dir: PathBuf) -> Result<i32> {
         queue: VecDeque::new(),
         cancel: None,
         undo: Vec::new(),
+        reply: None,
         toast_open: false,
         toast_gen: 0,
         arm_timer: slint::Timer::default(),
@@ -542,20 +704,10 @@ pub fn run(dir: PathBuf) -> Result<i32> {
         if items.is_empty() {
             return;
         }
-        let (restored, failed) = ops::undo(&items);
-        let _ = st.borrow_mut().ctl.reload();
-        redraw(&ui, &st.borrow());
-        let text = if failed.is_empty() {
-            format!("Restored {}", ops::count(restored))
-        } else {
-            format!(
-                "Restored {}, {} stayed in the trash",
-                ops::count(restored),
-                failed.len()
-            )
-        };
-        let tone = if failed.is_empty() { "" } else { "warning" };
-        show_toast(&ui, &st, tone, text, failed, "");
+        // Restoring renames on the job thread like any other job, so a
+        // slow drive never stalls the window.
+        ui.set_toast_on(false);
+        apply(&ui, &st, Action::Run(Job::restore(items)));
     });
 
     ui.show().map_err(|e| Error::Message(e.to_string()))?;
@@ -608,6 +760,7 @@ fn redraw(ui: &AppWindow, s: &State) {
                     ui.set_confirm_names_count(names.len().min(6) as i32);
                 }
                 Dialog::Refused { .. } => {}
+                Dialog::Conflict { ask, apply_all } => conflict_props(ui, ask, *apply_all),
             }
         }
         None => ui.set_overlay(SharedString::new()),
@@ -650,9 +803,26 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
             }
             redraw(ui, &s);
         }
+        Action::Answer(choice) => {
+            if let Some(tx) = st.borrow_mut().reply.take() {
+                let _ = tx.send(choice);
+            }
+            redraw(ui, &st.borrow());
+        }
         Action::CancelJob => {
             if let Some(c) = &st.borrow().cancel {
                 c.cancel();
+            }
+            let pending = {
+                let mut s = st.borrow_mut();
+                if matches!(s.ctl.dialog, Some(Dialog::Conflict { .. })) {
+                    s.ctl.dialog = None;
+                }
+                s.reply.take()
+            };
+            if let Some(tx) = pending {
+                let _ = tx.send(None);
+                redraw(ui, &st.borrow());
             }
             st.borrow_mut().queue.clear();
             ui.set_job_detail("Cancelling after this item…".into());
@@ -685,22 +855,176 @@ fn pump(ui: &AppWindow, st: &Shared) {
     ui.set_job_label(job.label().into());
     ui.set_job_detail(format!("0 of {}", ops::count(job.names.len())).into());
     ui.set_job_amount(0.0);
+    let dest = job.dest.file_name().map_or_else(
+        || job.dest.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     std::thread::spawn(move || {
-        let outcome = ops::run(&job, &env, &cancel, &mut |p: &Progress| {
-            let (detail, amount) = (p.detail(), p.amount());
+        let total = job.names.len();
+        let mut seen = 0usize;
+        let mut ask = |prompt: &ConflictPrompt| -> Result<ConflictChoice> {
+            seen += 1;
+            let (tx, rx) = mpsc::channel();
+            let ask = ConflictAsk {
+                prompt: prompt.clone(),
+                dest: dest.clone(),
+                left: total.saturating_sub(seen - 1).max(1),
+            };
             let _ = slint::invoke_from_event_loop(move || {
-                with_state(|ui, _| {
-                    if !ui.get_job_detail().starts_with("Cancelling") {
-                        ui.set_job_detail(detail.into());
-                    }
-                    ui.set_job_amount(amount);
-                });
+                with_state(|ui, st| ask_conflict(&ui, st, ask, tx));
             });
-        });
+            // The window answers on the event loop; this thread waits so
+            // the transfer resumes exactly where it stopped.
+            match rx.recv() {
+                Ok(Some(choice)) => Ok(choice),
+                _ => Err(Error::Cancelled),
+            }
+        };
+        let outcome = ops::run_asking(
+            &job,
+            &env,
+            &cancel,
+            &mut |p: &Progress| {
+                let (detail, amount) = (p.detail(), p.amount());
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_state(|ui, _| {
+                        if !ui.get_job_detail().starts_with("Cancelling") {
+                            ui.set_job_detail(detail.into());
+                        }
+                        ui.set_job_amount(amount);
+                    });
+                });
+            },
+            &mut ask,
+        );
         let _ = slint::invoke_from_event_loop(move || {
             with_state(|ui, st| done(&ui, st, job, outcome));
         });
     });
+}
+
+/// Show the job thread's conflict question. Another dialog open means the
+/// user is mid-answer elsewhere, so the question waits for it to close.
+fn ask_conflict(
+    ui: &AppWindow,
+    st: &Shared,
+    ask: ConflictAsk,
+    tx: mpsc::Sender<Option<ConflictChoice>>,
+) {
+    if st.borrow().ctl.dialog.is_some() {
+        let w = ui.as_weak();
+        let st = st.clone();
+        slint::Timer::single_shot(Duration::from_millis(200), move || {
+            if let Some(ui) = w.upgrade() {
+                ask_conflict(&ui, &st, ask, tx);
+            }
+        });
+        return;
+    }
+    st.borrow_mut().reply = Some(tx);
+    apply(
+        ui,
+        st,
+        Action::Open(Dialog::Conflict {
+            ask,
+            apply_all: false,
+        }),
+    );
+}
+
+pub fn conflict_props(ui: &AppWindow, ask: &ConflictAsk, apply_all: bool) {
+    let p = &ask.prompt;
+    ui.set_conflict_title(format!("{} already has “{}”", ask.dest, p.name).into());
+    ui.set_conflict_name(p.name.as_str().into());
+    let folders = p.kind == ConflictKind::FolderFolder;
+    let ext = if folders {
+        "Folder".into()
+    } else {
+        Path::new(&p.name)
+            .extension()
+            .map(|e| format!("{} file", e.to_string_lossy().to_uppercase()))
+            .unwrap_or_else(|| "File".into())
+    };
+    ui.set_conflict_kind(ext.into());
+    let (existing_dir, incoming_dir) = match p.kind {
+        ConflictKind::FileFile => (false, false),
+        ConflictKind::FolderFolder => (true, true),
+        ConflictKind::FileFolder => (false, true),
+        ConflictKind::FolderFile => (true, false),
+    };
+    let size = |dir: bool, n: u64| if dir { String::new() } else { human(n) };
+    ui.set_conflict_existing_size(size(existing_dir, p.existing_size).into());
+    ui.set_conflict_incoming_size(size(incoming_dir, p.incoming_size).into());
+    ui.set_conflict_existing_folder(existing_dir);
+    ui.set_conflict_incoming_folder(incoming_dir);
+    // Replacing a folder with a folder merges into it; the button says so.
+    ui.set_conflict_replace_label(if folders { "Merge" } else { "Replace" }.into());
+    ui.set_conflict_existing_date(fsops::short_date(p.existing_mtime).into());
+    ui.set_conflict_incoming_date(fsops::short_date(p.incoming_mtime).into());
+    let (existing, incoming) = side_badges(p);
+    let at = |v: &[&'static str], i: usize| SharedString::from(v.get(i).copied().unwrap_or(""));
+    ui.set_conflict_existing_badge(at(&existing, 0));
+    ui.set_conflict_existing_badge2(at(&existing, 1));
+    ui.set_conflict_incoming_badge(at(&incoming, 0));
+    ui.set_conflict_incoming_badge2(at(&incoming, 1));
+    let both = if existing_dir {
+        format!("{} (2)", p.name)
+    } else {
+        keep_both_name(&p.name)
+    };
+    ui.set_conflict_hint(format!("Keep both saves it as {both}").into());
+    ui.set_conflict_apply_label(apply_label(p.kind, ask.left).into());
+    ui.set_conflict_apply(apply_all);
+}
+
+/// The apply-to-all toggle names the kind of clash it covers, since an
+/// answer only carries over to clashes of that kind.
+pub fn apply_label(kind: ConflictKind, left: usize) -> String {
+    let what = match kind {
+        ConflictKind::FileFile => "file conflicts",
+        ConflictKind::FolderFolder => "folder conflicts",
+        ConflictKind::FileFolder | ConflictKind::FolderFile => "file-and-folder conflicts",
+    };
+    if left > 1 {
+        format!("Apply to the rest of the {what} ({})", left - 1)
+    } else {
+        format!("Apply to the rest of the {what}")
+    }
+}
+
+/// ("Larger", "Newer") badges for the (existing, incoming) side.
+pub fn conflict_badges(
+    p: &ConflictPrompt,
+) -> ((&'static str, &'static str), (&'static str, &'static str)) {
+    let sized = p.kind == ConflictKind::FileFile;
+    let larger = match p.existing_size.cmp(&p.incoming_size) {
+        _ if !sized => ("", ""),
+        std::cmp::Ordering::Greater => ("Larger", ""),
+        std::cmp::Ordering::Less => ("", "Larger"),
+        std::cmp::Ordering::Equal => ("", ""),
+    };
+    let newer = match p.existing_mtime.cmp(&p.incoming_mtime) {
+        std::cmp::Ordering::Greater => ("Newer", ""),
+        std::cmp::Ordering::Less => ("", "Newer"),
+        std::cmp::Ordering::Equal => ("", ""),
+    };
+    (larger, newer)
+}
+
+/// Every badge each side earns, in reading order: a file both newer and
+/// larger shows "Newer" and "Larger" side by side.
+pub fn side_badges(p: &ConflictPrompt) -> (Vec<&'static str>, Vec<&'static str>) {
+    let (larger, newer) = conflict_badges(p);
+    let keep = |v: [&'static str; 2]| v.into_iter().filter(|b| !b.is_empty()).collect();
+    (keep([newer.0, larger.0]), keep([newer.1, larger.1]))
+}
+
+/// The first name Keep both tries: "photo (2).jpg".
+pub fn keep_both_name(name: &str) -> String {
+    match name.rfind('.') {
+        Some(i) if i > 0 => format!("{} (2){}", &name[..i], &name[i..]),
+        _ => format!("{name} (2)"),
+    }
 }
 
 fn with_state(f: impl FnOnce(AppWindow, &Shared)) {
@@ -738,26 +1062,31 @@ fn done(ui: &AppWindow, st: &Shared, job: Job, outcome: Outcome) {
         );
     }
     if let Some(d) = dialog {
-        if let Dialog::Refused { name, .. } = &d {
-            let kept: &Vec<KeptEntry> = &outcome.refused[0].1;
-            let r = fsops::refusal(&name.to_string_lossy(), kept);
-            ui.set_refusal_title(r.title.as_str().into());
-            ui.set_refusal_can_copy(r.can_copy_instead);
-            ui.set_refusal_dismiss(r.dismiss_label.into());
-            ui.set_refusal_notes(r.note_count() as i32);
-            ui.set_refusal_lines(ModelRc::new(Rc::new(VecModel::from(
-                r.lines
-                    .into_iter()
-                    .map(|l| crate::RefusalLine {
-                        path: l.path.into(),
-                        note: l.note.unwrap_or_default().into(),
-                    })
-                    .collect::<Vec<_>>(),
-            ))));
+        if matches!(d, Dialog::Refused { .. }) {
+            set_refusal(ui, &refusal_view(&outcome.refused));
         }
         apply(ui, st, Action::Open(d));
     }
     pump(ui, st);
+}
+
+pub fn set_refusal(ui: &AppWindow, r: &RefusalView) {
+    ui.set_refusal_title(r.title.as_str().into());
+    ui.set_refusal_can_copy(r.can_copy);
+    ui.set_refusal_body(r.body.as_str().into());
+    ui.set_refusal_dismiss(r.dismiss.into());
+    ui.set_refusal_notes(r.notes as i32);
+    ui.set_refusal_lines_items(r.items as i32);
+    ui.set_refusal_lines(ModelRc::new(Rc::new(VecModel::from(
+        r.lines
+            .iter()
+            .map(|(path, note, head)| crate::RefusalLine {
+                path: path.as_str().into(),
+                note: note.as_str().into(),
+                head: *head,
+            })
+            .collect::<Vec<_>>(),
+    ))));
 }
 
 fn show_toast(
@@ -1012,8 +1341,13 @@ mod tests {
         let out = ops::run(&job, &c.env, &Cancel::new(), &mut |_| {});
         assert!(out.toast(JobKind::Trash).undo);
         assert!(!c.dir.join("a.jpg").exists());
-        let (n, failed) = ops::undo(&out.trashed);
-        assert_eq!((n, failed.len()), (1, 0));
+        let back = ops::run(
+            &Job::restore(out.trashed.clone()),
+            &c.env,
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        assert_eq!((back.done, back.failed.len()), (1, 0));
         assert_eq!(fs::read(c.dir.join("a.jpg")).unwrap(), b"a");
         c.reload().unwrap();
     }
@@ -1045,7 +1379,8 @@ mod tests {
         );
         c.open_dialog(Dialog::Refused {
             job,
-            name: "a.jpg".into(),
+            names: vec!["a.jpg".into()],
+            copy: vec!["a.jpg".into()],
             can_copy: true,
         });
         assert_eq!(c.focus, 1);
@@ -1058,7 +1393,8 @@ mod tests {
         ));
         c.open_dialog(Dialog::Refused {
             job: Job::new(JobKind::Move, &c.dir, vec![], &c.dir),
-            name: "a.jpg".into(),
+            names: vec!["a.jpg".into()],
+            copy: vec![],
             can_copy: false,
         });
         assert_eq!(c.focus, 0);
@@ -1077,5 +1413,213 @@ mod tests {
         );
         assert_eq!(names_text(&many[..6]).lines().count(), 6);
         assert_eq!(noun(&many[..1]), "“f0”");
+    }
+
+    fn prompt() -> ConflictPrompt {
+        ConflictPrompt {
+            name: "dune.jpg".into(),
+            kind: ConflictKind::FileFile,
+            existing_size: 6_200_000,
+            existing_mtime: 100,
+            incoming_size: 4_100_000,
+            incoming_mtime: 200,
+        }
+    }
+
+    fn conflict(c: &mut Controller) {
+        c.open_dialog(Dialog::Conflict {
+            ask: ConflictAsk {
+                prompt: prompt(),
+                dest: "SANDISK".into(),
+                left: 3,
+            },
+            apply_all: false,
+        });
+    }
+
+    #[test]
+    fn conflict_dialog_is_keyboard_operable() {
+        let mut c = setup("conflict-keys");
+        conflict(&mut c);
+        assert_eq!(c.focus, 1, "Skip is the default");
+        assert_eq!(
+            c.key(keys::RETURN, false, false),
+            Action::Answer(Some(ConflictChoice {
+                action: Conflict::Skip,
+                apply_all: false
+            }))
+        );
+        conflict(&mut c);
+        c.key(keys::TAB, false, false);
+        c.key(keys::TAB, false, false);
+        c.key(keys::TAB, false, false);
+        assert_eq!(c.focus, 4);
+        c.key(" ", false, false);
+        assert!(matches!(
+            c.dialog,
+            Some(Dialog::Conflict {
+                apply_all: true,
+                ..
+            })
+        ));
+        c.key(keys::LEFT, false, false);
+        assert_eq!(
+            c.key(keys::RETURN, false, false),
+            Action::Answer(Some(ConflictChoice {
+                action: Conflict::Replace,
+                apply_all: true
+            }))
+        );
+        conflict(&mut c);
+        assert_eq!(
+            c.key("k", false, false),
+            Action::Answer(Some(ConflictChoice {
+                action: Conflict::Rename,
+                apply_all: false
+            }))
+        );
+        conflict(&mut c);
+        assert_eq!(c.key(keys::ESCAPE, false, false), Action::Answer(None));
+        assert!(c.dialog.is_none());
+    }
+
+    #[test]
+    fn conflict_badges_and_names() {
+        assert_eq!(conflict_badges(&prompt()), (("Larger", ""), ("", "Newer")));
+        assert_eq!(side_badges(&prompt()), (vec!["Larger"], vec!["Newer"]));
+        let both = ConflictPrompt {
+            incoming_size: 9_000_000,
+            ..prompt()
+        };
+        assert_eq!(side_badges(&both), (vec![], vec!["Newer", "Larger"]));
+        let same = ConflictPrompt {
+            incoming_size: 6_200_000,
+            incoming_mtime: 100,
+            ..prompt()
+        };
+        assert_eq!(side_badges(&same), (vec![], vec![]));
+        assert_eq!(keep_both_name("dune.jpg"), "dune (2).jpg");
+        assert_eq!(keep_both_name(".bashrc"), ".bashrc (2)");
+    }
+
+    #[test]
+    fn copy_instead_copies_what_it_can_and_names_the_rest() {
+        let mut c = setup("refused-some");
+        let job = Job::new(
+            JobKind::Move,
+            &c.dir,
+            vec!["a.jpg".into(), "locked".into()],
+            &c.dir.join("raw-exports"),
+        );
+        let kept = |p: &str, reason| {
+            vec![KeptEntry {
+                path: p.into(),
+                reason,
+            }]
+        };
+        let outcome = Outcome {
+            refused: vec![
+                (
+                    "a.jpg".into(),
+                    kept("a.jpg", fsops::KeepReason::ReadOnlyFolder),
+                ),
+                (
+                    "locked".into(),
+                    kept("locked", fsops::KeepReason::UnreadableFolder),
+                ),
+            ],
+            ..Outcome::default()
+        };
+        let view = refusal_view(&outcome.refused);
+        assert!(view.can_copy, "one copyable item keeps Copy instead");
+        assert!(view.body.contains("locked"), "{}", view.body);
+        assert!(!view.body.contains("a.jpg"), "{}", view.body);
+        let d = c.finish(&job, &outcome).unwrap();
+        c.open_dialog(d);
+        let Action::Run(copy) = c.button(1) else {
+            panic!("Copy instead is offered")
+        };
+        assert_eq!(copy.kind, JobKind::Copy);
+        assert_eq!(copy.names, vec![OsString::from("a.jpg")]);
+    }
+
+    #[test]
+    fn toggle_names_the_kind_of_conflict() {
+        assert_eq!(
+            apply_label(ConflictKind::FileFile, 4),
+            "Apply to the rest of the file conflicts (3)"
+        );
+        assert_eq!(
+            apply_label(ConflictKind::FolderFolder, 3),
+            "Apply to the rest of the folder conflicts (2)"
+        );
+        let folders = ConflictPrompt {
+            kind: ConflictKind::FolderFolder,
+            ..prompt()
+        };
+        assert_eq!(
+            side_badges(&folders).1,
+            vec!["Newer"],
+            "no size badge on folders"
+        );
+    }
+
+    #[test]
+    fn every_refused_item_is_listed_and_copied() {
+        let mut c = setup("refused-many");
+        let job = Job::new(
+            JobKind::Move,
+            &c.dir,
+            vec!["a.jpg".into(), "b.jpg".into()],
+            &c.dir.join("raw-exports"),
+        );
+        let kept = |p: &str| {
+            vec![KeptEntry {
+                path: p.into(),
+                reason: fsops::KeepReason::ReadOnlyFolder,
+            }]
+        };
+        let outcome = Outcome {
+            refused: vec![
+                ("a.jpg".into(), kept("a.jpg")),
+                ("b.jpg".into(), kept("b.jpg")),
+            ],
+            ..Outcome::default()
+        };
+        let view = refusal_view(&outcome.refused);
+        assert_eq!(view.items, 2);
+        assert!(view.title.contains("2 items"), "{}", view.title);
+        assert_eq!(view.lines.iter().filter(|l| l.2).count(), 2);
+        let d = c.finish(&job, &outcome).unwrap();
+        let Dialog::Refused { names, .. } = &d else {
+            panic!()
+        };
+        assert_eq!(names.len(), 2);
+        c.open_dialog(d.clone());
+        if let Dialog::Refused { can_copy: true, .. } = d {
+            let Action::Run(copy) = c.button(1) else {
+                panic!()
+            };
+            assert_eq!(copy.names.len(), 2);
+        }
+    }
+
+    #[test]
+    fn dragging_onto_itself_is_refused_and_labelled() {
+        let mut c = setup("drag-self");
+        let i = c
+            .listing
+            .view()
+            .iter()
+            .position(|e| e.name == "raw-exports")
+            .unwrap();
+        c.listing.select_only("raw-exports".into());
+        c.pointer(i, 0, 0, false, Mods::default());
+        c.pointer(i, 1, 0, true, Mods::default());
+        let d = c.drag.clone().unwrap();
+        assert_eq!((d.target, d.refused), (None, Some(i)));
+        assert_eq!(c.drag_label().unwrap().0, "Can't drop into itself");
+        let row = &c.rows()[i];
+        assert!(row.drop_refused && !row.drop);
     }
 }

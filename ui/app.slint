@@ -30,6 +30,8 @@ export global Columns {
 export struct RefusalLine {
     path: string,
     note: string,
+    // An item's own line when several moves were refused.
+    head: bool,
 }
 
 export struct Place {
@@ -57,6 +59,8 @@ export struct Row {
     cut: bool,
     // The folder a drag is over.
     drop: bool,
+    // The folder a drag is over but can't drop into (it is being dragged).
+    drop-refused: bool,
 }
 
 export struct GridLine {
@@ -507,9 +511,30 @@ export component AppWindow inherits Window {
     in property <[RefusalLine]> refusal-lines;
     // False when a folder can't be read: only Close is offered.
     in property <bool> refusal-can-copy: true;
+    in property <string> refusal-body: "";
+    in property <string> conflict-replace-label: "Replace";
+    in property <bool> conflict-existing-folder: false;
+    in property <bool> conflict-incoming-folder: false;
     in property <string> refusal-dismiss: "Cancel";
     // Lines with a note under the path; each adds a row of height.
     in property <int> refusal-notes: 0;
+    // How many items were refused; above one the list groups by item.
+    in property <int> refusal-lines-items: 1;
+    // The live conflict dialog. Defaults match the design render.
+    in property <string> conflict-title: "SANDISK already has \"dune-sunset-0412.jpg\"";
+    in property <string> conflict-name: "dune-sunset-0412.jpg";
+    in property <string> conflict-kind: "JPEG image";
+    in property <string> conflict-existing-size: "6.2 MB";
+    in property <string> conflict-existing-date: "2026-10-12 21:40";
+    in property <string> conflict-existing-badge2: "";
+    in property <string> conflict-existing-badge: "Larger";
+    in property <string> conflict-incoming-size: "4.1 MB";
+    in property <string> conflict-incoming-date: "2026-10-30 18:58";
+    in property <string> conflict-incoming-badge2: "";
+    in property <string> conflict-incoming-badge: "Newer";
+    in property <string> conflict-hint: "Keep both saves it as dune-sunset-0412 (2).jpg";
+    in property <string> conflict-apply-label: "Apply to all 14 conflicts";
+    in property <bool> conflict-apply: false;
     // Interactive window. Dialog buttons are numbered left to right and the
     // focused one carries the ring; Tab, arrows, Enter, and Esc drive them.
     in property <int> dialog-focus: 0;
@@ -901,10 +926,10 @@ export component AppWindow inherits Window {
                         for row[i] in files: Rectangle {
                             width: parent.width;
                             height: row-h;
-                            background: row.drop ? selected : row.selected ? selected-active : row.hovered ? hover : transparent;
+                            background: row.drop ? selected : row.selected && !row.drop-refused ? selected-active : row.hovered ? hover : transparent;
                             border-radius: 6px;
-                            border-width: row.drop ? 2px : 0px;
-                            border-color: accent;
+                            border-width: row.drop ? 2px : row.drop-refused ? 1px : 0px;
+                            border-color: row.drop-refused ? muted : accent;
                             opacity: row.cut ? 0.5 : 1;
                             TouchArea {
                                 pointer-event(e) => {
@@ -1145,6 +1170,96 @@ export component AppWindow inherits Window {
         }
     }
 
+    if !harness && (toast-on || overlay == "skipped" || overlay == "skipped-details" || overlay == "toast-details"): Rectangle {
+        property <bool> open: overlay == "skipped-details" || overlay == "toast-details" || toast-open;
+        property <color> tone: toast-tone == "warning" ? warning : toast-tone == "danger" ? danger : muted;
+        property <length> line-h: 20px;
+        // Fit the line, 520px to 800px, and never wider than the window.
+        width: min(max(520px, min(800px, toast-line.preferred-width + 42px + 120px)), parent.width - side-w - 32px);
+        // At most eight detail lines show; the rest scroll, so the toast
+        // never grows over the listing.
+        property <length> list-h: min(8, toast-details.length) * line-h;
+        height: open ? 52px + 12px + list-h + 12px : 52px;
+        x: side-w + (parent.width - side-w - self.width) / 2;
+        y: parent.height - status-h - 16px - self.height;
+        background: surface;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: toast-tone == "" ? hairline : tone;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: #000000.with-alpha(0.35);
+        if toast-tone != "": Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 4px;
+            height: parent.height;
+            border-top-left-radius: 8px;
+            border-bottom-left-radius: 8px;
+            background: tone;
+        }
+        Text {
+            text: toast-tone == "warning" ? "󰀦" : toast-tone == "danger" ? "󰅙" : "󰄬";
+            x: 16px;
+            y: 0px;
+            width: 18px;
+            height: 52px;
+            font-size: 14px;
+            color: tone;
+            vertical-alignment: center;
+        }
+        toast-line := Text {
+            text: toast-text;
+            x: 42px;
+            y: 0px;
+            width: parent.width - 42px - 120px;
+            height: 52px;
+            font-size: 13px;
+            color: text;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        Text {
+            text: toast-details.length == 0 ? toast-action : open ? "Hide details" : "Details";
+            x: parent.width - 16px - self.width;
+            y: 0px;
+            width: 96px;
+            height: 52px;
+            font-size: 12px;
+            color: accent;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.toast-link(); }
+            }
+        }
+        if open: Rectangle {
+            x: 16px;
+            y: 52px;
+            width: parent.width - 32px;
+            height: 1px;
+            background: hairline;
+        }
+        if open: Flickable {
+            x: 42px;
+            y: 52px + 12px;
+            width: parent.width - 58px;
+            height: list-h;
+            viewport-height: toast-details.length * line-h;
+            VerticalLayout {
+                spacing: 0px;
+                for detail in toast-details: Text {
+                    text: detail;
+                    height: line-h;
+                    font-size: 11px;
+                    color: muted;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
     if !harness && (overlay == "trash" || overlay == "trash-no" || overlay == "delete" || overlay == "move-refused" || overlay == "menu-file" || overlay == "shortcuts"): Rectangle {
         background: #000000.with-alpha(0.6);
         if overlay == "delete" || overlay == "trash" || overlay == "trash-no": Rectangle {
@@ -1162,7 +1277,7 @@ export component AppWindow inherits Window {
                 spacing: 8px;
                 if overlay == "delete": HorizontalLayout {
                     spacing: 8px;
-                    Text { text: "󰀦"; font-size: 13px; color: danger; vertical-alignment: center; }
+                    Text { text: "󰀦"; width: 18px; height: 20px; font-size: 15px; color: danger; horizontal-alignment: center; vertical-alignment: center; }
                     Text { text: "Permanently delete \{confirm-noun}?"; font-size: 13px; font-weight: 700; color: text; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
                 }
                 if overlay != "delete": Text {
@@ -1213,7 +1328,9 @@ export component AppWindow inherits Window {
         }
         if overlay == "move-refused": Rectangle {
             width: 460px;
-            height: 160px + refusal-lines.length * 18px + refusal-notes * 18px;
+            // The list shows up to 14 lines and scrolls past that.
+            property <length> list-h: (refusal-lines.length + refusal-notes) * 18px;
+            height: 160px + min(list-h, 252px);
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: surface;
@@ -1225,14 +1342,20 @@ export component AppWindow inherits Window {
                 spacing: 8px;
                 Text { text: refusal-title; font-size: 13px; font-weight: 700; color: text; wrap: word-wrap; }
                 Text {
-                    text: refusal-can-copy ? "Robin can copy it there instead and leave the original where it is." : "Nothing was moved.";
+                    text: refusal-body != "" ? refusal-body : refusal-can-copy ? refusal-lines-items > 1 ? "Robin can copy them there instead and leave the originals where they are." : "Robin can copy it there instead and leave the original where it is." : "Nothing was moved.";
                     font-size: 12px;
                     color: muted;
                     wrap: word-wrap;
                 }
-                for line in refusal-lines: VerticalLayout {
-                    Text { text: line.path; font-size: 11px; color: muted; height: 18px; overflow: elide; }
-                    if line.note != "": Text { text: line.note; font-size: 11px; color: text; height: 18px; overflow: elide; x: 12px; }
+                Flickable {
+                    height: min(list-h, 252px);
+                    viewport-height: list-h;
+                    VerticalLayout {
+                        for line in refusal-lines: VerticalLayout {
+                            Text { text: line.path; font-size: 11px; font-weight: line.head ? 700 : 400; color: line.head ? text : muted; height: 18px; overflow: elide; x: line.head ? 0px : 12px; }
+                            if line.note != "": Text { text: line.note; font-size: 11px; color: text; height: 18px; overflow: elide; x: line.head ? 12px : 24px; }
+                        }
+                    }
                 }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
@@ -1380,8 +1503,13 @@ export component AppWindow inherits Window {
         }
     }
 
-    if !harness && (overlay == "conflict" || overlay == "conflict-all"): Rectangle {
+    if !harness && (overlay == "conflict" || overlay == "conflict-all" || overlay == "conflict-live"): Rectangle {
+        property <bool> live: overlay == "conflict-live";
+        property <bool> apply: live ? conflict-apply : overlay == "conflict-all";
+        // Design renders ring Skip; the live dialog follows the keyboard.
+        property <int> f: live ? dialog-focus : 1;
         background: #000000.with-alpha(0.6);
+        TouchArea { }
         Rectangle {
             width: 480px;
             height: 310px;
@@ -1392,7 +1520,7 @@ export component AppWindow inherits Window {
             border-width: 1px;
             border-color: hairline;
             Text {
-                text: "SANDISK already has \"dune-sunset-0412.jpg\"";
+                text: conflict-title;
                 x: 20px;
                 y: 16px;
                 width: parent.width - 40px;
@@ -1411,8 +1539,8 @@ export component AppWindow inherits Window {
                 border-radius: 6px;
                 border-width: 1px;
                 border-color: hairline;
-                Text { text: "dune-sunset-0412.jpg"; x: 8px; y: 6px; width: 200px; height: 16px; font-size: 11px; color: text; overflow: elide; }
-                Image {
+                Text { text: conflict-name; x: 8px; y: 6px; width: 200px; height: 16px; font-size: 11px; color: text; overflow: elide; }
+                if !live: Image {
                     x: 8px;
                     y: 26px;
                     width: 64px;
@@ -1420,11 +1548,14 @@ export component AppWindow inherits Window {
                     source: @image-url("../assets/thumbs/dune-sunset-0412.jpg");
                     image-fit: cover;
                 }
-                Rectangle { x: 8px; y: 94px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
-                Text { text: "Larger"; x: 8px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
-                Text { text: "6.2 MB"; x: 80px; y: 28px; width: 128px; height: 16px; font-size: 11px; color: muted; }
-                Text { text: "2026-10-12 21:40"; x: 80px; y: 46px; width: 128px; height: 16px; font-size: 11px; color: muted; }
-                Text { text: "JPEG image"; x: 80px; y: 64px; width: 128px; height: 16px; font-size: 11px; color: muted; }
+                if live: Text { text: conflict-existing-folder ? "󰉋" : "󰈔"; x: 8px; y: 26px; width: 64px; height: 64px; font-size: 40px; color: muted; horizontal-alignment: center; vertical-alignment: center; }
+                if conflict-existing-badge != "": Rectangle { x: 8px; y: 94px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
+                if conflict-existing-badge != "": Text { text: conflict-existing-badge; x: 8px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
+                if conflict-existing-badge2 != "": Rectangle { x: 64px; y: 94px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
+                if conflict-existing-badge2 != "": Text { text: conflict-existing-badge2; x: 64px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
+                Text { text: conflict-existing-size; x: 80px; y: 28px; width: 128px; height: 16px; font-size: 11px; color: muted; }
+                Text { text: conflict-existing-date; x: 80px; y: 46px; width: 128px; height: 16px; font-size: 11px; color: muted; }
+                Text { text: conflict-kind; x: 80px; y: 64px; width: 128px; height: 16px; font-size: 11px; color: muted; }
                 Text { text: "Existing"; x: 8px; y: 116px; width: 200px; height: 16px; font-size: 11px; color: muted; }
             }
             Rectangle {
@@ -1435,8 +1566,8 @@ export component AppWindow inherits Window {
                 border-radius: 6px;
                 border-width: 1px;
                 border-color: hairline;
-                Text { text: "dune-sunset-0412.jpg"; x: 8px; y: 6px; width: 200px; height: 16px; font-size: 11px; color: text; overflow: elide; }
-                Image {
+                Text { text: conflict-name; x: 8px; y: 6px; width: 200px; height: 16px; font-size: 11px; color: text; overflow: elide; }
+                if !live: Image {
                     x: 8px;
                     y: 26px;
                     width: 64px;
@@ -1444,15 +1575,18 @@ export component AppWindow inherits Window {
                     source: @image-url("../assets/thumbs/dune-sunset-0413.jpg");
                     image-fit: cover;
                 }
-                Rectangle { x: 8px; y: 94px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
-                Text { text: "Newer"; x: 8px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
-                Text { text: "4.1 MB"; x: 80px; y: 28px; width: 128px; height: 16px; font-size: 11px; color: muted; }
-                Text { text: "2026-10-30 18:58"; x: 80px; y: 46px; width: 128px; height: 16px; font-size: 11px; color: muted; }
-                Text { text: "JPEG image"; x: 80px; y: 64px; width: 128px; height: 16px; font-size: 11px; color: muted; }
+                if live: Text { text: conflict-incoming-folder ? "󰉋" : "󰈔"; x: 8px; y: 26px; width: 64px; height: 64px; font-size: 40px; color: muted; horizontal-alignment: center; vertical-alignment: center; }
+                if conflict-incoming-badge != "": Rectangle { x: 8px; y: 94px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
+                if conflict-incoming-badge != "": Text { text: conflict-incoming-badge; x: 8px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
+                if conflict-incoming-badge2 != "": Rectangle { x: 64px; y: 94px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
+                if conflict-incoming-badge2 != "": Text { text: conflict-incoming-badge2; x: 64px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
+                Text { text: conflict-incoming-size; x: 80px; y: 28px; width: 128px; height: 16px; font-size: 11px; color: muted; }
+                Text { text: conflict-incoming-date; x: 80px; y: 46px; width: 128px; height: 16px; font-size: 11px; color: muted; }
+                Text { text: conflict-kind; x: 80px; y: 64px; width: 128px; height: 16px; font-size: 11px; color: muted; }
                 Text { text: "Incoming"; x: 8px; y: 116px; width: 200px; height: 16px; font-size: 11px; color: muted; }
             }
             Text {
-                text: "Rename to dune-sunset-0412 (2).jpg";
+                text: conflict-hint;
                 x: 16px;
                 y: 202px;
                 width: 448px;
@@ -1466,11 +1600,11 @@ export component AppWindow inherits Window {
                 width: 14px;
                 height: 14px;
                 border-radius: 2px;
-                border-width: 1px;
-                border-color: line;
-                background: overlay == "conflict-all" ? accent : transparent;
+                border-color: f == 4 ? accent : line;
+                border-width: f == 4 ? 2px : 1px;
+                background: apply ? accent : transparent;
             }
-            if overlay == "conflict-all": Text {
+            if apply: Text {
                 text: "󰄬";
                 x: 16px;
                 y: 226px;
@@ -1481,14 +1615,26 @@ export component AppWindow inherits Window {
                 horizontal-alignment: center;
             }
             Text {
-                text: "Apply to all 14 conflicts";
+                text: conflict-apply-label;
                 x: 36px;
                 y: 226px;
-                width: 220px;
+                width: 330px;
                 height: 18px;
                 font-size: 12px;
                 color: text;
                 vertical-alignment: center;
+            }
+            TouchArea { x: 12px; y: 222px; width: 248px; height: 26px; clicked => { root.dialog-button(4); } }
+            if live: Rectangle {
+                x: 16px;
+                y: 262px;
+                width: 88px;
+                height: 32px;
+                border-radius: 6px;
+                border-width: f == 0 ? 2px : 1px;
+                border-color: f == 0 ? accent : line;
+                Text { text: "Cancel"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.dialog-button(0); } }
             }
             Rectangle {
                 x: 176px;
@@ -1496,9 +1642,10 @@ export component AppWindow inherits Window {
                 width: 88px;
                 height: 32px;
                 border-radius: 6px;
-                border-width: 2px;
-                border-color: accent;
+                border-width: f == 1 ? 2px : 1px;
+                border-color: f == 1 ? accent : line;
                 Text { text: "Skip"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.dialog-button(1); } }
             }
             Rectangle {
                 x: 272px;
@@ -1506,9 +1653,10 @@ export component AppWindow inherits Window {
                 width: 88px;
                 height: 32px;
                 border-radius: 6px;
-                border-width: 1px;
-                border-color: line;
-                Text { text: "Rename"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                border-width: f == 2 ? 2px : 1px;
+                border-color: f == 2 ? accent : line;
+                Text { text: "Keep both"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.dialog-button(2); } }
             }
             Rectangle {
                 x: 368px;
@@ -1516,9 +1664,10 @@ export component AppWindow inherits Window {
                 width: 96px;
                 height: 32px;
                 border-radius: 6px;
-                border-width: 1px;
-                border-color: line;
-                Text { text: "Replace"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                border-width: f == 3 ? 2px : 1px;
+                border-color: f == 3 ? accent : line;
+                Text { text: conflict-replace-label; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.dialog-button(3); } }
             }
         }
     }
@@ -2045,90 +2194,6 @@ export component AppWindow inherits Window {
         border-color: accent;
         Text { text: drag-glyph; x: 14px; y: 0px; width: 18px; height: parent.height; font-size: 14px; color: accent; vertical-alignment: center; }
         drag-line := Text { text: drag-label; x: 40px; y: 0px; height: parent.height; font-size: 12px; color: text; vertical-alignment: center; }
-    }
-
-    if !harness && (toast-on || overlay == "skipped" || overlay == "skipped-details" || overlay == "toast-details"): Rectangle {
-        property <bool> open: overlay == "skipped-details" || overlay == "toast-details" || toast-open;
-        property <color> tone: toast-tone == "warning" ? warning : toast-tone == "danger" ? danger : muted;
-        property <length> line-h: 20px;
-        // Fit the line, 520px to 800px, and never wider than the window.
-        width: min(max(520px, min(800px, toast-line.preferred-width + 42px + 120px)), parent.width - side-w - 32px);
-        height: open ? 52px + 12px + toast-details.length * line-h + 12px : 52px;
-        x: side-w + (parent.width - side-w - self.width) / 2;
-        y: parent.height - status-h - 16px - self.height;
-        background: surface;
-        border-radius: 8px;
-        border-width: 1px;
-        border-color: toast-tone == "" ? hairline : tone;
-        drop-shadow-blur: 16px;
-        drop-shadow-color: #000000.with-alpha(0.35);
-        if toast-tone != "": Rectangle {
-            x: 0px;
-            y: 0px;
-            width: 4px;
-            height: parent.height;
-            border-top-left-radius: 8px;
-            border-bottom-left-radius: 8px;
-            background: tone;
-        }
-        Text {
-            text: toast-tone == "warning" ? "󰀦" : toast-tone == "danger" ? "󰅙" : "󰄬";
-            x: 16px;
-            y: 0px;
-            width: 18px;
-            height: 52px;
-            font-size: 14px;
-            color: tone;
-            vertical-alignment: center;
-        }
-        toast-line := Text {
-            text: toast-text;
-            x: 42px;
-            y: 0px;
-            width: parent.width - 42px - 120px;
-            height: 52px;
-            font-size: 13px;
-            color: text;
-            overflow: elide;
-            vertical-alignment: center;
-        }
-        Text {
-            text: toast-details.length == 0 ? toast-action : open ? "Hide details" : "Details";
-            x: parent.width - 16px - self.width;
-            y: 0px;
-            width: 96px;
-            height: 52px;
-            font-size: 12px;
-            color: accent;
-            horizontal-alignment: right;
-            vertical-alignment: center;
-            TouchArea {
-                mouse-cursor: pointer;
-                clicked => { root.toast-link(); }
-            }
-        }
-        if open: Rectangle {
-            x: 16px;
-            y: 52px;
-            width: parent.width - 32px;
-            height: 1px;
-            background: hairline;
-        }
-        if open: VerticalLayout {
-            x: 42px;
-            y: 52px + 12px;
-            width: parent.width - 58px;
-            height: toast-details.length * line-h;
-            spacing: 0px;
-            for detail in toast-details: Text {
-                text: detail;
-                height: line-h;
-                font-size: 11px;
-                color: muted;
-                overflow: elide;
-                vertical-alignment: center;
-            }
-        }
     }
 
     if !harness && overlay == "path-complete": Rectangle {

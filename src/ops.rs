@@ -128,11 +128,47 @@ pub fn same_filesystem(a: &Path, b: &Path) -> bool {
 
 /// A folder can't go into itself or anything under it, and a move into the
 /// folder it is already in does nothing.
-pub fn drop_allowed(op: Op, src: &Path, names: &[OsString], dest: &Path) -> bool {
+/// Why a drop on a folder is or isn't possible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropCheck {
+    Ok,
+    /// Nothing to do: no names, or a move into the folder they are in.
+    Nothing,
+    /// The folder is one of the dragged folders or inside one.
+    IntoItself,
+}
+
+pub fn drop_check(op: Op, src: &Path, names: &[OsString], dest: &Path) -> DropCheck {
     if names.is_empty() || (op == Op::Move && src == dest) {
+        return DropCheck::Nothing;
+    }
+    if names.iter().any(|n| inside(&src.join(n), dest)) {
+        return DropCheck::IntoItself;
+    }
+    DropCheck::Ok
+}
+
+pub fn drop_allowed(op: Op, src: &Path, names: &[OsString], dest: &Path) -> bool {
+    drop_check(op, src, names, dest) == DropCheck::Ok
+}
+
+/// Whether `dest` is the folder `item` or anywhere inside it. Compares
+/// device and inode up the destination's real parent chain, so a symlinked
+/// or `..`-laden path into the folder is still caught.
+pub fn inside(item: &Path, dest: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::symlink_metadata(item) else {
+        return dest.starts_with(item);
+    };
+    if !meta.is_dir() {
         return false;
     }
-    !names.iter().any(|n| dest.starts_with(src.join(n)))
+    let Ok(real) = std::fs::canonicalize(dest) else {
+        return dest.starts_with(item);
+    };
+    real.ancestors().any(|dir| {
+        std::fs::metadata(dir).is_ok_and(|m| m.dev() == meta.dev() && m.ino() == meta.ino())
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +177,8 @@ pub enum JobKind {
     Move,
     Trash,
     Delete,
+    /// Undo of a trash: put `Job::restore` entries back.
+    Restore,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,6 +188,8 @@ pub struct Job {
     pub names: Vec<OsString>,
     /// Destination folder for copies and moves. Unused for trash and delete.
     pub dest: PathBuf,
+    /// What a Restore job puts back; empty otherwise.
+    pub restore: Vec<Trashed>,
 }
 
 impl Job {
@@ -159,6 +199,27 @@ impl Job {
             src: src.to_path_buf(),
             names,
             dest: dest.to_path_buf(),
+            restore: Vec::new(),
+        }
+    }
+
+    /// Undo a trash job on the job thread.
+    pub fn restore(items: Vec<Trashed>) -> Self {
+        let first = items
+            .first()
+            .and_then(|t| t.original.parent())
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let names = items
+            .iter()
+            .map(|t| t.original.file_name().unwrap_or_default().to_os_string())
+            .collect();
+        Self {
+            kind: JobKind::Restore,
+            src: first.clone(),
+            names,
+            dest: first,
+            restore: items,
         }
     }
 
@@ -176,6 +237,7 @@ impl Job {
             JobKind::Copy => "󰆏",
             JobKind::Move => "󰪹",
             JobKind::Trash | JobKind::Delete => "󰩺",
+            JobKind::Restore => "󰕌",
         }
     }
 
@@ -188,6 +250,7 @@ impl Job {
             JobKind::Move => format!("Moving {n} to {to}"),
             JobKind::Trash => format!("Moving {n} to trash"),
             JobKind::Delete => format!("Deleting {n}"),
+            JobKind::Restore => format!("Restoring {n}"),
         }
     }
 }
@@ -273,7 +336,21 @@ impl Outcome {
             JobKind::Move => format!("Moved {n}"),
             JobKind::Trash => format!("Moved {n} to trash"),
             JobKind::Delete => format!("Deleted {n}"),
+            JobKind::Restore => format!("Restored {n}"),
         };
+        if kind == JobKind::Restore {
+            let stayed = self.failed.len();
+            return Toast {
+                tone: if stayed == 0 { "" } else { "warning" },
+                text: if stayed == 0 {
+                    text
+                } else {
+                    format!("{text}, {stayed} stayed in the trash")
+                },
+                details: self.failed.clone(),
+                undo: false,
+            };
+        }
         if !self.report.left_behind.is_empty() {
             text = format!(
                 "{text}, but couldn't remove {} original{}",
@@ -288,6 +365,9 @@ impl Outcome {
         if !self.report.skipped.is_empty() {
             text = format!("{text}, skipped {}", self.report.skipped.len());
         }
+        if !self.refused.is_empty() {
+            text = format!("{text}, {} left where they were", self.refused.len());
+        }
         if !self.failed.is_empty() {
             text = format!("{text}, {} failed", self.failed.len());
         }
@@ -296,9 +376,15 @@ impl Outcome {
         }
         let mut details = self.report.details();
         details.extend(self.failed.iter().cloned());
+        details.extend(
+            self.refused
+                .iter()
+                .map(|(n, _)| format!("{}: not moved, see the dialog", n.to_string_lossy())),
+        );
         let tone = if !self.failed.is_empty() {
             "danger"
-        } else if !self.report.left_behind.is_empty() || self.cancelled {
+        } else if !self.report.left_behind.is_empty() || !self.refused.is_empty() || self.cancelled
+        {
             "warning"
         } else {
             ""
@@ -397,8 +483,44 @@ fn trash_target(dir: &Path, env: &Env) -> Result<TrashTarget> {
 /// items, so an item is never left half-done. `progress` sees each item
 /// before it starts and once at the end.
 pub fn run(job: &Job, env: &Env, cancel: &Cancel, progress: &mut dyn FnMut(&Progress)) -> Outcome {
+    run_asking(job, env, cancel, progress, &mut keep_both)
+}
+
+/// The conflict question a job asks: answer with a choice, or
+/// `Err(Error::Cancelled)` to stop the job.
+pub type Ask<'a> = dyn FnMut(&fsops::ConflictPrompt) -> Result<ConflictChoice> + 'a;
+
+/// [`run`], asking `ask` about each name clash. An "apply to all" answer
+/// holds for the rest of the job.
+pub fn run_asking(
+    job: &Job,
+    env: &Env,
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(&Progress),
+    ask: &mut Ask<'_>,
+) -> Outcome {
     let mut out = Outcome::default();
     let total = job.names.len();
+    if job.kind == JobKind::Restore {
+        for (i, t) in job.restore.iter().enumerate() {
+            progress(&Progress {
+                done: i,
+                total,
+                current: job.names[i].to_string_lossy().into_owned(),
+            });
+            match restore_one(t) {
+                Ok(()) => out.done += 1,
+                Err(e) => out.failed.push(format!("{}: {e}", t.original.display())),
+            }
+        }
+        progress(&Progress {
+            done: out.done,
+            total,
+            current: String::new(),
+        });
+        return out;
+    }
+    let mut policy = ConflictPolicy::new();
     let src = match DirFd::open(&job.src) {
         Ok(fd) => fd,
         Err(e) => {
@@ -439,13 +561,30 @@ pub fn run(job: &Job, env: &Env, cancel: &Cancel, progress: &mut dyn FnMut(&Prog
         // Each item finishes once started; Cancel takes effect before the next.
         let item = Cancel::new();
         let result = match job.kind {
-            JobKind::Copy => copy_one(job, &src, dest.as_ref().unwrap(), name, &item, &mut out),
-            JobKind::Move => move_one(job, &src, dest.as_ref().unwrap(), name, &item, &mut out),
+            JobKind::Copy | JobKind::Move => {
+                let mut opts = CopyOpts {
+                    cancel: &item,
+                    policy: &mut policy,
+                    ask: &mut *ask,
+                };
+                let dest = dest.as_ref().unwrap();
+                if job.kind == JobKind::Copy {
+                    copy_one(job, &src, dest, name, &mut opts, &mut out)
+                } else {
+                    move_one(job, &src, dest, name, opts, &mut out)
+                }
+            }
             JobKind::Trash => trash_one(job, &src, trash.as_ref().unwrap(), name, &mut out),
             JobKind::Delete => fsops::remove_child(&src, name, &mut |_| {}, &item),
+            JobKind::Restore => unreachable!("handled above"),
         };
         match result {
             Ok(()) => out.done += 1,
+            // Cancel in the conflict dialog stops the whole job.
+            Err(Error::Cancelled) => {
+                out.cancelled = true;
+                break;
+            }
             Err(Error::NotRemovable(kept)) => out.refused.push((name.clone(), kept)),
             Err(e) => out.failed.push(format!("{}: {e}", name.to_string_lossy())),
         }
@@ -472,20 +611,8 @@ fn keep_both(_: &fsops::ConflictPrompt) -> Result<ConflictChoice> {
 /// Compares device and inode up the destination's real parent chain, so a
 /// symlinked or `..`-laden path into the folder is still caught.
 fn into_itself(job: &Job, name: &OsStr) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(item) = std::fs::symlink_metadata(job.src.join(name)) else {
-        return Ok(()); // gone; the operation reports it
-    };
-    if !item.is_dir() {
-        return Ok(());
-    }
-    let dest = std::fs::canonicalize(&job.dest).map_err(|e| Error::Message(e.to_string()))?;
-    for dir in dest.ancestors() {
-        if let Ok(meta) = std::fs::metadata(dir) {
-            if meta.dev() == item.dev() && meta.ino() == item.ino() {
-                return Err(Error::Message("can't put a folder inside itself".into()));
-            }
-        }
+    if inside(&job.src.join(name), &job.dest) {
+        return Err(Error::Message("can't put a folder inside itself".into()));
     }
     Ok(())
 }
@@ -501,21 +628,19 @@ fn copy_one(
     src: &DirFd,
     dest: &DirFd,
     name: &OsStr,
-    item: &Cancel,
+    opts: &mut CopyOpts<'_>,
     out: &mut Outcome,
 ) -> Result<()> {
     into_itself(job, name)?;
-    let mut policy = ConflictPolicy::new();
-    let mut ask = keep_both;
     let (_, report) = fsops::copy_instead(
         src,
         name,
         dest,
         name,
         CopyOpts {
-            cancel: item,
-            policy: &mut policy,
-            ask: &mut ask,
+            cancel: opts.cancel,
+            policy: &mut *opts.policy,
+            ask: &mut *opts.ask,
         },
     )?;
     merge(&mut out.report, report);
@@ -527,23 +652,17 @@ fn move_one(
     src: &DirFd,
     dest: &DirFd,
     name: &OsStr,
-    item: &Cancel,
+    copy: CopyOpts<'_>,
     out: &mut Outcome,
 ) -> Result<()> {
     if job.src == job.dest {
         return Ok(());
     }
     into_itself(job, name)?;
-    let mut policy = ConflictPolicy::new();
-    let mut ask = keep_both;
     let mut opts = MoveOpts {
         force_copy: false,
         fail_before_unlink: false,
-        copy: CopyOpts {
-            cancel: item,
-            policy: &mut policy,
-            ask: &mut ask,
-        },
+        copy,
         report: TransferReport::default(),
         check_removable: true,
         keep_source: false,
@@ -579,28 +698,32 @@ fn trash_one(
     Ok(())
 }
 
-/// Put trashed entries back where they were. Returns how many came back
-/// and a line for each that couldn't.
-pub fn undo(items: &[Trashed]) -> (usize, Vec<String>) {
-    let mut restored = 0;
-    let mut failed = Vec::new();
-    for t in items {
-        let result = (|| {
-            let parent = t
-                .original
-                .parent()
-                .ok_or_else(|| Error::Message("no parent folder".into()))?;
-            let name = t.original.file_name().ok_or(Error::InvalidName)?;
-            let trash = DirFd::open(&t.trash)?;
-            let dest = DirFd::open(parent)?;
-            fsops::restore_from_trash(&trash, &t.stored, &dest, name)
-        })();
-        match result {
-            Ok(()) => restored += 1,
-            Err(e) => failed.push(format!("{}: {e}", t.original.display())),
-        }
-    }
-    (restored, failed)
+/// Run an undo the way the window does, as a Restore job.
+#[cfg(test)]
+pub(crate) fn undo(items: &[Trashed]) -> (usize, Vec<String>) {
+    let env = Env {
+        home: PathBuf::from("/"),
+        home_trash: PathBuf::from("/nonexistent"),
+    };
+    let out = run(
+        &Job::restore(items.to_vec()),
+        &env,
+        &Cancel::new(),
+        &mut |_| {},
+    );
+    (out.done, out.failed)
+}
+
+/// Put one trashed entry back where it was, never over a new file.
+fn restore_one(t: &Trashed) -> Result<()> {
+    let parent = t
+        .original
+        .parent()
+        .ok_or_else(|| Error::Message("no parent folder".into()))?;
+    let name = t.original.file_name().ok_or(Error::InvalidName)?;
+    let trash = DirFd::open(&t.trash)?;
+    let dest = DirFd::open(parent)?;
+    fsops::restore_from_trash(&trash, &t.stored, &dest, name)
 }
 
 #[cfg(test)]
@@ -853,5 +976,138 @@ mod tests {
         );
         assert_eq!(job.label(), "Copying 1 item to SANDISK");
         assert_eq!(job.glyph(), "󰆏");
+    }
+
+    fn clash(label: &str, files: &[&str]) -> (PathBuf, PathBuf) {
+        let root = scratch(label);
+        let (src, dest) = (root.join("src"), root.join("dest"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        for f in files {
+            fs::write(src.join(f), b"new").unwrap();
+            fs::write(dest.join(f), b"old").unwrap();
+        }
+        (root, dest)
+    }
+
+    #[test]
+    fn conflict_answers_and_apply_to_all() {
+        let (root, dest) = clash("conflict-all", &["a", "b", "c"]);
+        let job = Job::new(
+            JobKind::Copy,
+            &root.join("src"),
+            names(&["a", "b", "c"]),
+            &dest,
+        );
+        let mut asked = Vec::new();
+        let mut script = vec![
+            ConflictChoice {
+                action: fsops::Conflict::Replace,
+                apply_all: false,
+            },
+            ConflictChoice {
+                action: fsops::Conflict::Skip,
+                apply_all: true,
+            },
+        ]
+        .into_iter();
+        let out = run_asking(&job, &env(&root), &Cancel::new(), &mut |_| {}, &mut |p| {
+            asked.push(p.name.clone());
+            Ok(script.next().expect("asked once too often"))
+        });
+        assert_eq!(asked, ["a", "b"], "apply to all answers c without asking");
+        assert_eq!(fs::read(dest.join("a")).unwrap(), b"new");
+        assert_eq!(fs::read(dest.join("b")).unwrap(), b"old");
+        assert_eq!(fs::read(dest.join("c")).unwrap(), b"old");
+        assert_eq!(out.done, 3, "skipped items still finish");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn keep_both_never_overwrites() {
+        let (root, dest) = clash("conflict-keep", &["a.txt"]);
+        for kind in [JobKind::Copy, JobKind::Move] {
+            let job = Job::new(kind, &root.join("src"), names(&["a.txt"]), &dest);
+            if kind == JobKind::Move {
+                fs::write(root.join("src/a.txt"), b"moved").unwrap();
+            }
+            run_asking(&job, &env(&root), &Cancel::new(), &mut |_| {}, &mut |_| {
+                Ok(ConflictChoice {
+                    action: fsops::Conflict::Rename,
+                    apply_all: false,
+                })
+            });
+        }
+        assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"old");
+        assert_eq!(fs::read(dest.join("a (2).txt")).unwrap(), b"new");
+        assert_eq!(fs::read(dest.join("a (3).txt")).unwrap(), b"moved");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancelling_a_conflict_stops_the_job() {
+        let (root, dest) = clash("conflict-cancel", &["a", "b"]);
+        let job = Job::new(JobKind::Move, &root.join("src"), names(&["a", "b"]), &dest);
+        let mut n = 0;
+        let out = run_asking(&job, &env(&root), &Cancel::new(), &mut |_| {}, &mut |_| {
+            n += 1;
+            Err(Error::Cancelled)
+        });
+        assert!(out.cancelled);
+        assert_eq!(n, 1, "nothing is asked after Cancel");
+        assert!(root.join("src/a").exists() && root.join("src/b").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drop_through_a_symlink_into_itself_is_refused() {
+        let root = scratch("drop-link");
+        fs::create_dir_all(root.join("Projects/inner")).unwrap();
+        std::os::unix::fs::symlink(root.join("Projects/inner"), root.join("shortcut")).unwrap();
+        let check = drop_check(
+            Op::Move,
+            &root,
+            &names(&["Projects"]),
+            &root.join("shortcut"),
+        );
+        assert_eq!(check, DropCheck::IntoItself);
+        assert!(!drop_allowed(
+            Op::Copy,
+            &root,
+            &names(&["Projects"]),
+            &root.join("shortcut")
+        ));
+        fs::create_dir_all(root.join("Other")).unwrap();
+        assert!(drop_allowed(
+            Op::Move,
+            &root,
+            &names(&["Projects"]),
+            &root.join("Other")
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_job_puts_trashed_files_back() {
+        let root = scratch("restore");
+        fs::write(root.join("a"), b"a").unwrap();
+        let e = env(&root);
+        let out = run(
+            &Job::new(JobKind::Trash, &root, names(&["a"]), &root),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        assert!(!root.join("a").exists());
+        let back = run(
+            &Job::restore(out.trashed.clone()),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        assert_eq!((back.done, back.failed.len()), (1, 0));
+        assert_eq!(fs::read(root.join("a")).unwrap(), b"a");
+        assert!(back.toast(JobKind::Restore).text.starts_with("Restored"));
+        let _ = fs::remove_dir_all(&root);
     }
 }
