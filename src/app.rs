@@ -680,6 +680,8 @@ struct State {
     watch: Option<crate::watch::Watch>,
     debounce: crate::model::Debounce,
     watch_timer: slint::Timer,
+    /// Paths another app dropped on the window, flushed as one batch.
+    dropped: Rc<RefCell<Vec<PathBuf>>>,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -708,9 +710,25 @@ pub fn run(dir: PathBuf) -> Result<i32> {
         watch: None,
         debounce: crate::model::Debounce::new(Duration::from_millis(WATCH_DEBOUNCE_MS)),
         watch_timer: slint::Timer::default(),
+        dropped: Rc::default(),
     }));
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
     redraw(&ui, &state.borrow());
+    {
+        // Inbound drops from other apps. winit reports one DroppedFile per
+        // path (X11 only in winit 0.30) and no pointer position, so they
+        // land in the open folder.
+        use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
+        let dropped = state.borrow().dropped.clone();
+        ui.window()
+            .on_winit_window_event(move |_, event| match event {
+                WindowEvent::DroppedFile(path) => {
+                    dropped.borrow_mut().push(path.clone());
+                    EventResult::PreventDefault
+                }
+                _ => EventResult::Propagate,
+            });
+    }
     let w = ui.as_weak();
     let st = state.clone();
     state.borrow().watch_timer.start(
@@ -821,6 +839,13 @@ const WATCH_DEBOUNCE_MS: u64 = 200;
 /// Follow the open folder and reread it once outside changes settle,
 /// keeping the selection (by name) and the scroll position.
 fn poll_watch(ui: &AppWindow, st: &Shared) {
+    let paths = std::mem::take(&mut *st.borrow().dropped.borrow_mut());
+    if !paths.is_empty() {
+        let jobs = ops::external_drop(&paths, &st.borrow().ctl.dir);
+        for job in jobs {
+            apply(ui, st, Action::Run(job));
+        }
+    }
     let mut s = st.borrow_mut();
     if s.watch.as_ref().map(|w| w.dir()) != Some(s.ctl.dir.as_path()) {
         s.watch = crate::watch::Watch::new(&s.ctl.dir).ok();

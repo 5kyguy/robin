@@ -148,6 +148,36 @@ pub fn drop_check(op: Op, src: &Path, names: &[OsString], dest: &Path) -> DropCh
     DropCheck::Ok
 }
 
+/// Files dropped on the window by another app, as copy or move jobs into
+/// `dest`: one job per source folder, Thunar's same-filesystem rule for
+/// the op (no modifier keys can be read during an outside drag), and
+/// nothing for items already in `dest` or for a folder dropped into
+/// itself.
+pub fn external_drop(paths: &[PathBuf], dest: &Path) -> Vec<Job> {
+    let mut groups: Vec<(PathBuf, Vec<OsString>)> = Vec::new();
+    for path in paths {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            continue;
+        };
+        match groups.iter_mut().find(|(p, _)| p == parent) {
+            Some((_, names)) => {
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.to_os_string());
+                }
+            }
+            None => groups.push((parent.to_path_buf(), vec![name.to_os_string()])),
+        }
+    }
+    groups
+        .into_iter()
+        .filter(|(src, _)| src != dest)
+        .filter_map(|(src, names)| {
+            let op = drop_op(Mods::default(), same_filesystem(&src, dest))?;
+            drop_allowed(op, &src, &names, dest).then(|| Job::transfer(op, &src, names, dest))
+        })
+        .collect()
+}
+
 pub fn drop_allowed(op: Op, src: &Path, names: &[OsString], dest: &Path) -> bool {
     drop_check(op, src, names, dest) == DropCheck::Ok
 }
@@ -1215,5 +1245,34 @@ mod tests {
         assert_eq!(fs::read(root.join("a")).unwrap(), b"a");
         assert!(back.toast(JobKind::Restore).text.starts_with("Restored"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn outside_drops_group_by_folder_and_skip_what_is_already_here() {
+        let root = std::env::temp_dir().join(format!("robin-xdrop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (a, b, dest) = (root.join("a"), root.join("b"), root.join("dest"));
+        for d in [&a, &b, &dest, &dest.join("sub")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let paths = vec![
+            a.join("1.jpg"),
+            b.join("2.jpg"),
+            a.join("3.jpg"),
+            a.join("1.jpg"),
+            dest.join("here.txt"),
+            PathBuf::from("/"),
+        ];
+        let jobs = external_drop(&paths, &dest);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].src, a);
+        assert_eq!(jobs[0].names, ["1.jpg", "3.jpg"]);
+        assert_eq!(jobs[1].src, b);
+        assert_eq!(jobs[1].names, ["2.jpg"]);
+        assert!(jobs
+            .iter()
+            .all(|j| j.dest == dest && j.kind == JobKind::Move));
+        assert!(external_drop(std::slice::from_ref(&root), &dest.join("sub")).is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
