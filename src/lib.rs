@@ -8,6 +8,7 @@ pub mod error;
 pub mod fixture;
 pub mod fsops;
 pub mod model;
+pub mod mounts;
 pub mod safety;
 pub mod shots;
 pub mod stats;
