@@ -383,6 +383,92 @@ pub struct MoveOpts<'a> {
     pub force_copy: bool,
     pub fail_before_unlink: bool,
     pub copy: CopyOpts<'a>,
+    /// What moved and what was left behind, for the completion toast.
+    pub report: TransferReport,
+}
+
+/// Why a cross-device move left an entry where it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Another filesystem is mounted here. Moving would empty that volume.
+    MountPoint,
+    Fifo,
+    Socket,
+    Device,
+}
+
+impl SkipReason {
+    pub fn describe(self) -> &'static str {
+        match self {
+            SkipReason::MountPoint => "another drive is mounted here",
+            SkipReason::Fifo => "named pipes are not copied",
+            SkipReason::Socket => "sockets are not copied",
+            SkipReason::Device => "device files are not copied",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedEntry {
+    /// Relative to the moved item, starting with its own name.
+    pub path: std::path::PathBuf,
+    pub reason: SkipReason,
+}
+
+/// The result of a transfer. Skipped entries stay in the source and are
+/// listed so they never vanish silently.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransferReport {
+    pub moved: usize,
+    pub skipped: Vec<SkippedEntry>,
+}
+
+impl TransferReport {
+    /// The toast line, e.g. "Moved 212 items, skipped 3".
+    pub fn summary(&self) -> String {
+        let items = if self.moved == 1 { "item" } else { "items" };
+        if self.skipped.is_empty() {
+            format!("Moved {} {items}", self.moved)
+        } else {
+            format!(
+                "Moved {} {items}, skipped {}",
+                self.moved,
+                self.skipped.len()
+            )
+        }
+    }
+
+    /// One line per skipped entry for the Details list.
+    pub fn details(&self) -> Vec<String> {
+        self.skipped
+            .iter()
+            .map(|s| format!("{} — {}", s.path.display(), s.reason.describe()))
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryKind {
+    Dir,
+    File,
+    Symlink,
+    Skip(SkipReason),
+}
+
+/// Decide how a cross-device move treats an entry. Anything on a different
+/// device than the moved root is a mount point and is never descended into.
+fn classify(mode: u32, dev: u64, root_dev: u64) -> EntryKind {
+    if dev != root_dev {
+        return EntryKind::Skip(SkipReason::MountPoint);
+    }
+    match mode & 0o170000 {
+        0o040000 => EntryKind::Dir,
+        0o100000 => EntryKind::File,
+        0o120000 => EntryKind::Symlink,
+        0o010000 => EntryKind::Skip(SkipReason::Fifo),
+        0o140000 => EntryKind::Skip(SkipReason::Socket),
+        _ => EntryKind::Skip(SkipReason::Device),
+    }
 }
 
 /// Move by rename when it works. `force_copy` exercises the cross-device path.
@@ -397,39 +483,143 @@ pub fn move_child(
     if !opts.force_copy {
         let from_c = component(from)?;
         let to_c = component(to)?;
-        match rename_noreplace(parent.as_fd(), &from_c, dest_parent.as_fd(), &to_c) {
-            Ok(()) => return Ok(CopyOutcome::Copied),
-            Err(err) if err == Errno::XDEV => {}
-            Err(err) if err == Errno::EXIST => {
-                return replace_or_rename(parent, from, dest_parent, to, &mut opts.copy);
-            }
+        let outcome = match rename_noreplace(parent.as_fd(), &from_c, dest_parent.as_fd(), &to_c) {
+            Ok(()) => Some(CopyOutcome::Copied),
+            Err(err) if err == Errno::XDEV => None,
+            Err(err) if err == Errno::EXIST => Some(replace_or_rename(
+                parent,
+                from,
+                dest_parent,
+                to,
+                &mut opts.copy,
+            )?),
             Err(err) => return Err(Error::from_errno(to, err)),
+        };
+        if let Some(outcome) = outcome {
+            if outcome == CopyOutcome::Copied {
+                opts.report.moved += 1;
+            }
+            return Ok(outcome);
         }
     }
-    if is_directory(parent, from)? {
-        return move_directory(parent, from, dest_parent, to, opts, 0);
+    let from_c = component(from)?;
+    let stat = rustix::fs::statat(parent.as_fd(), from_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(from, e))?;
+    let rel = std::path::PathBuf::from(from);
+    move_entry(parent, from, dest_parent, to, opts, stat.st_dev, &rel, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn move_entry(
+    parent: &DirFd,
+    from: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    to: &std::ffi::OsStr,
+    opts: &mut MoveOpts<'_>,
+    root_dev: u64,
+    rel: &Path,
+    depth: u32,
+) -> Result<CopyOutcome> {
+    if opts.copy.cancel.is_cancelled() {
+        return Err(Error::Cancelled);
     }
-    if copy_file(parent, from, dest_parent, to, &mut opts.copy)? == CopyOutcome::Skipped {
+    let from_c = component(from)?;
+    let stat = rustix::fs::statat(parent.as_fd(), from_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(from, e))?;
+    match classify(stat.st_mode, stat.st_dev, root_dev) {
+        EntryKind::Skip(reason) => {
+            opts.report.skipped.push(SkippedEntry {
+                path: rel.to_path_buf(),
+                reason,
+            });
+            Ok(CopyOutcome::Skipped)
+        }
+        EntryKind::Dir => move_directory(parent, from, dest_parent, to, opts, root_dev, rel, depth),
+        EntryKind::Symlink => move_symlink(parent, from, dest_parent, to, &stat, opts),
+        EntryKind::File => {
+            if copy_file(parent, from, dest_parent, to, &mut opts.copy)? == CopyOutcome::Skipped {
+                return Ok(CopyOutcome::Skipped);
+            }
+            rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(to, e))?;
+            if opts.fail_before_unlink {
+                return Err(Error::Message(
+                    "injected failure before unlinking the source".into(),
+                ));
+            }
+            remove_child(parent, from, &mut |_| {}, opts.copy.cancel)?;
+            opts.report.moved += 1;
+            Ok(CopyOutcome::Copied)
+        }
+    }
+}
+
+/// Recreate a symlink on the destination with the same target, then unlink
+/// the source link. The target is never followed.
+fn move_symlink(
+    parent: &DirFd,
+    from: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    to: &std::ffi::OsStr,
+    stat: &rustix::fs::Stat,
+    opts: &mut MoveOpts<'_>,
+) -> Result<CopyOutcome> {
+    let from_c = component(from)?;
+    let target = rustix::fs::readlinkat(parent.as_fd(), from_c.as_c_str(), Vec::new())
+        .map_err(|e| Error::from_errno(from, e))?;
+    let Some(dest_name) = resolve_dest_name(dest_parent, to, stat, &mut opts.copy)? else {
         return Ok(CopyOutcome::Skipped);
+    };
+    if exists(dest_parent, dest_name.as_os_str())?
+        && is_directory(dest_parent, dest_name.as_os_str())?
+    {
+        return Err(Error::Message(format!(
+            "refusing to replace directory {} with a symlink",
+            dest_name.to_string_lossy()
+        )));
     }
-    rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(to, e))?;
+    let to_c = component(dest_name.as_os_str())?;
+    let tmp = std::ffi::OsString::from(partial_name());
+    let tmp_c = component(tmp.as_os_str())?;
+    rustix::fs::symlinkat(target.as_c_str(), dest_parent.as_fd(), tmp_c.as_c_str())
+        .map_err(|e| Error::from_errno(&tmp, e))?;
+    let mut guard = UnlinkOnDrop {
+        dir: dest_parent.as_fd(),
+        name: tmp_c,
+        live: true,
+    };
+    rustix::fs::renameat(
+        dest_parent.as_fd(),
+        guard.name.as_c_str(),
+        dest_parent.as_fd(),
+        to_c.as_c_str(),
+    )
+    .map_err(|e| Error::from_errno(&dest_name, e))?;
+    guard.live = false;
+    rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
     if opts.fail_before_unlink {
         return Err(Error::Message(
             "injected failure before unlinking the source".into(),
         ));
     }
-    remove_child(parent, from, &mut |_| {}, opts.copy.cancel)?;
+    rustix::fs::unlinkat(parent.as_fd(), from_c.as_c_str(), AtFlags::empty())
+        .map_err(|e| Error::from_errno(from, e))?;
+    opts.report.moved += 1;
     Ok(CopyOutcome::Copied)
 }
 
 /// Copy a directory across devices. The source directory is removed only when
-/// every child was [`CopyOutcome::Copied`].
+/// every child was [`CopyOutcome::Copied`]. A new destination directory is
+/// created private and writable, and gets the source mode and times only
+/// after its children are in, so a read-only source still copies.
+#[allow(clippy::too_many_arguments)]
 fn move_directory(
     parent: &DirFd,
     from: &std::ffi::OsStr,
     dest_parent: &DirFd,
     to: &std::ffi::OsStr,
     opts: &mut MoveOpts<'_>,
+    root_dev: u64,
+    rel: &Path,
     depth: u32,
 ) -> Result<CopyOutcome> {
     if opts.copy.cancel.is_cancelled() {
@@ -445,35 +635,54 @@ fn move_directory(
     let Some(dest_name) = dest_name else {
         return Ok(CopyOutcome::Skipped);
     };
-    if exists(dest_parent, dest_name.as_os_str())? {
+    let created = if exists(dest_parent, dest_name.as_os_str())? {
         if !is_directory(dest_parent, dest_name.as_os_str())? {
             return Err(Error::Message(format!(
                 "refusing to replace a file with directory {}",
                 dest_name.to_string_lossy()
             )));
         }
+        false
     } else {
         let c = component(dest_name.as_os_str())?;
         rustix::fs::mkdirat(
             dest_parent.as_fd(),
             c.as_c_str(),
-            Mode::from_raw_mode(stat.st_mode & 0o777),
+            Mode::from_raw_mode(0o700),
         )
         .map_err(|e| Error::from_errno(&dest_name, e))?;
-    }
+        true
+    };
     let src = parent.open_dir_nofollow(from)?;
     let dst = dest_parent.open_dir_nofollow(dest_name.as_os_str())?;
     let mut all_copied = true;
-    for entry in src.list()? {
-        let outcome = if is_directory(&src, &entry.name)? {
-            move_directory(&src, &entry.name, &dst, &entry.name, opts, depth + 1)?
-        } else {
-            move_child(&src, &entry.name, &dst, &entry.name, opts)?
-        };
-        if outcome == CopyOutcome::Skipped {
-            all_copied = false;
+    // Children first; the mode and times are applied even if a child fails,
+    // so a partial copy does not stay 0700 or carry the copy time.
+    let children = (|| -> Result<()> {
+        for entry in src.list()? {
+            let child_rel = rel.join(&entry.name);
+            let outcome = move_entry(
+                &src,
+                &entry.name,
+                &dst,
+                &entry.name,
+                opts,
+                root_dev,
+                &child_rel,
+                depth + 1,
+            )?;
+            if outcome == CopyOutcome::Skipped {
+                all_copied = false;
+            }
         }
+        Ok(())
+    })();
+    if created {
+        rustix::fs::fchmod(dst.as_fd(), Mode::from_raw_mode(stat.st_mode & 0o7777))
+            .map_err(|e| Error::from_errno(&dest_name, e))?;
+        set_times(dst.as_fd(), &stat).map_err(|e| Error::from_errno(&dest_name, e))?;
     }
+    children?;
     rustix::fs::fsync(dst.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
     if !all_copied {
         return Ok(CopyOutcome::Skipped);
@@ -960,24 +1169,42 @@ fn deletion_date() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0))
         .as_secs() as i64;
-    format_deletion_date(secs)
+    format_deletion_date(secs, local_offset(secs))
 }
 
-fn format_deletion_date(secs: i64) -> String {
+/// Seconds east of UTC for the local zone at `secs`.
+fn local_offset(secs: i64) -> i64 {
     let t = secs as libc::time_t;
     let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
     let ok = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
-    if !ok {
-        return String::from("1970-01-01T00:00:00");
+    if ok {
+        tm.tm_gmtoff as i64
+    } else {
+        0
     }
+}
+
+/// `DeletionDate` is local time without a zone, so the offset is applied
+/// here. Pure, so tests do not touch `TZ`.
+fn format_deletion_date(secs: i64, offset: i64) -> String {
+    let t = secs + offset;
+    let days = t.div_euclid(86_400);
+    let rem = t.rem_euclid(86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
     )
 }
 
@@ -1268,6 +1495,7 @@ mod tests {
                 force_copy: false,
                 fail_before_unlink: false,
                 copy: opts(&cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
             },
         )
         .unwrap();
@@ -1293,6 +1521,7 @@ mod tests {
                 force_copy: true,
                 fail_before_unlink: true,
                 copy: opts(&cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
             },
         )
         .unwrap_err();
@@ -1325,6 +1554,7 @@ mod tests {
                 force_copy: true,
                 fail_before_unlink: false,
                 copy: opts(&cancel, &mut policy, &mut skip),
+                report: TransferReport::default(),
             },
         )
         .unwrap();
@@ -1368,6 +1598,7 @@ mod tests {
                 force_copy: true,
                 fail_before_unlink: false,
                 copy: opts(&cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
             },
         )
         .unwrap();
@@ -1400,6 +1631,7 @@ mod tests {
                 force_copy: true,
                 fail_before_unlink: false,
                 copy: opts(&cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
             },
         )
         .unwrap();
@@ -1438,6 +1670,7 @@ mod tests {
                 force_copy: false,
                 fail_before_unlink: false,
                 copy: opts(&cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
             },
         )
         .unwrap();
@@ -1451,6 +1684,7 @@ mod tests {
                 force_copy: false,
                 fail_before_unlink: false,
                 copy: opts(&cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
             },
         )
         .unwrap();
@@ -1559,29 +1793,21 @@ mod tests {
 
     #[test]
     fn deletion_date_is_local_not_utc() {
-        let prev = std::env::var_os("TZ");
-        std::env::set_var("TZ", "EST5");
-        reload_tz();
         assert_eq!(
-            format_deletion_date(1_700_000_000),
+            format_deletion_date(1_700_000_000, -5 * 3600),
             "2023-11-14T17:13:20",
             "DeletionDate must be local time"
         );
-        std::env::set_var("TZ", "UTC0");
-        reload_tz();
-        assert_eq!(format_deletion_date(1_700_000_000), "2023-11-14T22:13:20");
-        match prev {
-            Some(value) => std::env::set_var("TZ", value),
-            None => std::env::remove_var("TZ"),
-        }
-        reload_tz();
-    }
-
-    fn reload_tz() {
-        extern "C" {
-            fn tzset();
-        }
-        unsafe { tzset() }
+        assert_eq!(
+            format_deletion_date(1_700_000_000, 0),
+            "2023-11-14T22:13:20"
+        );
+        assert_eq!(
+            format_deletion_date(1_700_000_000, 5 * 3600 + 1800),
+            "2023-11-15T03:43:20"
+        );
+        assert_eq!(format_deletion_date(951_782_400, 0), "2000-02-29T00:00:00");
+        assert_eq!(format_deletion_date(0, -3600), "1969-12-31T23:00:00");
     }
 
     #[test]
@@ -1822,6 +2048,182 @@ mod tests {
         assert!(xattr_errno(Errno::NOTSUP).is_ok());
         let err = xattr_errno(Errno::PERM).unwrap_err();
         assert!(err.to_string().contains("xattr"), "{err}");
+    }
+
+    fn cross_device_move(root: &Path, from: &str, to: &str) -> (CopyOutcome, TransferReport) {
+        let dir = DirFd::open(root).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = replace_ask;
+        let mut opts = MoveOpts {
+            force_copy: true,
+            fail_before_unlink: false,
+            copy: CopyOpts {
+                cancel: &cancel,
+                policy: &mut policy,
+                ask: &mut ask,
+            },
+            report: TransferReport::default(),
+        };
+        let outcome = move_child(
+            &dir,
+            std::ffi::OsStr::new(from),
+            &dir,
+            std::ffi::OsStr::new(to),
+            &mut opts,
+        )
+        .unwrap();
+        (outcome, opts.report)
+    }
+
+    #[test]
+    fn mount_points_are_skipped_not_descended() {
+        let dir_mode = 0o040755;
+        assert_eq!(classify(dir_mode, 7, 7), EntryKind::Dir);
+        assert_eq!(
+            classify(dir_mode, 9, 7),
+            EntryKind::Skip(SkipReason::MountPoint),
+            "a child on another device is a mount point"
+        );
+        assert_eq!(
+            classify(0o100644, 9, 7),
+            EntryKind::Skip(SkipReason::MountPoint)
+        );
+        assert_eq!(classify(0o120777, 7, 7), EntryKind::Symlink);
+        assert_eq!(classify(0o100644, 7, 7), EntryKind::File);
+        assert_eq!(classify(0o010644, 7, 7), EntryKind::Skip(SkipReason::Fifo));
+        assert_eq!(
+            classify(0o140755, 7, 7),
+            EntryKind::Skip(SkipReason::Socket)
+        );
+        assert_eq!(
+            classify(0o020644, 7, 7),
+            EntryKind::Skip(SkipReason::Device)
+        );
+
+        // /proc is its own mount under /. Its device differs from the root's,
+        // so a move rooted at / would skip it instead of copying it.
+        let root = rustix::fs::stat("/").unwrap();
+        let proc_ = rustix::fs::stat("/proc").unwrap();
+        if proc_.st_dev != root.st_dev {
+            assert_eq!(
+                classify(proc_.st_mode, proc_.st_dev, root.st_dev),
+                EntryKind::Skip(SkipReason::MountPoint)
+            );
+        }
+    }
+
+    #[test]
+    fn cross_device_move_copies_symlinks_and_skips_fifos_and_sockets() {
+        let root = scratch("special");
+        let src = root.join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink("../elsewhere/target", src.join("link")).unwrap();
+        let fifo = std::ffi::CString::new(src.join("pipe").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        let _sock = std::os::unix::net::UnixListener::bind(src.join("sock")).unwrap();
+
+        let (outcome, report) = cross_device_move(&root, "src", "dest");
+        assert_eq!(
+            outcome,
+            CopyOutcome::Skipped,
+            "skipped children keep the source"
+        );
+        let dest = root.join("dest");
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"a");
+        assert_eq!(
+            std::fs::read_link(dest.join("link")).unwrap(),
+            Path::new("../elsewhere/target"),
+            "the link target is copied, not followed"
+        );
+        assert!(!dest.join("pipe").exists());
+        assert!(!dest.join("sock").exists());
+        // Copied entries leave the source; skipped ones stay put.
+        assert!(!src.join("a.txt").exists());
+        assert!(std::fs::symlink_metadata(src.join("link")).is_err());
+        assert!(std::fs::symlink_metadata(src.join("pipe")).is_ok());
+        assert!(std::fs::symlink_metadata(src.join("sock")).is_ok());
+        assert_eq!(report.moved, 2);
+        let mut skipped: Vec<_> = report
+            .skipped
+            .iter()
+            .map(|s| (s.path.clone(), s.reason))
+            .collect();
+        skipped.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            skipped,
+            vec![
+                (Path::new("src/pipe").to_path_buf(), SkipReason::Fifo),
+                (Path::new("src/sock").to_path_buf(), SkipReason::Socket),
+            ]
+        );
+        assert_eq!(report.summary(), "Moved 2 items, skipped 2");
+        assert_eq!(report.details().len(), 2);
+
+        // A top-level symlink moves on its own too.
+        std::os::unix::fs::symlink("a.txt", root.join("top-link")).unwrap();
+        let (outcome, _) = cross_device_move(&root, "top-link", "moved-link");
+        assert_eq!(outcome, CopyOutcome::Copied);
+        assert_eq!(
+            std::fs::read_link(root.join("moved-link")).unwrap(),
+            Path::new("a.txt")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_directory_moves_and_keeps_its_mode() {
+        let root = scratch("ro-dir");
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("inner")).unwrap();
+        std::fs::write(src.join("inner/f"), b"x").unwrap();
+        std::fs::set_permissions(src.join("inner"), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        let mtime = std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        std::fs::File::open(src.join("inner"))
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        // Before the fix `inner` was created 0500 on the destination and
+        // writing `f` into it failed. Now the copy lands in full; removing the
+        // source `f` from a 0500 directory then fails, which keeps the source.
+        let dir = DirFd::open(&root).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = replace_ask;
+        let mut opts = MoveOpts {
+            force_copy: true,
+            fail_before_unlink: false,
+            copy: CopyOpts {
+                cancel: &cancel,
+                policy: &mut policy,
+                ask: &mut ask,
+            },
+            report: TransferReport::default(),
+        };
+        let err = move_child(
+            &dir,
+            std::ffi::OsStr::new("src"),
+            &dir,
+            std::ffi::OsStr::new("dest"),
+            &mut opts,
+        );
+        assert!(opts.report.skipped.is_empty());
+        let inner = root.join("dest/inner");
+        assert_eq!(std::fs::read(inner.join("f")).unwrap(), b"x");
+        assert_eq!(mode_bits(&inner), 0o500);
+        assert_eq!(
+            std::fs::metadata(&inner).unwrap().modified().unwrap(),
+            mtime,
+            "times are set after the children"
+        );
+        if err.is_err() {
+            assert_eq!(std::fs::read(src.join("inner/f")).unwrap(), b"x");
+        }
+        let _ = std::fs::set_permissions(src.join("inner"), std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn mode_bits(path: &Path) -> u32 {

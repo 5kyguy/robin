@@ -43,6 +43,8 @@ pub fn known(view: &str) -> bool {
             | "progress-1"
             | "progress-3"
             | "progress-error"
+            | "skipped"
+            | "skipped-details"
             | "menu-file"
             | "shortcuts-browser"
             | "reduce-motion"
@@ -194,6 +196,15 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         }
         .into(),
     );
+    let report = skipped_report();
+    ui.set_toast_text(report.summary().into());
+    ui.set_toast_details(ModelRc::new(Rc::new(VecModel::from(
+        report
+            .details()
+            .into_iter()
+            .map(slint::SharedString::from)
+            .collect::<Vec<_>>(),
+    ))));
     ui.set_overlay(
         match view {
             "path-edit" => "path-edit",
@@ -208,6 +219,8 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "progress-1" => "progress-1",
             "progress-3" => "progress-3",
             "progress-error" => "progress-error",
+            "skipped" => "skipped",
+            "skipped-details" => "skipped-details",
             "menu-file" => "menu-file",
             "shortcuts-browser" | "shortcuts-viewer" => "shortcuts",
             _ => "",
@@ -292,6 +305,23 @@ fn stats_cells(drilled: bool) -> Vec<MapCell> {
             }
         })
         .collect()
+}
+
+/// The report a cross-device move of ~/Projects to SANDISK would produce.
+fn skipped_report() -> crate::fsops::TransferReport {
+    use crate::fsops::{SkipReason, SkippedEntry, TransferReport};
+    let skip = |path: &str, reason| SkippedEntry {
+        path: path.into(),
+        reason,
+    };
+    TransferReport {
+        moved: 212,
+        skipped: vec![
+            skip("Projects/robin/target/mnt", SkipReason::MountPoint),
+            skip("Projects/robin/.cache/build.fifo", SkipReason::Fifo),
+            skip("Projects/r2-d2/run/agent.sock", SkipReason::Socket),
+        ],
+    }
 }
 
 fn places(view: &str) -> Vec<Place> {

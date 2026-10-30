@@ -472,6 +472,8 @@ export component AppWindow inherits Window {
     in property <[Row]> files;
     in property <[GridLine]> grid-rows;
     in property <[string]> menu-labels;
+    in property <string> toast-text: "";
+    in property <[string]> toast-details;
 
     title: "Robin";
     default-font-family: "JetBrainsMono Nerd Font";
@@ -1863,6 +1865,76 @@ export component AppWindow inherits Window {
                     }
                 }
                 Rectangle { x: 0px; y: 0px; width: parent.width; height: 3px; background: danger; }
+            }
+        }
+    }
+
+    // Neutral completion toast. Skipped entries are listed, never dropped.
+    if !harness && (overlay == "skipped" || overlay == "skipped-details"): Rectangle {
+        property <bool> open: overlay == "skipped-details";
+        property <length> line-h: 20px;
+        width: 520px;
+        height: open ? 52px + 12px + toast-details.length * line-h + 12px : 52px;
+        x: side-w + (parent.width - side-w - self.width) / 2;
+        y: parent.height - status-h - 16px - self.height;
+        background: surface;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: hairline;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: #000000.with-alpha(0.35);
+        Text {
+            text: "󰄬";
+            x: 16px;
+            y: 0px;
+            width: 18px;
+            height: 52px;
+            font-size: 14px;
+            color: muted;
+            vertical-alignment: center;
+        }
+        Text {
+            text: toast-text;
+            x: 42px;
+            y: 0px;
+            width: parent.width - 42px - 120px;
+            height: 52px;
+            font-size: 13px;
+            color: text;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        Text {
+            text: open ? "Hide details" : "Details";
+            x: parent.width - 16px - self.width;
+            y: 0px;
+            width: 96px;
+            height: 52px;
+            font-size: 12px;
+            color: accent;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+        if open: Rectangle {
+            x: 16px;
+            y: 52px;
+            width: parent.width - 32px;
+            height: 1px;
+            background: hairline;
+        }
+        if open: VerticalLayout {
+            x: 42px;
+            y: 52px + 12px;
+            width: parent.width - 58px;
+            height: toast-details.length * line-h;
+            spacing: 0px;
+            for detail in toast-details: Text {
+                text: detail;
+                height: line-h;
+                font-size: 11px;
+                color: muted;
+                overflow: elide;
+                vertical-alignment: center;
             }
         }
     }
