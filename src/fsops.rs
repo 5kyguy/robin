@@ -1082,11 +1082,31 @@ mod tests {
 
     #[test]
     fn dev_shm_opens_and_dev_is_refused() {
+        let fixture = "\
+203 201 0:6 / /dev rw - devtmpfs devtmpfs rw\n\
+204 203 0:23 / /dev/shm rw - tmpfs tmpfs rw\n";
+        assert_eq!(
+            crate::safety::fstype_in_mountinfo(fixture, 0, 6),
+            Some("devtmpfs")
+        );
+        assert_eq!(
+            crate::safety::fstype_in_mountinfo(fixture, 0, 23),
+            Some("tmpfs")
+        );
+
         DirFd::open(Path::new("/dev/shm")).expect("/dev/shm is tmpfs and must open");
-        match DirFd::open(Path::new("/dev")) {
-            Err(Error::Pseudo { kind: "devtmpfs" }) => {}
-            Ok(_) => panic!("/dev opened; devtmpfs must be refused"),
-            Err(err) => panic!("/dev failed for the wrong reason: {err}"),
+        let text = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let dev = rustix::fs::stat("/dev").unwrap();
+        let (major, minor) = crate::safety::dev_parts(dev.st_dev);
+        match crate::safety::fstype_in_mountinfo(&text, major, minor) {
+            Some("devtmpfs") => match DirFd::open(Path::new("/dev")) {
+                Err(Error::Pseudo { kind: "devtmpfs" }) => {}
+                Ok(_) => panic!("/dev opened; devtmpfs must be refused"),
+                Err(err) => panic!("/dev failed for the wrong reason: {err}"),
+            },
+            _ => {
+                DirFd::open(Path::new("/dev")).expect("a /dev that is not devtmpfs must open");
+            }
         }
     }
 
