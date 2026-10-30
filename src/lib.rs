@@ -6,6 +6,7 @@
 pub mod cli;
 pub mod error;
 pub mod fixture;
+pub mod fsops;
 pub mod model;
 pub mod safety;
 pub mod shots;
