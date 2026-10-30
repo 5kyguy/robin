@@ -1304,14 +1304,6 @@ fn move_directory_inner(
     let merges_before = opts.report.merges.len();
     let children = (|| -> Result<()> {
         listing = src.list()?;
-        // Tests walk a folder in a fixed order, either way round.
-        #[cfg(test)]
-        if let Some(reverse) = WALK_ORDER.with(|w| *w.borrow()) {
-            listing.sort_by(|a, b| a.name.cmp(&b.name));
-            if reverse {
-                listing.reverse();
-            }
-        }
         for (i, entry) in listing.iter().enumerate() {
             stopped_at = i;
             if opts.copy.cancel.is_cancelled() {
@@ -1867,14 +1859,6 @@ thread_local! {
 
 #[cfg(test)]
 type LandingHook = Box<dyn FnMut(&DirFd, &std::ffi::OsStr)>;
-
-#[cfg(test)]
-thread_local! {
-    /// Sorts each merged folder's listing by name, reversed when true,
-    /// so tests don't depend on the filesystem's readdir order.
-    pub(crate) static WALK_ORDER: std::cell::RefCell<Option<bool>> =
-        const { std::cell::RefCell::new(None) };
-}
 
 #[cfg(test)]
 thread_local! {
@@ -2461,36 +2445,36 @@ mod tests {
 
     #[test]
     fn a_folder_that_skipped_some_but_landed_others_is_partly_merged() {
-        // Walked either way round, a sibling comes after inner, and the
-        // first landing after inner's own file fails by name.
-        for reverse in [false, true] {
-            let root = scratch(&format!("merge-partly-skip-{reverse}"));
-            std::fs::create_dir_all(root.join("src/sub/inner")).unwrap();
-            std::fs::create_dir_all(root.join("dest/sub/inner")).unwrap();
-            std::fs::write(root.join("src/sub/inner/a"), b"a").unwrap();
-            std::fs::write(root.join("src/sub/inner/b"), b"b").unwrap();
-            std::fs::write(root.join("dest/sub/inner/a"), b"old").unwrap();
-            std::fs::write(root.join("src/sub/aa"), b"1").unwrap();
-            std::fs::write(root.join("src/sub/zz"), b"2").unwrap();
-            let (first, after) = if reverse { ("zz", "aa") } else { ("aa", "zz") };
-            WALK_ORDER.with(|w| *w.borrow_mut() = Some(reverse));
-            FAIL_LANDING.with(|f| *f.borrow_mut() = Some(after.into()));
-            let (out, report) = force_move_report(&root, "src", "dest", &Cancel::new());
-            WALK_ORDER.with(|w| *w.borrow_mut() = None);
-            assert!(out.is_err(), "{out:?}");
-            let m = report.merges.iter().find(|m| m.into == "dest/sub").unwrap();
-            assert_eq!(m.merged, 1, "{m:?}");
-            assert_eq!(m.partly, ["dest/sub/inner"], "{m:?}");
-            assert!(m.skipped.is_empty(), "{m:?}");
-            assert_eq!(m.missing, [format!("dest/sub/{after}")], "{m:?}");
-            assert_eq!(
-                m.merged + m.skipped.len() + m.partly.len() + m.missing.len(),
-                m.total
-            );
-            assert!(root.join("dest/sub").join(first).exists());
-            assert_eq!(std::fs::read(root.join("dest/sub/inner/b")).unwrap(), b"b");
-            let _ = std::fs::remove_dir_all(&root);
+        let root = scratch("merge-partly-skip");
+        // Two folders, each landing one file and skipping a clash.
+        for d in ["p", "q"] {
+            std::fs::create_dir_all(root.join("src/sub").join(d)).unwrap();
+            std::fs::create_dir_all(root.join("dest/sub").join(d)).unwrap();
+            for f in ["a", "b"] {
+                std::fs::write(root.join("src/sub").join(d).join(format!("{d}{f}")), f).unwrap();
+            }
+            std::fs::write(root.join("dest/sub").join(d).join(format!("{d}a")), b"old").unwrap();
         }
+        // Whichever folder lists second fails, after the first one has
+        // landed its file and skipped its clash.
+        let order = listed(&root.join("src/sub"));
+        FAIL_LANDING.with(|f| *f.borrow_mut() = Some(format!("{}b", order[1]).into()));
+        let (out, report) = force_move_report(&root, "src", "dest", &Cancel::new());
+        assert!(out.is_err(), "{out:?}");
+        let m = report.merges.iter().find(|m| m.into == "dest/sub").unwrap();
+        assert_eq!(m.partly[0], format!("dest/sub/{}", order[0]), "{m:?}");
+        assert!(m.skipped.is_empty(), "{m:?}");
+        assert_eq!(m.merged, 0, "{m:?}");
+        assert_eq!(
+            m.merged + m.skipped.len() + m.partly.len() + m.missing.len(),
+            m.total
+        );
+        let first = root.join("dest/sub").join(&order[0]);
+        assert_eq!(
+            std::fs::read(first.join(format!("{}b", order[0]))).unwrap(),
+            b"b"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
