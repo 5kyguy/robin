@@ -522,9 +522,11 @@ export component AppWindow inherits Window {
     in property <string> conflict-kind: "JPEG image";
     in property <string> conflict-existing-size: "6.2 MB";
     in property <string> conflict-existing-date: "2026-10-12 21:40";
+    in property <string> conflict-existing-badge2: "";
     in property <string> conflict-existing-badge: "Larger";
     in property <string> conflict-incoming-size: "4.1 MB";
     in property <string> conflict-incoming-date: "2026-10-30 18:58";
+    in property <string> conflict-incoming-badge2: "";
     in property <string> conflict-incoming-badge: "Newer";
     in property <string> conflict-hint: "Keep both saves it as dune-sunset-0412 (2).jpg";
     in property <string> conflict-apply-label: "Apply to all 14 conflicts";
@@ -1545,6 +1547,8 @@ export component AppWindow inherits Window {
                 if live: Text { text: "󰈔"; x: 8px; y: 26px; width: 64px; height: 64px; font-size: 40px; color: muted; horizontal-alignment: center; vertical-alignment: center; }
                 if conflict-existing-badge != "": Rectangle { x: 8px; y: 94px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
                 if conflict-existing-badge != "": Text { text: conflict-existing-badge; x: 8px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
+                if conflict-existing-badge2 != "": Rectangle { x: 64px; y: 94px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
+                if conflict-existing-badge2 != "": Text { text: conflict-existing-badge2; x: 64px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
                 Text { text: conflict-existing-size; x: 80px; y: 28px; width: 128px; height: 16px; font-size: 11px; color: muted; }
                 Text { text: conflict-existing-date; x: 80px; y: 46px; width: 128px; height: 16px; font-size: 11px; color: muted; }
                 Text { text: conflict-kind; x: 80px; y: 64px; width: 128px; height: 16px; font-size: 11px; color: muted; }
@@ -1570,6 +1574,8 @@ export component AppWindow inherits Window {
                 if live: Text { text: "󰈔"; x: 8px; y: 26px; width: 64px; height: 64px; font-size: 40px; color: muted; horizontal-alignment: center; vertical-alignment: center; }
                 if conflict-incoming-badge != "": Rectangle { x: 8px; y: 94px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
                 if conflict-incoming-badge != "": Text { text: conflict-incoming-badge; x: 8px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
+                if conflict-incoming-badge2 != "": Rectangle { x: 64px; y: 94px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
+                if conflict-incoming-badge2 != "": Text { text: conflict-incoming-badge2; x: 64px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
                 Text { text: conflict-incoming-size; x: 80px; y: 28px; width: 128px; height: 16px; font-size: 11px; color: muted; }
                 Text { text: conflict-incoming-date; x: 80px; y: 46px; width: 128px; height: 16px; font-size: 11px; color: muted; }
                 Text { text: conflict-kind; x: 80px; y: 64px; width: 128px; height: 16px; font-size: 11px; color: muted; }

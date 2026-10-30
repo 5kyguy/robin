@@ -915,10 +915,12 @@ pub fn conflict_props(ui: &AppWindow, ask: &ConflictAsk, apply_all: bool) {
     ui.set_conflict_incoming_size(human(p.incoming_size).into());
     ui.set_conflict_existing_date(fsops::short_date(p.existing_mtime).into());
     ui.set_conflict_incoming_date(fsops::short_date(p.incoming_mtime).into());
-    let (larger, newer) = conflict_badges(p);
-    let badge = |a: &'static str, b: &'static str| if a.is_empty() { b } else { a };
-    ui.set_conflict_existing_badge(badge(larger.0, newer.0).into());
-    ui.set_conflict_incoming_badge(badge(newer.1, larger.1).into());
+    let (existing, incoming) = side_badges(p);
+    let at = |v: &[&'static str], i: usize| SharedString::from(v.get(i).copied().unwrap_or(""));
+    ui.set_conflict_existing_badge(at(&existing, 0));
+    ui.set_conflict_existing_badge2(at(&existing, 1));
+    ui.set_conflict_incoming_badge(at(&incoming, 0));
+    ui.set_conflict_incoming_badge2(at(&incoming, 1));
     ui.set_conflict_hint(format!("Keep both saves it as {}", keep_both_name(&p.name)).into());
     ui.set_conflict_apply_label(
         if ask.left > 1 {
@@ -946,6 +948,14 @@ pub fn conflict_badges(
         std::cmp::Ordering::Equal => ("", ""),
     };
     (larger, newer)
+}
+
+/// Every badge each side earns, in reading order: a file both newer and
+/// larger shows "Newer" and "Larger" side by side.
+pub fn side_badges(p: &ConflictPrompt) -> (Vec<&'static str>, Vec<&'static str>) {
+    let (larger, newer) = conflict_badges(p);
+    let keep = |v: [&'static str; 2]| v.into_iter().filter(|b| !b.is_empty()).collect();
+    (keep([newer.0, larger.0]), keep([newer.1, larger.1]))
 }
 
 /// The first name Keep both tries: "photo (2).jpg".
@@ -1411,6 +1421,18 @@ mod tests {
     #[test]
     fn conflict_badges_and_names() {
         assert_eq!(conflict_badges(&prompt()), (("Larger", ""), ("", "Newer")));
+        assert_eq!(side_badges(&prompt()), (vec!["Larger"], vec!["Newer"]));
+        let both = ConflictPrompt {
+            incoming_size: 9_000_000,
+            ..prompt()
+        };
+        assert_eq!(side_badges(&both), (vec![], vec!["Newer", "Larger"]));
+        let same = ConflictPrompt {
+            incoming_size: 6_200_000,
+            incoming_mtime: 100,
+            ..prompt()
+        };
+        assert_eq!(side_badges(&same), (vec![], vec![]));
         assert_eq!(keep_both_name("dune.jpg"), "dune (2).jpg");
         assert_eq!(keep_both_name(".bashrc"), ".bashrc (2)");
     }
