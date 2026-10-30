@@ -393,6 +393,7 @@ fn toast(view: &str) -> (&'static str, String, Vec<String>) {
                     kept("Projects/robin/vendor/fonts", KeepReason::ReadOnlyFolder),
                     kept("Projects/robin/vendor/icons", KeepReason::ReadOnlyFolder),
                 ],
+                ..Default::default()
             };
             ("warning", report.summary(), report.details())
         }
@@ -418,6 +419,7 @@ fn skipped_report() -> crate::fsops::TransferReport {
             skip("Projects/r2-d2/run/agent.sock", SkipReason::Socket),
         ],
         left_behind: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -968,10 +970,11 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
         "conflict-live" => {
             let ask = crate::app::ConflictAsk {
                 prompt: crate::fsops::ConflictPrompt {
-                    name: "speeder-run.mp4".into(),
-                    existing_size: 48_300_000,
+                    name: "raw-exports".into(),
+                    kind: crate::fsops::ConflictKind::FolderFolder,
+                    existing_size: 4096,
                     existing_mtime: 1_792_000_000,
-                    incoming_size: 51_700_000,
+                    incoming_size: 4096,
                     incoming_mtime: 1_793_400_000,
                 },
                 dest: "SANDISK".into(),

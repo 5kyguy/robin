@@ -15,7 +15,7 @@ use std::time::Duration;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::fsops::{
-    self, Cancel, Conflict, ConflictChoice, ConflictPrompt, KeptEntry, TrashChoice,
+    self, Cancel, Conflict, ConflictChoice, ConflictKind, ConflictPrompt, KeptEntry, TrashChoice,
 };
 use crate::model::{Listing, Nav};
 use crate::ops::{self, Clipboard, Env, Job, JobKind, Mods, Op, Outcome, Progress, Trashed};
@@ -30,10 +30,11 @@ pub enum Dialog {
     TrashNo(Vec<OsString>),
     Delete(Vec<OsString>),
     /// A move left `names` where they were. Button 1 is Copy instead when
-    /// every one of them can be copied.
+    /// any of them can be copied; it copies `copy`, the ones that can.
     Refused {
         job: Job,
         names: Vec<OsString>,
+        copy: Vec<OsString>,
         can_copy: bool,
     },
     /// A paste, drop or move found the name taken. Buttons: 0 Cancel,
@@ -315,9 +316,10 @@ impl Controller {
             }
             Dialog::Refused {
                 job,
-                names,
+                copy,
                 can_copy,
-            } if can_copy => Action::Run(Job::new(JobKind::Copy, &job.src, names, &job.dest)),
+                ..
+            } if can_copy => Action::Run(Job::new(JobKind::Copy, &job.src, copy, &job.dest)),
             Dialog::Refused { .. } | Dialog::Conflict { .. } => Action::Redraw,
         }
     }
@@ -436,10 +438,17 @@ impl Controller {
         if outcome.refused.is_empty() {
             return None;
         }
+        let view = refusal_view(&outcome.refused);
         Some(Dialog::Refused {
             job: job.clone(),
             names: outcome.refused.iter().map(|r| r.0.clone()).collect(),
-            can_copy: refusal_view(&outcome.refused).can_copy,
+            copy: outcome
+                .refused
+                .iter()
+                .filter(|(n, k)| fsops::refusal(&n.to_string_lossy(), k).can_copy_instead)
+                .map(|r| r.0.clone())
+                .collect(),
+            can_copy: view.can_copy,
         })
     }
 
@@ -488,6 +497,8 @@ pub struct RefusalView {
     /// (path, note, heading) rows.
     pub lines: Vec<(String, String, bool)>,
     pub can_copy: bool,
+    /// Set when only some items can be copied: says which stay behind.
+    pub body: String,
     pub dismiss: &'static str,
     pub notes: usize,
     pub items: usize,
@@ -498,7 +509,24 @@ pub fn refusal_view(refused: &[(OsString, Vec<KeptEntry>)]) -> RefusalView {
         .iter()
         .map(|(n, k)| fsops::refusal(&n.to_string_lossy(), k))
         .collect();
-    let can_copy = !parts.is_empty() && parts.iter().all(|r| r.can_copy_instead);
+    let can_copy = parts.iter().any(|r| r.can_copy_instead);
+    let stuck: Vec<String> = refused
+        .iter()
+        .zip(&parts)
+        .filter(|(_, r)| !r.can_copy_instead)
+        .map(|((n, _), _)| n.to_string_lossy().into_owned())
+        .collect();
+    let body = if can_copy && !stuck.is_empty() {
+        let n = parts.len() - stuck.len();
+        format!(
+            "Robin can copy the other {} there instead. {} can't be read, so {} not be copied either.",
+            ops::count(n),
+            stuck.join(", "),
+            if stuck.len() == 1 { "it will" } else { "they will" },
+        )
+    } else {
+        String::new()
+    };
     let rows = |r: &fsops::Refusal| {
         r.lines
             .iter()
@@ -510,6 +538,7 @@ pub fn refusal_view(refused: &[(OsString, Vec<KeptEntry>)]) -> RefusalView {
             title: one.title.clone(),
             lines: rows(one),
             can_copy,
+            body,
             dismiss: one.dismiss_label,
             notes: one.note_count(),
             items: 1,
@@ -527,6 +556,7 @@ pub fn refusal_view(refused: &[(OsString, Vec<KeptEntry>)]) -> RefusalView {
         title: format!("Can't move {}", ops::count(parts.len())),
         lines,
         can_copy,
+        body,
         dismiss: if can_copy { "Cancel" } else { "Close" },
         notes,
         items: parts.len(),
@@ -906,13 +936,29 @@ pub fn conflict_props(ui: &AppWindow, ask: &ConflictAsk, apply_all: bool) {
     let p = &ask.prompt;
     ui.set_conflict_title(format!("{} already has “{}”", ask.dest, p.name).into());
     ui.set_conflict_name(p.name.as_str().into());
-    let ext = Path::new(&p.name)
-        .extension()
-        .map(|e| format!("{} file", e.to_string_lossy().to_uppercase()))
-        .unwrap_or_else(|| "File".into());
+    let folders = p.kind == ConflictKind::FolderFolder;
+    let ext = if folders {
+        "Folder".into()
+    } else {
+        Path::new(&p.name)
+            .extension()
+            .map(|e| format!("{} file", e.to_string_lossy().to_uppercase()))
+            .unwrap_or_else(|| "File".into())
+    };
     ui.set_conflict_kind(ext.into());
-    ui.set_conflict_existing_size(human(p.existing_size).into());
-    ui.set_conflict_incoming_size(human(p.incoming_size).into());
+    let (existing_dir, incoming_dir) = match p.kind {
+        ConflictKind::FileFile => (false, false),
+        ConflictKind::FolderFolder => (true, true),
+        ConflictKind::FileFolder => (false, true),
+        ConflictKind::FolderFile => (true, false),
+    };
+    let size = |dir: bool, n: u64| if dir { String::new() } else { human(n) };
+    ui.set_conflict_existing_size(size(existing_dir, p.existing_size).into());
+    ui.set_conflict_incoming_size(size(incoming_dir, p.incoming_size).into());
+    ui.set_conflict_existing_folder(existing_dir);
+    ui.set_conflict_incoming_folder(incoming_dir);
+    // Replacing a folder with a folder merges into it; the button says so.
+    ui.set_conflict_replace_label(if folders { "Merge" } else { "Replace" }.into());
     ui.set_conflict_existing_date(fsops::short_date(p.existing_mtime).into());
     ui.set_conflict_incoming_date(fsops::short_date(p.incoming_mtime).into());
     let (existing, incoming) = side_badges(p);
@@ -921,23 +967,38 @@ pub fn conflict_props(ui: &AppWindow, ask: &ConflictAsk, apply_all: bool) {
     ui.set_conflict_existing_badge2(at(&existing, 1));
     ui.set_conflict_incoming_badge(at(&incoming, 0));
     ui.set_conflict_incoming_badge2(at(&incoming, 1));
-    ui.set_conflict_hint(format!("Keep both saves it as {}", keep_both_name(&p.name)).into());
-    ui.set_conflict_apply_label(
-        if ask.left > 1 {
-            format!("Apply to the rest ({} left)", ask.left - 1)
-        } else {
-            "Apply to the rest of this job".into()
-        }
-        .into(),
-    );
+    let both = if existing_dir {
+        format!("{} (2)", p.name)
+    } else {
+        keep_both_name(&p.name)
+    };
+    ui.set_conflict_hint(format!("Keep both saves it as {both}").into());
+    ui.set_conflict_apply_label(apply_label(p.kind, ask.left).into());
     ui.set_conflict_apply(apply_all);
+}
+
+/// The apply-to-all toggle names the kind of clash it covers, since an
+/// answer only carries over to clashes of that kind.
+pub fn apply_label(kind: ConflictKind, left: usize) -> String {
+    let what = match kind {
+        ConflictKind::FileFile => "file conflicts",
+        ConflictKind::FolderFolder => "folder conflicts",
+        ConflictKind::FileFolder | ConflictKind::FolderFile => "file-and-folder conflicts",
+    };
+    if left > 1 {
+        format!("Apply to the rest of the {what} ({})", left - 1)
+    } else {
+        format!("Apply to the rest of the {what}")
+    }
 }
 
 /// ("Larger", "Newer") badges for the (existing, incoming) side.
 pub fn conflict_badges(
     p: &ConflictPrompt,
 ) -> ((&'static str, &'static str), (&'static str, &'static str)) {
+    let sized = p.kind == ConflictKind::FileFile;
     let larger = match p.existing_size.cmp(&p.incoming_size) {
+        _ if !sized => ("", ""),
         std::cmp::Ordering::Greater => ("Larger", ""),
         std::cmp::Ordering::Less => ("", "Larger"),
         std::cmp::Ordering::Equal => ("", ""),
@@ -1012,6 +1073,7 @@ fn done(ui: &AppWindow, st: &Shared, job: Job, outcome: Outcome) {
 pub fn set_refusal(ui: &AppWindow, r: &RefusalView) {
     ui.set_refusal_title(r.title.as_str().into());
     ui.set_refusal_can_copy(r.can_copy);
+    ui.set_refusal_body(r.body.as_str().into());
     ui.set_refusal_dismiss(r.dismiss.into());
     ui.set_refusal_notes(r.notes as i32);
     ui.set_refusal_lines_items(r.items as i32);
@@ -1318,6 +1380,7 @@ mod tests {
         c.open_dialog(Dialog::Refused {
             job,
             names: vec!["a.jpg".into()],
+            copy: vec!["a.jpg".into()],
             can_copy: true,
         });
         assert_eq!(c.focus, 1);
@@ -1331,6 +1394,7 @@ mod tests {
         c.open_dialog(Dialog::Refused {
             job: Job::new(JobKind::Move, &c.dir, vec![], &c.dir),
             names: vec!["a.jpg".into()],
+            copy: vec![],
             can_copy: false,
         });
         assert_eq!(c.focus, 0);
@@ -1354,6 +1418,7 @@ mod tests {
     fn prompt() -> ConflictPrompt {
         ConflictPrompt {
             name: "dune.jpg".into(),
+            kind: ConflictKind::FileFile,
             existing_size: 6_200_000,
             existing_mtime: 100,
             incoming_size: 4_100_000,
@@ -1435,6 +1500,68 @@ mod tests {
         assert_eq!(side_badges(&same), (vec![], vec![]));
         assert_eq!(keep_both_name("dune.jpg"), "dune (2).jpg");
         assert_eq!(keep_both_name(".bashrc"), ".bashrc (2)");
+    }
+
+    #[test]
+    fn copy_instead_copies_what_it_can_and_names_the_rest() {
+        let mut c = setup("refused-some");
+        let job = Job::new(
+            JobKind::Move,
+            &c.dir,
+            vec!["a.jpg".into(), "locked".into()],
+            &c.dir.join("raw-exports"),
+        );
+        let kept = |p: &str, reason| {
+            vec![KeptEntry {
+                path: p.into(),
+                reason,
+            }]
+        };
+        let outcome = Outcome {
+            refused: vec![
+                (
+                    "a.jpg".into(),
+                    kept("a.jpg", fsops::KeepReason::ReadOnlyFolder),
+                ),
+                (
+                    "locked".into(),
+                    kept("locked", fsops::KeepReason::UnreadableFolder),
+                ),
+            ],
+            ..Outcome::default()
+        };
+        let view = refusal_view(&outcome.refused);
+        assert!(view.can_copy, "one copyable item keeps Copy instead");
+        assert!(view.body.contains("locked"), "{}", view.body);
+        assert!(!view.body.contains("a.jpg"), "{}", view.body);
+        let d = c.finish(&job, &outcome).unwrap();
+        c.open_dialog(d);
+        let Action::Run(copy) = c.button(1) else {
+            panic!("Copy instead is offered")
+        };
+        assert_eq!(copy.kind, JobKind::Copy);
+        assert_eq!(copy.names, vec![OsString::from("a.jpg")]);
+    }
+
+    #[test]
+    fn toggle_names_the_kind_of_conflict() {
+        assert_eq!(
+            apply_label(ConflictKind::FileFile, 4),
+            "Apply to the rest of the file conflicts (3)"
+        );
+        assert_eq!(
+            apply_label(ConflictKind::FolderFolder, 3),
+            "Apply to the rest of the folder conflicts (2)"
+        );
+        let folders = ConflictPrompt {
+            kind: ConflictKind::FolderFolder,
+            ..prompt()
+        };
+        assert_eq!(
+            side_badges(&folders).1,
+            vec!["Newer"],
+            "no size badge on folders"
+        );
     }
 
     #[test]

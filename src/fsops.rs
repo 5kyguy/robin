@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -86,16 +86,45 @@ pub fn choice_from_buttons(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConflictPrompt {
     pub name: String,
+    pub kind: ConflictKind,
     pub existing_size: u64,
     pub existing_mtime: i64,
     pub incoming_size: u64,
     pub incoming_mtime: i64,
 }
 
-/// Remembers an "apply to all" answer for the rest of a transfer.
+/// What clashes with what, (existing, incoming). An "apply to all"
+/// answer only covers clashes of the same kind: replacing files says
+/// nothing about merging folders.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ConflictKind {
+    #[default]
+    FileFile,
+    FolderFolder,
+    FileFolder,
+    FolderFile,
+}
+
+impl ConflictKind {
+    pub fn of(existing_is_dir: bool, incoming_is_dir: bool) -> Self {
+        match (existing_is_dir, incoming_is_dir) {
+            (false, false) => Self::FileFile,
+            (true, true) => Self::FolderFolder,
+            (false, true) => Self::FileFolder,
+            (true, false) => Self::FolderFile,
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Remembers "apply to all" answers for the rest of a transfer, one per
+/// [`ConflictKind`].
 #[derive(Debug, Default)]
 pub struct ConflictPolicy {
-    remembered: Option<Conflict>,
+    remembered: [Option<Conflict>; 4],
 }
 
 impl ConflictPolicy {
@@ -108,12 +137,13 @@ impl ConflictPolicy {
         prompt: &ConflictPrompt,
         ask: &mut dyn FnMut(&ConflictPrompt) -> Result<ConflictChoice>,
     ) -> Result<Conflict> {
-        if let Some(action) = self.remembered {
+        let slot = prompt.kind.index();
+        if let Some(action) = self.remembered[slot] {
             return Ok(action);
         }
         let choice = ask(prompt)?;
         if choice.apply_all {
-            self.remembered = Some(choice.action);
+            self.remembered[slot] = Some(choice.action);
         }
         Ok(choice.action)
     }
@@ -486,6 +516,9 @@ pub struct TransferReport {
     pub skipped: Vec<SkippedEntry>,
     /// Copied, but the original is still in the source.
     pub left_behind: Vec<KeptEntry>,
+    /// Source entries copied in full, for removing the originals of a
+    /// folder move once its copy is done.
+    pub copied: Vec<PathBuf>,
 }
 
 impl TransferReport {
@@ -916,7 +949,7 @@ fn move_entry(
     let from_c = component(from)?;
     let stat = rustix::fs::statat(parent.as_fd(), from_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|e| Error::from_errno(from, e))?;
-    match classify(stat.st_mode, stat.st_dev, root_dev) {
+    let out = match classify(stat.st_mode, stat.st_dev, root_dev) {
         EntryKind::Skip(reason) => {
             opts.report.skipped.push(SkippedEntry {
                 path: rel.to_path_buf(),
@@ -938,14 +971,19 @@ fn move_entry(
             }
             opts.report.moved += 1;
             if opts.keep_source {
-                return Ok(CopyOutcome::Copied);
-            }
-            match remove_child(parent, from, &mut |_| {}, opts.copy.cancel) {
-                Ok(()) => Ok(CopyOutcome::Copied),
-                Err(err) => opts.report.keep(parent, from, rel, err),
+                Ok(CopyOutcome::Copied)
+            } else {
+                match remove_child(parent, from, &mut |_| {}, opts.copy.cancel) {
+                    Ok(()) => Ok(CopyOutcome::Copied),
+                    Err(err) => opts.report.keep(parent, from, rel, err),
+                }
             }
         }
+    };
+    if let Ok(CopyOutcome::Copied) = out {
+        opts.report.copied.push(rel.to_path_buf());
     }
+    out
 }
 
 /// Recreate a symlink on the destination with the same target, then unlink
@@ -1036,6 +1074,81 @@ fn move_directory(
     rel: &Path,
     depth: u32,
 ) -> Result<CopyOutcome> {
+    if depth > 0 {
+        return move_directory_inner(parent, from, dest_parent, to, opts, root_dev, rel, depth);
+    }
+    // The top folder copies its whole tree first and removes the source
+    // only once all of it landed, so a Cancel part-way can drop what it
+    // copied and leave the source untouched: nothing is half-moved.
+    let move_source = !opts.keep_source;
+    opts.keep_source = true;
+    let out = move_directory_inner(parent, from, dest_parent, to, opts, root_dev, rel, depth);
+    opts.keep_source = !move_source;
+    if move_source && out.is_ok() {
+        let copied: std::collections::HashSet<PathBuf> = std::mem::take(&mut opts.report.copied)
+            .into_iter()
+            .collect();
+        let all = matches!(out, Ok(CopyOutcome::Copied));
+        let gone = remove_copied(parent, from, rel, all, &copied, opts)?;
+        rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(to, e))?;
+        if !gone {
+            return Ok(CopyOutcome::Skipped);
+        }
+    }
+    out
+}
+
+/// Remove the originals a deferred folder move copied in full. Returns
+/// whether `from` itself is gone. What can't be removed is reported as
+/// left behind, as if it had been removed right after its copy.
+fn remove_copied(
+    parent: &DirFd,
+    from: &std::ffi::OsStr,
+    rel: &Path,
+    all: bool,
+    copied: &std::collections::HashSet<PathBuf>,
+    opts: &mut MoveOpts<'_>,
+) -> Result<bool> {
+    let covered = all || copied.contains(rel);
+    let c = component(from)?;
+    let stat = rustix::fs::statat(parent.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(from, e))?;
+    let flags = if is_dir(stat.st_mode) && !is_lnk(stat.st_mode) {
+        let dir = parent.open_dir_nofollow(from)?;
+        let mut empty = true;
+        for entry in dir.list()? {
+            let child = rel.join(&entry.name);
+            empty &= remove_copied(&dir, &entry.name, &child, covered, copied, opts)?;
+        }
+        if !covered || !empty {
+            return Ok(false);
+        }
+        AtFlags::REMOVEDIR
+    } else if covered {
+        AtFlags::empty()
+    } else {
+        return Ok(false);
+    };
+    match rustix::fs::unlinkat(parent.as_fd(), c.as_c_str(), flags) {
+        Ok(()) => Ok(true),
+        Err(e) => opts
+            .report
+            .keep(parent, from, rel, Error::from_errno(from, e))
+            .map(|_| false),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn move_directory_inner(
+    parent: &DirFd,
+    from: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    to: &std::ffi::OsStr,
+    opts: &mut MoveOpts<'_>,
+    root_dev: u64,
+    rel: &Path,
+    depth: u32,
+) -> Result<CopyOutcome> {
     if opts.copy.cancel.is_cancelled() {
         return Err(Error::Cancelled);
     }
@@ -1076,6 +1189,13 @@ fn move_directory(
     let src = parent.open_dir_nofollow(from)?;
     let dst = dest_parent.open_dir_nofollow(dest_name.as_os_str())?;
     let mut all_copied = true;
+    // What was there before, so a Cancel inside a merged folder can take
+    // back only what this job added.
+    let before: std::collections::HashSet<std::ffi::OsString> = if created {
+        Default::default()
+    } else {
+        dst.list()?.into_iter().map(|e| e.name).collect()
+    };
     // Children first; the mode and times are applied even if a child fails,
     // so a partial copy does not stay 0700 or carry the copy time.
     let children = (|| -> Result<()> {
@@ -1101,6 +1221,24 @@ fn move_directory(
         rustix::fs::fchmod(dst.as_fd(), Mode::from_raw_mode(stat.st_mode & 0o777))
             .map_err(|e| Error::from_errno(&dest_name, e))?;
         set_times(dst.as_fd(), &stat).map_err(|e| Error::from_errno(&dest_name, e))?;
+    }
+    if let Err(Error::Cancelled) = children {
+        // Leave nothing half-copied behind: drop the folder this job made,
+        // or what it added to the folder it was merging into.
+        let fresh = Cancel::new();
+        if created {
+            drop(dst);
+            remove_child(dest_parent, &dest_name, &mut |_| {}, &fresh)?;
+        } else {
+            for entry in dst.list()? {
+                if !before.contains(&entry.name)
+                    && !entry.name.to_string_lossy().starts_with(".robin-partial")
+                {
+                    remove_child(&dst, &entry.name, &mut |_| {}, &fresh)?;
+                }
+            }
+        }
+        return Err(Error::Cancelled);
     }
     children?;
     rustix::fs::fsync(dst.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
@@ -1490,6 +1628,7 @@ fn settle_conflict_stat(
     .map_err(|e| Error::from_errno(to, e))?;
     let prompt = ConflictPrompt {
         name: to.to_string_lossy().into_owned(),
+        kind: ConflictKind::of(is_dir(existing.st_mode), is_dir(incoming.st_mode)),
         existing_size: existing.st_size as u64,
         existing_mtime: existing.st_mtime,
         incoming_size: incoming.st_size as u64,
@@ -1792,6 +1931,108 @@ mod tests {
             policy,
             ask,
         }
+    }
+
+    #[test]
+    fn apply_to_all_is_remembered_per_kind() {
+        let mut policy = ConflictPolicy::new();
+        let mut asked = Vec::new();
+        let mut ask = |p: &ConflictPrompt| {
+            asked.push(p.kind);
+            Ok(ConflictChoice {
+                action: Conflict::Replace,
+                apply_all: true,
+            })
+        };
+        let prompt = |kind| ConflictPrompt {
+            name: "x".into(),
+            kind,
+            existing_size: 1,
+            existing_mtime: 1,
+            incoming_size: 1,
+            incoming_mtime: 1,
+        };
+        for kind in [
+            ConflictKind::FileFile,
+            ConflictKind::FileFile,
+            ConflictKind::FolderFolder,
+            ConflictKind::FolderFolder,
+            ConflictKind::FileFolder,
+        ] {
+            policy.choose(&prompt(kind), &mut ask).unwrap();
+        }
+        assert_eq!(
+            asked,
+            [
+                ConflictKind::FileFile,
+                ConflictKind::FolderFolder,
+                ConflictKind::FileFolder
+            ],
+            "a file answer does not cover folders"
+        );
+    }
+
+    #[test]
+    fn cancel_inside_a_folder_leaves_nothing_behind() {
+        for keep_source in [false, true] {
+            let root = scratch("cancel-folder");
+            for d in ["src/new", "src/sub", "dest/sub"] {
+                std::fs::create_dir_all(root.join(d)).unwrap();
+            }
+            std::fs::write(root.join("src/new/x"), b"x").unwrap();
+            std::fs::write(root.join("src/top"), b"t").unwrap();
+            std::fs::write(root.join("src/sub/clash"), b"new").unwrap();
+            std::fs::write(root.join("dest/sub/clash"), b"old").unwrap();
+            let dir = DirFd::open(&root).unwrap();
+            let cancel = Cancel::new();
+            let mut policy = ConflictPolicy::new();
+            // Merge the folders, then Cancel at the file clash inside.
+            let mut ask = |p: &ConflictPrompt| match p.kind {
+                ConflictKind::FolderFolder => Ok(ConflictChoice {
+                    action: Conflict::Replace,
+                    apply_all: false,
+                }),
+                _ => Err(Error::Cancelled),
+            };
+            let out = move_child(
+                &dir,
+                std::ffi::OsStr::new("src"),
+                &dir,
+                std::ffi::OsStr::new("dest"),
+                &mut MoveOpts {
+                    force_copy: true,
+                    fail_before_unlink: false,
+                    copy: opts(&cancel, &mut policy, &mut ask),
+                    report: TransferReport::default(),
+                    check_removable: true,
+                    keep_source,
+                },
+            );
+            assert!(matches!(out, Err(Error::Cancelled)), "{out:?}");
+            let mut left: Vec<_> = walk(&root.join("dest"));
+            left.sort();
+            assert_eq!(left, ["sub", "sub/clash"], "keep_source={keep_source}");
+            assert_eq!(std::fs::read(root.join("dest/sub/clash")).unwrap(), b"old");
+            for f in ["src/new/x", "src/top", "src/sub/clash"] {
+                assert!(root.join(f).exists(), "{f} stays in the source");
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    fn walk(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        fn go(base: &Path, d: &Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(d).unwrap() {
+                let p = e.unwrap().path();
+                out.push(p.strip_prefix(base).unwrap().to_string_lossy().into_owned());
+                if p.is_dir() && !p.is_symlink() {
+                    go(base, &p, out);
+                }
+            }
+        }
+        go(dir, dir, &mut out);
+        out
     }
 
     #[test]
