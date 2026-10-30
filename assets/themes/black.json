@@ -1,0 +1,17 @@
+{
+  "dark": {
+    "bg": "#0C0C0C",
+    "surface": "#161616",
+    "line": "#3A3A3A",
+    "accent": "#E6E6E6",
+    "on_accent": "#101010",
+    "text": "#F4F4F4",
+    "muted": "#8E8E8E",
+    "danger": "#D0D0D0",
+    "on_danger": "#101010",
+    "warning": "#A6A6A6",
+    "on_warning": "#101010",
+    "deep": "#080808",
+    "spark": "#FFFFFF"
+  }
+}
