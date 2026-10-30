@@ -38,6 +38,8 @@ pub fn known(view: &str) -> bool {
             | "confirm-trash"
             | "confirm-trash-no-trash"
             | "confirm-delete-permanent"
+            | "conflict"
+            | "conflict-all"
             | "progress-1"
             | "progress-3"
             | "progress-error"
@@ -187,6 +189,8 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "confirm-trash" => "trash",
             "confirm-trash-no-trash" => "trash-no",
             "confirm-delete-permanent" => "delete",
+            "conflict" => "conflict",
+            "conflict-all" => "conflict-all",
             "progress-1" => "progress-1",
             "progress-3" => "progress-3",
             "progress-error" => "progress-error",

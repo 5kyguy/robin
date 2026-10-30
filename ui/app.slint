@@ -1078,6 +1078,149 @@ export component AppWindow inherits Window {
         }
     }
 
+    if !harness && (overlay == "conflict" || overlay == "conflict-all"): Rectangle {
+        background: #000000.with-alpha(0.6);
+        Rectangle {
+            width: 480px;
+            height: 292px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: surface;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            Text {
+                text: "SANDISK already has \"dune-sunset-0412.jpg\"";
+                x: 20px;
+                y: 16px;
+                width: parent.width - 40px;
+                height: 22px;
+                font-size: 13px;
+                font-weight: 700;
+                color: text;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                x: 16px;
+                y: 48px;
+                width: 216px;
+                height: 128px;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: hairline;
+                Image {
+                    x: 8px;
+                    y: 8px;
+                    width: 64px;
+                    height: 64px;
+                    source: @image-url("../assets/thumbs/dune-sunset-0412.jpg");
+                    image-fit: cover;
+                }
+                Rectangle { x: 8px; y: 76px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
+                Text { text: "Larger"; x: 8px; y: 76px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
+                Text { text: "dune-sunset-0412.jpg"; x: 80px; y: 10px; width: 128px; height: 16px; font-size: 11px; color: text; overflow: elide; }
+                Text { text: "6.2 MB"; x: 80px; y: 30px; width: 128px; height: 16px; font-size: 11px; color: muted; }
+                Text { text: "2026-10-12 21:40"; x: 80px; y: 48px; width: 128px; height: 16px; font-size: 11px; color: muted; }
+                Text { text: "JPEG image"; x: 80px; y: 66px; width: 128px; height: 16px; font-size: 11px; color: muted; }
+                Text { text: "Existing"; x: 8px; y: 100px; width: 200px; height: 16px; font-size: 11px; color: muted; }
+            }
+            Rectangle {
+                x: 248px;
+                y: 48px;
+                width: 216px;
+                height: 128px;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: hairline;
+                Image {
+                    x: 8px;
+                    y: 8px;
+                    width: 64px;
+                    height: 64px;
+                    source: @image-url("../assets/thumbs/dune-sunset-0413.jpg");
+                    image-fit: cover;
+                }
+                Rectangle { x: 8px; y: 76px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
+                Text { text: "Newer"; x: 8px; y: 76px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
+                Text { text: "dune-sunset-0412.jpg"; x: 80px; y: 10px; width: 128px; height: 16px; font-size: 11px; color: text; overflow: elide; }
+                Text { text: "4.1 MB"; x: 80px; y: 30px; width: 128px; height: 16px; font-size: 11px; color: muted; }
+                Text { text: "2026-10-30 18:58"; x: 80px; y: 48px; width: 128px; height: 16px; font-size: 11px; color: muted; }
+                Text { text: "JPEG image"; x: 80px; y: 66px; width: 128px; height: 16px; font-size: 11px; color: muted; }
+                Text { text: "Incoming"; x: 8px; y: 100px; width: 200px; height: 16px; font-size: 11px; color: muted; }
+            }
+            Text {
+                text: "Rename to dune-sunset-0412 (2).jpg";
+                x: 16px;
+                y: 184px;
+                width: 448px;
+                height: 16px;
+                font-size: 11px;
+                color: muted;
+            }
+            Rectangle {
+                x: 16px;
+                y: 210px;
+                width: 14px;
+                height: 14px;
+                border-radius: 2px;
+                border-width: 1px;
+                border-color: line;
+                background: overlay == "conflict-all" ? accent : transparent;
+            }
+            if overlay == "conflict-all": Text {
+                text: "󰄬";
+                x: 16px;
+                y: 208px;
+                width: 14px;
+                height: 16px;
+                font-size: 12px;
+                color: on-accent;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: "Apply to all 14 conflicts";
+                x: 36px;
+                y: 208px;
+                width: 220px;
+                height: 18px;
+                font-size: 12px;
+                color: text;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                x: 176px;
+                y: 244px;
+                width: 88px;
+                height: 32px;
+                border-radius: 6px;
+                border-width: 2px;
+                border-color: accent;
+                Text { text: "Skip"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+            }
+            Rectangle {
+                x: 272px;
+                y: 244px;
+                width: 88px;
+                height: 32px;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: line;
+                Text { text: "Rename"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+            }
+            Rectangle {
+                x: 368px;
+                y: 244px;
+                width: 96px;
+                height: 32px;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: line;
+                Text { text: "Replace"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+            }
+        }
+    }
+
     if !harness && overlay == "path-complete": Rectangle {
         x: side-w + 120px;
         y: toolbar-h;
