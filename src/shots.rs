@@ -116,7 +116,29 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         _ => 152.0,
     };
     ui.set_tile(tile);
-    ui.set_places(ModelRc::new(Rc::new(VecModel::from(places(view)))));
+    let all_places = places(view);
+    ui.set_places(ModelRc::new(Rc::new(VecModel::from(all_places.clone()))));
+    ui.set_pinned_places(ModelRc::new(Rc::new(VecModel::from(
+        all_places
+            .iter()
+            .filter(|p| p.section == 0)
+            .cloned()
+            .collect::<Vec<_>>(),
+    ))));
+    ui.set_device_places(ModelRc::new(Rc::new(VecModel::from(
+        all_places
+            .iter()
+            .filter(|p| p.section == 1)
+            .cloned()
+            .collect::<Vec<_>>(),
+    ))));
+    ui.set_trash_places(ModelRc::new(Rc::new(VecModel::from(
+        all_places
+            .iter()
+            .filter(|p| p.section == 2)
+            .cloned()
+            .collect::<Vec<_>>(),
+    ))));
     let show_hidden = view == "hidden-files-shown";
     ui.set_hidden_on(show_hidden);
     ui.set_files(ModelRc::new(Rc::new(VecModel::from(files(show_hidden)))));
