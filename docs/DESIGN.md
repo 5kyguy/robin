@@ -316,3 +316,24 @@ Things that never animate: scrolling content, list sorting (it cuts), and typing
 30. theme-black for frames 1, 3, 24, and 28
 
 Mockups: `/workspace/robin-design/mockups/{01-list,02-grid,03-viewer,04-stats,05-dialogs}.png`. They are a direction only, and this spec wins over them.
+
+## External drag and drop (Slint 1.17.1)
+
+Checked against the 1.17.1 sources rather than assumed.
+
+- `DragArea`/`DropArea` are in-window only. `DataTransfer` holds
+  `plain_text`, `image` and `user_data`; there is no MIME/uri-list slot.
+- `i-slint-backend-winit` 1.17.1 neither starts native drags nor
+  forwards `WindowEvent::DroppedFile` into Slint's drop machinery.
+- So outbound drags to other apps are impossible without patching
+  Slint; we do not fake them (e.g. by copying paths to the clipboard).
+- Inbound: the `unstable-winit-030` feature exposes
+  `WinitWindowAccessor::on_winit_window_event`, and winit 0.30 emits
+  `DroppedFile(path)` on X11 (once per path). `app::run` collects those
+  and the next 100ms tick turns them into jobs via
+  `ops::external_drop`: grouped per source folder, op from `drop_op`
+  with no modifiers plus `same_filesystem`, and `drop_check` refusing
+  no-op and into-itself drops. `DroppedFile` has no position, no
+  modifiers and no hover events, so the target is always the open
+  folder. winit 0.30 has no Wayland implementation, so nothing arrives
+  there.
