@@ -158,6 +158,10 @@ impl DirFd {
         Ok(out)
     }
 
+    pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
     fn reject_pseudo(&self, path: &Path) -> Result<()> {
         let class = class_of(self.fd.as_fd()).map_err(|e| Error::from_errno(path, e))?;
         if class.is_pseudo() {
@@ -187,7 +191,7 @@ fn class_of(fd: impl AsFd) -> std::result::Result<FsClass, Errno> {
     Ok(FsClass::Normal)
 }
 
-fn dev_parts(dev: u64) -> (u32, u32) {
+pub fn dev_parts(dev: u64) -> (u32, u32) {
     let major = (((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0xfff)) as u32;
     let minor = (((dev >> 12) & 0xffff_ff00) | (dev & 0xff)) as u32;
     (major, minor)
