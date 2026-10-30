@@ -3,6 +3,7 @@
 //! Mutations go through [`safety::DirFd`] so a path is never opened by string
 //! after the parent directory has been checked.
 
+pub mod app;
 pub mod cli;
 pub mod delegate;
 pub mod error;
@@ -11,6 +12,7 @@ pub mod fsops;
 pub mod instance;
 pub mod model;
 pub mod mounts;
+pub mod ops;
 pub mod safety;
 pub mod shots;
 pub mod stats;

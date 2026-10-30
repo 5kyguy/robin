@@ -68,6 +68,12 @@ pub fn known(view: &str) -> bool {
             | "stats-treemap-drilled"
             | "stats-empty-trash"
             | "theme-black-stats"
+            | "cut"
+            | "dnd-copy"
+            | "dnd-move"
+            | "progress"
+            | "confirm-delete"
+            | "undo"
     )
 }
 
@@ -85,6 +91,7 @@ pub fn paint(view: &str, theme: &Theme, size: (u32, u32), out: &Path) -> Result<
     } else {
         ui.set_harness(false);
         apply_scene(&ui, view);
+        fileops_scene(&ui, view);
     }
     ui.window()
         .set_size(slint::PhysicalSize::new(size.0, size.1));
@@ -109,7 +116,7 @@ pub fn paint(view: &str, theme: &Theme, size: (u32, u32), out: &Path) -> Result<
     Ok(())
 }
 
-fn apply_theme(ui: &AppWindow, theme: &Theme) {
+pub(crate) fn apply_theme(ui: &AppWindow, theme: &Theme) {
     ui.set_bg(theme.bg.to_slint());
     ui.set_surface(theme.surface.to_slint());
     ui.set_text(theme.text.to_slint());
@@ -235,6 +242,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
     let refused = crate::fsops::refusal("Projects", &blocked);
     ui.set_refusal_title(refused.title.as_str().into());
     ui.set_refusal_can_copy(refused.can_copy_instead);
+    ui.set_dialog_focus(i32::from(refused.can_copy_instead));
     ui.set_refusal_dismiss(refused.dismiss_label.into());
     ui.set_refusal_notes(refused.note_count() as i32);
     ui.set_refusal_lines(ModelRc::new(Rc::new(VecModel::from(
@@ -263,6 +271,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "path-complete" => "path-complete",
             "search-results" | "search-no-results" => "search",
             "confirm-trash" => "trash",
+            "confirm-delete" => "delete",
             "confirm-trash-no-trash" => "trash-no",
             "confirm-delete-permanent" => "delete",
             "conflict" => "conflict",
@@ -731,6 +740,8 @@ fn row(
         hidden,
         role,
         badge: badge.into(),
+        cut: false,
+        drop: false,
     }
 }
 
@@ -897,6 +908,77 @@ fn menu() -> Vec<slint::SharedString> {
     .into_iter()
     .map(slint::SharedString::from)
     .collect()
+}
+
+/// The views of the wired file operations: cut rows, a drag over a folder,
+/// a running job, the keyboard-focused confirms, and the undo toast.
+fn fileops_scene(ui: &AppWindow, view: &str) {
+    let mut rows = files(false);
+    let pick = |rows: &mut Vec<Row>, f: &dyn Fn(&mut Row)| {
+        for r in rows
+            .iter_mut()
+            .filter(|r| r.name.starts_with("dune-sunset"))
+        {
+            f(r);
+        }
+    };
+    match view {
+        "cut" => {
+            pick(&mut rows, &|r| {
+                r.cut = true;
+                r.selected = true;
+                r.hovered = false;
+            });
+            ui.set_status_left("15 items · 2 selected · 2 items cut".into());
+        }
+        "dnd-copy" | "dnd-move" => {
+            pick(&mut rows, &|r| {
+                r.selected = true;
+                r.hovered = false;
+            });
+            rows[0].drop = true;
+            ui.set_status_left("15 items · 2 selected".into());
+            let copy = view == "dnd-copy";
+            ui.set_drag_label(
+                if copy {
+                    "Copy 2 items to raw-exports"
+                } else {
+                    "Move 2 items to raw-exports"
+                }
+                .into(),
+            );
+            ui.set_drag_glyph(if copy { "󰆏" } else { "󰪹" }.into());
+        }
+        "progress" => {
+            ui.set_job_on(true);
+            ui.set_job_glyph("󰆏".into());
+            ui.set_job_label("Copying 3 items to SANDISK".into());
+            ui.set_job_detail("2 of 3 items · speeder-run.mp4".into());
+            ui.set_job_amount(0.66);
+        }
+        "confirm-trash" => {
+            ui.set_dialog_focus(1);
+            ui.set_danger_armed(true);
+        }
+        "confirm-delete" => {
+            ui.set_dialog_focus(0);
+            ui.set_danger_armed(true);
+        }
+        "confirm-delete-permanent" => ui.set_dialog_focus(0),
+        "undo" => {
+            ui.set_toast_on(true);
+            ui.set_toast_tone("".into());
+            ui.set_toast_text("Moved 3 items to trash".into());
+            ui.set_toast_action("Undo".into());
+            ui.set_toast_details(ModelRc::new(Rc::new(VecModel::from(Vec::<
+                slint::SharedString,
+            >::new()))));
+        }
+        _ => return,
+    }
+    if matches!(view, "cut" | "dnd-copy" | "dnd-move") {
+        ui.set_files(ModelRc::new(Rc::new(VecModel::from(rows))));
+    }
 }
 
 #[cfg(test)]

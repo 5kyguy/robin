@@ -1233,7 +1233,7 @@ pub fn place_in_trash(
     trash: &DirFd,
     choice: TrashChoice,
     info_path: &str,
-) -> Result<()> {
+) -> Result<std::ffi::OsString> {
     if matches!(choice, TrashChoice::Ask) {
         return Err(Error::Message(
             "this drive has no trash and files are not copied home".into(),
@@ -1272,7 +1272,7 @@ pub fn place_in_trash(
         match rename_noreplace(parent.as_fd(), &from_c, files.as_fd(), &data_c) {
             Ok(()) => {
                 rustix::fs::fsync(files.as_fd()).map_err(|e| Error::from_errno(name, e))?;
-                return Ok(());
+                return Ok(candidate);
             }
             Err(Errno::EXIST) => {
                 let _ = rustix::fs::unlinkat(info_dir.as_fd(), info_c.as_c_str(), AtFlags::empty());
@@ -1284,6 +1284,56 @@ pub fn place_in_trash(
         }
     }
     Err(Error::Message("trash name is exhausted".into()))
+}
+
+/// Put a trashed entry back: `files/<stored>` is renamed to `name` in
+/// `dest_parent` without replacing anything there, then its `.trashinfo` is
+/// removed. An existing `name` leaves the entry in the trash.
+pub fn restore_from_trash(
+    trash: &DirFd,
+    stored: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    name: &std::ffi::OsStr,
+) -> Result<()> {
+    let files = trash.open_dir_nofollow(std::ffi::OsStr::new("files"))?;
+    let info_dir = trash.open_dir_nofollow(std::ffi::OsStr::new("info"))?;
+    let stored_c = component(stored)?;
+    let name_c = component(name)?;
+    rename_noreplace(files.as_fd(), &stored_c, dest_parent.as_fd(), &name_c).map_err(|e| {
+        if e == Errno::EXIST {
+            Error::Message(format!(
+                "{} already exists, left it in the trash",
+                name.to_string_lossy()
+            ))
+        } else {
+            Error::from_errno(name, e)
+        }
+    })?;
+    rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(name, e))?;
+    let info = std::ffi::OsString::from(format!("{}.trashinfo", stored.to_string_lossy()));
+    let info_c = component(&info)?;
+    match rustix::fs::unlinkat(info_dir.as_fd(), info_c.as_c_str(), AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(err) => Err(Error::from_errno(&info, err)),
+    }
+}
+
+/// Walk up from `path` to the top of its filesystem.
+pub fn mount_top(path: &Path) -> Result<std::path::PathBuf> {
+    let dev = |p: &Path| {
+        rustix::fs::stat(p)
+            .map(|s| s.st_dev)
+            .map_err(|e| Error::from_errno(p, e))
+    };
+    let own = dev(path)?;
+    let mut top = path.to_path_buf();
+    while let Some(parent) = top.parent() {
+        if dev(parent)? != own {
+            break;
+        }
+        top = parent.to_path_buf();
+    }
+    Ok(top)
 }
 
 fn trash_candidates(name: &std::ffi::OsStr) -> Vec<std::ffi::OsString> {

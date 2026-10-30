@@ -15,6 +15,7 @@ where
     let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
     let mut iter = args.iter();
     match iter.next().and_then(|s| s.to_str()) {
+        None if have_display() => crate::app::run(crate::app::start_dir(None)),
         None | Some("--help") | Some("-h") => {
             print_help();
             Ok(0)
@@ -22,6 +23,9 @@ where
         Some("--demo") => demo(iter),
         Some("--select") => select_file(iter),
         Some("--render") => render(iter),
+        Some(other) if !other.starts_with('-') => {
+            crate::app::run(crate::app::start_dir(Some(std::path::Path::new(other))))
+        }
         Some(other) => Err(Error::Message(format!(
             "unknown argument {other}. Try `robin --help`."
         ))),
@@ -34,6 +38,7 @@ fn print_help() {
 robin — file manager for R2-D2
 
 Usage:
+  robin [DIR]                 open DIR (default: home) in a window
   robin --demo [--out DIR]
   robin --render <view> [--fixture DIR] [--size WxH] [--density comfortable|compact]
                         [--theme cyan|black] [--out FILE]

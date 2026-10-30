@@ -53,6 +53,10 @@ export struct Row {
     hidden: bool,
     role: int,
     badge: string,
+    // Cut and waiting for a paste: drawn at 50%.
+    cut: bool,
+    // The folder a drag is over.
+    drop: bool,
 }
 
 export struct GridLine {
@@ -203,6 +207,9 @@ component JobRow inherits Rectangle {
     in property <color> accent-ink;
     in property <color> danger-ink;
     in property <length> row-h: 44px;
+    // Live jobs show a Cancel link instead of the pause and close glyphs.
+    in property <bool> cancel-link: false;
+    callback cancel();
     height: row-h;
     property <length> btn: 28px;
     property <length> action-w: failed ? 112px : btn * 2 + 2px;
@@ -262,7 +269,22 @@ component JobRow inherits Rectangle {
         vertical-alignment: center;
         overflow: elide;
     }
-    if !failed: Rectangle {
+    if cancel-link: Text {
+        text: "Cancel";
+        x: action-x;
+        y: 0px;
+        width: action-w;
+        height: parent.height;
+        font-size: 12px;
+        color: accent-ink;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.cancel(); }
+        }
+    }
+    if !failed && !cancel-link: Rectangle {
         x: action-x;
         y: (parent.height - btn) / 2;
         width: btn;
@@ -276,7 +298,7 @@ component JobRow inherits Rectangle {
             vertical-alignment: center;
         }
     }
-    if !failed: Rectangle {
+    if !failed && !cancel-link: Rectangle {
         x: action-x + btn + 2px;
         y: (parent.height - btn) / 2;
         width: btn;
@@ -488,6 +510,33 @@ export component AppWindow inherits Window {
     in property <string> refusal-dismiss: "Cancel";
     // Lines with a note under the path; each adds a row of height.
     in property <int> refusal-notes: 0;
+    // Interactive window. Dialog buttons are numbered left to right and the
+    // focused one carries the ring; Tab, arrows, Enter, and Esc drive them.
+    in property <int> dialog-focus: 0;
+    // The danger button unlocks 600ms after the delete dialog opens.
+    in property <bool> danger-armed: false;
+    in property <string> confirm-noun: "3 items";
+    in property <string> confirm-names: "dune-sunset-0412.jpg\ndune-sunset-0413.jpg\nspeeder-run.mp4";
+    in property <bool> job-on: false;
+    in property <string> job-glyph: "󰆏";
+    in property <string> job-label;
+    in property <string> job-detail;
+    in property <float> job-amount;
+    in property <bool> toast-on: false;
+    in property <string> toast-action: "";
+    in property <bool> toast-open: false;
+    // "Copy 2 items to raw-exports" while a drag is over a folder.
+    in property <string> drag-label: "";
+    in property <string> drag-glyph: "󰆏";
+    callback key(string, bool, bool, bool) -> bool;
+    // Row index, 0 down / 1 move / 2 up, rows from the pressed row, moved
+    // far enough to be a drag, Ctrl, Shift.
+    callback row-pointer(int, int, int, bool, bool, bool);
+    callback row-open(int);
+    callback dialog-button(int);
+    callback job-cancel();
+    callback toast-link();
+    forward-focus: keys;
 
     title: "Robin";
     default-font-family: "JetBrainsMono Nerd Font";
@@ -504,6 +553,15 @@ export component AppWindow inherits Window {
     property <color> selected: accent.with-alpha(0.18);
     property <color> selected-active: accent.with-alpha(0.28);
     property <color> divider: line;
+
+    keys := FocusScope {
+        key-pressed(e) => {
+            if root.key(e.text, e.modifiers.control, e.modifiers.shift, e.modifiers.alt) {
+                return accept;
+            }
+            return reject;
+        }
+    }
 
     if harness: VerticalLayout {
         padding: 16px;
@@ -838,11 +896,28 @@ export component AppWindow inherits Window {
                     Rectangle { height: 1px; background: divider; }
                     ListView {
                         vertical-stretch: 1;
-                        for row in files: Rectangle {
+                        for row[i] in files: Rectangle {
                             width: parent.width;
                             height: row-h;
-                            background: row.selected ? selected-active : row.hovered ? hover : transparent;
+                            background: row.drop ? selected : row.selected ? selected-active : row.hovered ? hover : transparent;
                             border-radius: 6px;
+                            border-width: row.drop ? 2px : 0px;
+                            border-color: accent;
+                            opacity: row.cut ? 0.5 : 1;
+                            TouchArea {
+                                pointer-event(e) => {
+                                    if e.button == PointerEventButton.left || e.kind == PointerEventKind.move {
+                                        root.row-pointer(
+                                            i,
+                                            e.kind == PointerEventKind.down ? 0 : e.kind == PointerEventKind.up ? 2 : 1,
+                                            floor(self.mouse-y / row-h),
+                                            self.pressed && (abs(self.mouse-x - self.pressed-x) > 6px || abs(self.mouse-y - self.pressed-y) > 6px),
+                                            e.modifiers.control,
+                                            e.modifiers.shift);
+                                    }
+                                }
+                                double-clicked => { root.row-open(i); }
+                            }
                             Text {
                                 text: row.glyph;
                                 x: Columns.pad;
@@ -973,6 +1048,24 @@ export component AppWindow inherits Window {
                 }
             }
 
+            if job-on: Rectangle {
+                height: 44px;
+                background: surface;
+                JobRow {
+                    row-h: 44px;
+                    glyph: job-glyph;
+                    label: job-label;
+                    detail: job-detail;
+                    amount: job-amount;
+                    failed: false;
+                    cancel-link: true;
+                    cancel => { root.job-cancel(); }
+                    ink: root.text;
+                    muted-ink: root.muted;
+                    accent-ink: root.accent;
+                    danger-ink: root.danger;
+                }
+            }
             if overlay == "progress-1" || overlay == "progress-3" || overlay == "progress-error": Rectangle {
                 height: overlay == "progress-3" ? 116px : 44px;
                 background: surface;
@@ -1069,9 +1162,9 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 padding: 20px;
                 spacing: 8px;
-                if overlay == "delete": Text { text: "󰀦  Permanently delete 3 items?"; font-size: 13px; font-weight: 700; color: text; }
+                if overlay == "delete": Text { text: "󰀦  Permanently delete \{confirm-noun}?"; font-size: 13px; font-weight: 700; color: text; }
                 if overlay != "delete": Text {
-                    text: overlay == "trash-no" ? "This drive has no trash" : "Move 3 items to trash?";
+                    text: overlay == "trash-no" ? "This drive has no trash" : "Move \{confirm-noun} to trash?";
                     font-size: 13px;
                     font-weight: 700;
                     color: text;
@@ -1081,7 +1174,7 @@ export component AppWindow inherits Window {
                     font-size: 12px;
                     color: muted;
                 }
-                Text { text: "dune-sunset-0412.jpg\ndune-sunset-0413.jpg\nspeeder-run.mp4"; font-size: 11px; color: muted; }
+                Text { text: confirm-names; font-size: 11px; color: muted; }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
                     alignment: end;
@@ -1090,16 +1183,20 @@ export component AppWindow inherits Window {
                         width: 88px;
                         height: 32px;
                         border-radius: 6px;
-                        border-width: overlay == "delete" ? 2px : 1px;
-                        border-color: overlay == "delete" ? accent : line;
+                        border-width: dialog-focus == 0 ? 2px : 1px;
+                        border-color: dialog-focus == 0 ? accent : line;
                         Text { text: "Cancel"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.dialog-button(0); } }
                     }
                     Rectangle {
                         min-width: 88px;
                         height: 32px;
                         border-radius: 6px;
                         background: overlay == "delete" || overlay == "trash-no" ? danger : accent;
-                        opacity: overlay == "delete" ? 0.42 : 1;
+                        opacity: overlay == "delete" && !danger-armed ? 0.42 : 1;
+                        border-width: dialog-focus == 1 ? 2px : 0px;
+                        border-color: text;
+                        TouchArea { clicked => { root.dialog-button(1); } }
                         Text {
                             text: overlay == "delete" || overlay == "trash-no" ? "Delete permanently" : "Move to Trash";
                             font-size: 12px;
@@ -1142,9 +1239,10 @@ export component AppWindow inherits Window {
                         width: 88px;
                         height: 32px;
                         border-radius: 6px;
-                        border-width: refusal-can-copy ? 1px : 2px;
-                        border-color: refusal-can-copy ? line : accent;
+                        border-width: dialog-focus == 0 ? 2px : 1px;
+                        border-color: dialog-focus == 0 ? accent : line;
                         Text { text: refusal-dismiss; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.dialog-button(0); } }
                     }
                     // Default button: filled, with the focus ring.
                     if refusal-can-copy: Rectangle {
@@ -1152,8 +1250,9 @@ export component AppWindow inherits Window {
                         height: 32px;
                         border-radius: 6px;
                         background: accent;
-                        border-width: 2px;
+                        border-width: dialog-focus == 1 ? 2px : 0px;
                         border-color: text;
+                        TouchArea { clicked => { root.dialog-button(1); } }
                         Text { text: "Copy instead"; font-size: 12px; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
                     }
                 }
@@ -1932,8 +2031,21 @@ export component AppWindow inherits Window {
     }
 
     // Neutral completion toast. Skipped entries are listed, never dropped.
-    if !harness && (overlay == "skipped" || overlay == "skipped-details" || overlay == "toast-details"): Rectangle {
-        property <bool> open: overlay == "skipped-details" || overlay == "toast-details";
+    if !harness && drag-label != "": Rectangle {
+        width: drag-line.preferred-width + 58px;
+        height: 36px;
+        x: side-w + (parent.width - side-w - self.width) / 2;
+        y: parent.height - status-h - 16px - self.height;
+        background: surface;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: accent;
+        Text { text: drag-glyph; x: 14px; y: 0px; width: 18px; height: parent.height; font-size: 14px; color: accent; vertical-alignment: center; }
+        drag-line := Text { text: drag-label; x: 40px; y: 0px; height: parent.height; font-size: 12px; color: text; vertical-alignment: center; }
+    }
+
+    if !harness && (toast-on || overlay == "skipped" || overlay == "skipped-details" || overlay == "toast-details"): Rectangle {
+        property <bool> open: overlay == "skipped-details" || overlay == "toast-details" || toast-open;
         property <color> tone: toast-tone == "warning" ? warning : toast-tone == "danger" ? danger : muted;
         property <length> line-h: 20px;
         // Fit the line, 520px to 800px, and never wider than the window.
@@ -1978,7 +2090,7 @@ export component AppWindow inherits Window {
             vertical-alignment: center;
         }
         Text {
-            text: open ? "Hide details" : "Details";
+            text: toast-details.length == 0 ? toast-action : open ? "Hide details" : "Details";
             x: parent.width - 16px - self.width;
             y: 0px;
             width: 96px;
@@ -1987,6 +2099,10 @@ export component AppWindow inherits Window {
             color: accent;
             horizontal-alignment: right;
             vertical-alignment: center;
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.toast-link(); }
+            }
         }
         if open: Rectangle {
             x: 16px;
