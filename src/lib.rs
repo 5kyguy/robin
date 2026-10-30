@@ -10,6 +10,7 @@ pub mod fsops;
 pub mod model;
 pub mod safety;
 pub mod shots;
+pub mod stats;
 pub mod theme;
 pub mod thumbs;
 pub mod video;

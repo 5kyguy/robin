@@ -11,7 +11,7 @@ use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::error::{Error, Result};
 use crate::theme::Theme;
-use crate::{AppWindow, GridLine, Place, Row};
+use crate::{AppWindow, GridLine, MapCell, Place, Row};
 
 pub fn known(view: &str) -> bool {
     matches!(
@@ -58,6 +58,10 @@ pub fn known(view: &str) -> bool {
             | "viewer-slideshow"
             | "shortcuts-viewer"
             | "theme-black-viewer"
+            | "stats-overview"
+            | "stats-treemap-drilled"
+            | "stats-empty-trash"
+            | "theme-black-stats"
     )
 }
 
@@ -224,6 +228,70 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         }
         .into(),
     );
+    let stats_mode = match view {
+        "stats-overview" | "theme-black-stats" => "overview",
+        "stats-treemap-drilled" => "drilled",
+        "stats-empty-trash" => "empty-trash",
+        _ => "",
+    };
+    ui.set_stats_mode(stats_mode.into());
+    if !stats_mode.is_empty() {
+        ui.set_map_cells(ModelRc::new(Rc::new(VecModel::from(stats_cells(
+            stats_mode == "drilled",
+        )))));
+    }
+}
+
+fn stats_cells(drilled: bool) -> Vec<MapCell> {
+    let weights: Vec<(String, u64)> = if drilled {
+        vec![
+            ("raw-exports".into(), 180),
+            ("tatooine-trip".into(), 140),
+            ("speeder-run.mp4".into(), 52),
+            ("cantina-band.heic".into(), 40),
+        ]
+    } else {
+        vec![
+            ("Videos".into(), 412),
+            ("Projects".into(), 188),
+            ("Pictures".into(), 141),
+            ("Downloads".into(), 96),
+            ("Games".into(), 61),
+            ("Music".into(), 58),
+            (".cache".into(), 22),
+            ("Documents".into(), 31),
+            ("Mail".into(), 9),
+            ("other".into(), 24),
+        ]
+    };
+    let mut ranked = weights.clone();
+    ranked.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
+    let rank_of: std::collections::HashMap<String, usize> = ranked
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| (name.clone(), index))
+        .collect();
+    let labels: std::collections::HashMap<_, _> = weights.iter().cloned().collect();
+    // 1px off each shared edge is a 2px surface gutter.
+    const GUTTER: f32 = 1.0;
+    crate::stats::squarify(&weights, 623.0, 300.0)
+        .into_iter()
+        .map(|rect| {
+            let rank = rank_of[&rect.name] as f32;
+            // Largest cell is full accent. Each lower rank steps down, and a
+            // deeper squarify row is clearly darker than the row above it.
+            let shade = (1.0 - rank * 0.08 - rect.depth as f32 * 0.15).clamp(0.18, 1.0);
+            MapCell {
+                x: rect.x + GUTTER,
+                y: rect.y + GUTTER,
+                w: (rect.w - GUTTER * 2.0).max(1.0),
+                h: (rect.h - GUTTER * 2.0).max(1.0),
+                name: rect.name.clone().into(),
+                detail: format!("{} GB", labels[&rect.name]).into(),
+                shade,
+            }
+        })
+        .collect()
 }
 
 fn places(view: &str) -> Vec<Place> {
@@ -737,5 +805,35 @@ mod tests {
         ] {
             assert!(known(name), "{name}");
         }
+    }
+
+    #[test]
+    fn treemap_tiles_keep_a_surface_gutter() {
+        let cells = stats_cells(false);
+        let videos = cells.iter().find(|c| c.name == "Videos").unwrap();
+        assert!((videos.shade - 1.0).abs() < 0.001, "{}", videos.shade);
+        let mut gaps = Vec::new();
+        for a in &cells {
+            for b in &cells {
+                if a.name == b.name {
+                    continue;
+                }
+                let ax2 = a.x + a.w;
+                let ay2 = a.y + a.h;
+                let bx2 = b.x + b.w;
+                let by2 = b.y + b.h;
+                let overlap_y = a.y < by2 - 1.0 && b.y < ay2 - 1.0;
+                let overlap_x = a.x < bx2 - 1.0 && b.x < ax2 - 1.0;
+                if overlap_y && b.x >= ax2 - 0.5 {
+                    gaps.push(b.x - ax2);
+                }
+                if overlap_x && b.y >= ay2 - 0.5 {
+                    gaps.push(b.y - ay2);
+                }
+            }
+        }
+        let min = gaps.iter().copied().fold(f32::MAX, f32::min);
+        assert!((min - 2.0).abs() < 0.2, "gutter should be 2px, min {min}");
+        assert!(cells.iter().any(|c| c.shade < videos.shade - 0.1));
     }
 }
