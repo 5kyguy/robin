@@ -190,6 +190,9 @@ All empty and error states are centred in the content area: glyph 64 `muted@60%`
 - Buttons: [Skip] [Keep both] (auto-rename to `IMG_0412 (2).jpg`, previewed in muted below) [Replace] (primary, but `warning` fill when the target is newer).
 - Checkbox "Apply to all 14 conflicts" sits in the bottom-left.
 - Folder-vs-folder conflicts offer [Merge] instead of Replace.
+- A folder's size line shows its item count ("48 items"), as the list view does.
+- The muted line under the cards also says that a replaced file isn't restored on cancel. Cancel takes back only what the job added; a file a Replace or Merge overwrote keeps the new contents.
+- An error that stops a merge partway shows a `warning` toast, "Merged 31 of 48 items into raw-exports before an error". Details lists the error, each item that wasn't merged, and anything the cleanup couldn't remove.
 
 ### Toasts
 - Bottom-centre, 16 above the status bar (or the strip). Width auto, from 280 to 520. Height 40, radius `r-lg`, fill `panel_float`, 1px `hairline`.

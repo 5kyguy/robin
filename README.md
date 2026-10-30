@@ -5,3 +5,10 @@ Robin is a native, offline file manager and media viewer for [R2-D2](https://git
 Robin is in development.
 
 Robin is licensed under the GNU General Public License version 3 only (GPL-3.0-only). There is no "or later" option.
+
+## Copy and move conflicts
+
+Cancelling a copy or move removes the items that job added. It does not
+restore a file that a Replace or Merge overwrote; that file keeps the
+copied contents. Anything the cleanup can't remove is listed under the
+job's Details.
