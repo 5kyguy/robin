@@ -2446,24 +2446,32 @@ mod tests {
     #[test]
     fn a_folder_that_skipped_some_but_landed_others_is_partly_merged() {
         let root = scratch("merge-partly-skip");
-        // Readdir order is up to the filesystem; enough siblings make it
-        // all but certain one is walked after inner, and that one fails.
-        std::fs::create_dir_all(root.join("src/sub/inner")).unwrap();
-        std::fs::create_dir_all(root.join("dest/sub/inner")).unwrap();
-        std::fs::write(root.join("src/sub/inner/a"), b"a").unwrap();
-        std::fs::write(root.join("src/sub/inner/b"), b"b").unwrap();
-        std::fs::write(root.join("dest/sub/inner/a"), b"old").unwrap();
-        for n in 0..8 {
-            std::fs::write(root.join(format!("src/sub/f{n}")), b"f").unwrap();
-        }
-        let order = listed(&root.join("src/sub"));
-        let at = order.iter().position(|n| n == "inner").unwrap();
-        let after = order.get(at + 1).cloned().expect("inner listed last");
-        FAIL_LANDING.with(|f| *f.borrow_mut() = Some(after.into()));
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        std::fs::write(root.join("src/sub/zz"), b"z").unwrap();
+        // Readdir order is up to the filesystem, so pick a folder name
+        // that is walked before its sibling, which then fails.
+        let dir = (0..64)
+            .map(|n| format!("inner{n}"))
+            .find(|d| {
+                std::fs::create_dir(root.join("src/sub").join(d)).unwrap();
+                let order = listed(&root.join("src/sub"));
+                let first = order[0] == *d;
+                if !first {
+                    std::fs::remove_dir(root.join("src/sub").join(d)).unwrap();
+                }
+                first
+            })
+            .expect("a name listed first");
+        let inner = root.join("src/sub").join(&dir);
+        std::fs::write(inner.join("a"), b"a").unwrap();
+        std::fs::write(inner.join("b"), b"b").unwrap();
+        std::fs::create_dir_all(root.join("dest/sub").join(&dir)).unwrap();
+        std::fs::write(root.join("dest/sub").join(&dir).join("a"), b"old").unwrap();
+        FAIL_LANDING.with(|f| *f.borrow_mut() = Some("zz".into()));
         let (out, report) = force_move_report(&root, "src", "dest", &Cancel::new());
         assert!(out.is_err(), "{out:?}");
         let m = report.merges.iter().find(|m| m.into == "dest/sub").unwrap();
-        assert_eq!(m.partly, ["dest/sub/inner"], "{m:?}");
+        assert_eq!(m.partly, [format!("dest/sub/{dir}")], "{m:?}");
         assert!(m.skipped.is_empty(), "{m:?}");
         assert_eq!(
             m.merged + m.skipped.len() + m.partly.len() + m.missing.len(),
