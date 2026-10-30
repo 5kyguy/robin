@@ -128,6 +128,8 @@ component Tile inherits Rectangle {
     in property <color> surface;
     in property <color> selected-bg;
     in property <color> hover-bg;
+    property <bool> still: name == "dune-sunset-0412.jpg" || name == "dune-sunset-0413.jpg" || name == "speeder-run.mp4" || name == "cantina-band.heic" || name == "droid-manual.pdf" || name == "lars homestead family portrait final.jpg";
+    property <string> label: name == "dune-sunset-0412.jpg" ? "dune-sunset-\n0412.jpg" : name == "dune-sunset-0413.jpg" ? "dune-sunset-\n0413.jpg" : name == "speeder-run.mp4" ? "speeder-\nrun.mp4" : name == "cantina-band.heic" ? "cantina-\nband.heic" : name == "droid-manual.pdf" ? "droid-\nmanual.pdf" : name == "holo-backup.tar.zst" ? "holo-backup.\ntar.zst" : name == "binary-sunset.flac" ? "binary-\nsunset.flac" : name == "lars homestead family portrait final.jpg" ? "lars homestead\nfamily portrait final.jpg" : name;
     width: tile;
     height: tile + 44px;
     border-radius: 6px;
@@ -140,24 +142,31 @@ component Tile inherits Rectangle {
             height: tile - 12px;
             border-radius: 4px;
             background: surface;
-            Text {
+            if name == "dune-sunset-0412.jpg": Image { source: @image-url("../assets/thumbs/dune-sunset-0412.jpg"); width: parent.width; height: parent.height; image-fit: cover; }
+            if name == "dune-sunset-0413.jpg": Image { source: @image-url("../assets/thumbs/dune-sunset-0413.jpg"); width: parent.width; height: parent.height; image-fit: cover; }
+            if name == "speeder-run.mp4": Image { source: @image-url("../assets/thumbs/speeder-frame.png"); width: parent.width; height: parent.height; image-fit: cover; }
+            if name == "cantina-band.heic": Image { source: @image-url("../assets/thumbs/cantina-band.png"); width: parent.width; height: parent.height; image-fit: cover; }
+            if name == "droid-manual.pdf": Image { source: @image-url("../assets/thumbs/droid-manual.png"); width: parent.width; height: parent.height; image-fit: cover; }
+            if name == "lars homestead family portrait final.jpg": Image { source: @image-url("../assets/thumbs/lars-homestead.jpg"); width: parent.width; height: parent.height; image-fit: cover; }
+            if !still: Text {
                 text: glyph;
                 font-size: tile * 0.32;
                 color: role == 2 ? danger : role == 3 ? warning : role == 1 ? accent : role == 4 ? muted : ink;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-            if badge != "": Text {
-                text: badge;
-                y: 4px;
+            if badge != "": Rectangle {
                 x: 4px;
-                font-size: 9px;
-                font-weight: 600;
-                color: ink;
+                y: 4px;
+                width: 44px;
+                height: 14px;
+                border-radius: 2px;
+                background: #000000.with-alpha(0.62);
+                Text { text: badge; font-size: 9px; font-weight: 600; color: #e7fbff; horizontal-alignment: center; vertical-alignment: center; }
             }
         }
         Text {
-            text: name;
+            text: label;
             font-size: 12px;
             color: ink;
             horizontal-alignment: center;

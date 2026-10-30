@@ -545,6 +545,14 @@ fn grid_lines(view: &str) -> Vec<GridLine> {
         ("\u{f0354}", "shot-list.md", 0, "MD", false, false),
         ("󰎆", "binary-sunset.flac", 1, "FLAC", false, false),
         ("󰈔", "mos-eisley.xcf", 4, "XCF", false, false),
+        (
+            "󰈟",
+            "lars homestead family portrait final.jpg",
+            0,
+            "",
+            false,
+            false,
+        ),
     ];
     cells
         .chunks(cols)
