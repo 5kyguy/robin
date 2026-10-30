@@ -48,6 +48,7 @@ pub fn known(view: &str) -> bool {
             | "move-partial"
             | "move-refused"
             | "move-refused-unreadable"
+            | "move-refused-unreadable-two"
             | "menu-file"
             | "shortcuts-browser"
             | "reduce-motion"
@@ -219,9 +220,23 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             crate::fsops::KeepReason::UnreadableFolder,
         )];
     }
+    if view == "move-refused-unreadable-two" {
+        blocked = vec![
+            kept(
+                "Projects/robin/.cache",
+                crate::fsops::KeepReason::UnreadableFolder,
+            ),
+            kept(
+                "Projects/robin/target/tmp",
+                crate::fsops::KeepReason::UnreadableFolder,
+            ),
+        ];
+    }
     let refused = crate::fsops::refusal("Projects", &blocked);
-    ui.set_refusal_title(refused.title.into());
+    ui.set_refusal_title(refused.title.as_str().into());
     ui.set_refusal_can_copy(refused.can_copy_instead);
+    ui.set_refusal_dismiss(refused.dismiss_label.into());
+    ui.set_refusal_notes(refused.note_count() as i32);
     ui.set_refusal_lines(ModelRc::new(Rc::new(VecModel::from(
         refused
             .lines
@@ -258,7 +273,9 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "skipped" => "skipped",
             "skipped-details" => "skipped-details",
             "move-partial" => "toast-details",
-            "move-refused" | "move-refused-unreadable" => "move-refused",
+            "move-refused" | "move-refused-unreadable" | "move-refused-unreadable-two" => {
+                "move-refused"
+            }
             "menu-file" => "menu-file",
             "shortcuts-browser" | "shortcuts-viewer" => "shortcuts",
             _ => "",

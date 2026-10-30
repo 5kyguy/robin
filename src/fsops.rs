@@ -548,8 +548,11 @@ pub struct Refusal {
     /// and the items in shared folders or on read-only drives.
     pub lines: Vec<RefusalLine>,
     /// False when a folder can't be read: it can't be copied either, so the
-    /// dialog offers only Cancel.
+    /// dialog offers a single Close button.
     pub can_copy_instead: bool,
+    /// Label of the button that dismisses the dialog: "Cancel" next to
+    /// Copy instead, "Close" when it is the only button.
+    pub dismiss_label: &'static str,
 }
 
 /// One blocking path in the dialog, with a note shown under it.
@@ -642,6 +645,14 @@ pub fn refusal(name: &str, blocked: &[KeptEntry]) -> Refusal {
         title: format!("Can't move {name}: {why}"),
         lines,
         can_copy_instead,
+        dismiss_label: if can_copy_instead { "Cancel" } else { "Close" },
+    }
+}
+
+impl Refusal {
+    /// Lines that carry a note; the dialog grows one row for each.
+    pub fn note_count(&self) -> usize {
+        self.lines.iter().filter(|l| l.note.is_some()).count()
     }
 }
 
@@ -2661,6 +2672,7 @@ mod tests {
                             note: None,
                         }],
                         can_copy_instead: true,
+                        dismiss_label: "Cancel",
                     }
                 );
             }
@@ -2773,6 +2785,8 @@ mod tests {
             r.can_copy_instead,
             "read-only and sticky can still be copied"
         );
+        assert_eq!(r.dismiss_label, "Cancel");
+        assert_eq!(r.note_count(), 0);
     }
 
     #[test]
@@ -2884,7 +2898,25 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_folder_offers_only_cancel() {
+    fn each_unreadable_folder_adds_a_note_row() {
+        let k = |p: &str, reason| KeptEntry {
+            path: p.into(),
+            reason,
+        };
+        let r = refusal(
+            "Projects",
+            &[
+                k("Projects/a", KeepReason::UnreadableFolder),
+                k("Projects/b", KeepReason::UnreadableFolder),
+                k("Projects/ro/f", KeepReason::ReadOnlyFolder),
+            ],
+        );
+        assert_eq!(r.note_count(), 2);
+        assert_eq!(r.dismiss_label, "Close");
+    }
+
+    #[test]
+    fn unreadable_folder_offers_only_close() {
         let k = |p: &str, reason| KeptEntry {
             path: p.into(),
             reason,
@@ -2897,6 +2929,8 @@ mod tests {
             ],
         );
         assert!(!r.can_copy_instead);
+        assert_eq!(r.dismiss_label, "Close");
+        assert_eq!(r.note_count(), 1);
         assert_eq!(
             r.lines,
             vec![
