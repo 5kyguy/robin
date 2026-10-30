@@ -320,6 +320,7 @@ export component AppWindow inherits Window {
     in property <length> tile: 152px;
     in property <string> state: "files";
     in property <string> overlay: "";
+    in property <string> viewer: "";
     in property <string> status-left: "15 items · 1 hidden";
     in property <string> status-right: "812 GB free of 1.8 TB";
     in property <bool> hidden-on: false;
@@ -1218,6 +1219,135 @@ export component AppWindow inherits Window {
                 border-color: line;
                 Text { text: "Replace"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
             }
+        }
+    }
+
+    if !harness && viewer != "": Rectangle {
+        background: #000000;
+        Rectangle { background: bg.with-alpha(0.30); width: parent.width; height: parent.height; }
+        if viewer != "hidden" && viewer != "slideshow": Rectangle {
+            y: 16px;
+            x: 16px;
+            width: parent.width - 32px;
+            height: 40px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 12px;
+                alignment: center;
+                Text { text: "󰁍"; font-size: 16px; color: text; }
+                Text { text: "dune-sunset-0412.jpg"; font-size: 13px; font-weight: 700; color: text; horizontal-stretch: 1; }
+                Text { text: "6 / 248"; font-size: 11px; color: muted; }
+                Text { text: "󰋽"; font-size: 16px; color: text; }
+                Text { text: "󰐊"; font-size: 16px; color: text; }
+            }
+        }
+        if viewer == "zoom": Rectangle {
+            x: parent.width - 16px - 120px;
+            y: parent.height - 16px - 80px - 70px;
+            width: 120px;
+            height: 80px;
+            background: bg.with-alpha(0.86);
+            border-width: 1px;
+            border-color: accent;
+        }
+        if viewer == "info": Rectangle {
+            x: parent.width - 16px - 300px;
+            y: 72px;
+            width: 300px;
+            height: parent.height - 160px;
+            background: bg.with-alpha(0.92);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 6px;
+                Text { text: "dune-sunset-0412.jpg"; font-size: 13px; font-weight: 700; color: text; }
+                Text { text: "~/Pictures/tatooine-trip"; font-size: 11px; color: muted; }
+                Text { text: "FILE"; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; }
+                Text { text: "Size          6.2 MB"; font-size: 12px; color: text; height: 20px; }
+                Text { text: "Type          JPEG"; font-size: 12px; color: text; height: 20px; }
+                Text { text: "Dimensions    6000 × 4000"; font-size: 12px; color: text; height: 20px; }
+            }
+        }
+        if viewer == "image" || viewer == "zoom" || viewer == "hidden" || viewer == "info" || viewer == "slideshow": Rectangle {
+            x: (parent.width - 480px) / 2;
+            y: viewer == "hidden" || viewer == "slideshow" ? (parent.height - 270px) / 2 : 80px;
+            width: 480px;
+            height: 270px;
+            background: accent.with-alpha(0.35);
+        }
+        if viewer != "hidden" && viewer != "slideshow" && viewer != "video" && viewer != "scrub" && viewer != "resume": Rectangle {
+            y: parent.height - 16px - 46px;
+            x: (parent.width - 420px) / 2;
+            width: 420px;
+            height: 46px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            HorizontalLayout {
+                alignment: center;
+                spacing: 16px;
+                Text { text: "󰁍   󰁔   −   fit   1:1   +   󰑙"; font-size: 14px; color: text; vertical-alignment: center; }
+            }
+        }
+        if viewer == "video" || viewer == "scrub" || viewer == "resume": Rectangle {
+            y: parent.height - 16px - 46px;
+            x: 60px;
+            width: parent.width - 120px;
+            height: 46px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 12px;
+                alignment: center;
+                Text { text: viewer == "video" ? "󰐊" : "󰏤"; font-size: 16px; color: text; }
+                Text { text: "01:12 / 04:30"; font-size: 11px; color: muted; }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: viewer == "scrub" ? 5px : 3px;
+                    border-radius: 2px;
+                    background: text.with-alpha(0.20);
+                    Rectangle { width: parent.width * 0.27; height: parent.height; background: accent; }
+                }
+                if viewer == "scrub": Rectangle {
+                    width: 12px;
+                    height: 12px;
+                    border-radius: 6px;
+                    background: text;
+                    border-width: 2px;
+                    border-color: accent;
+                }
+                Text { text: "1.0×"; font-size: 11px; color: text; }
+                Text { text: "󰕾"; font-size: 16px; color: text; }
+            }
+        }
+        if viewer == "resume": Rectangle {
+            x: (parent.width - 280px) / 2;
+            y: parent.height - 90px;
+            width: 280px;
+            height: 40px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            Text { text: "Resume at 02:14?"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        if viewer == "slideshow": Rectangle {
+            y: parent.height - 2px;
+            height: 2px;
+            width: parent.width * 0.4;
+            background: accent;
         }
     }
 

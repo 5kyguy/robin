@@ -48,6 +48,16 @@ pub fn known(view: &str) -> bool {
             | "reduce-motion"
             | "theme-black-list"
             | "theme-black-grid"
+            | "viewer-image"
+            | "viewer-hidden"
+            | "viewer-zoom-400"
+            | "viewer-video"
+            | "viewer-scrub"
+            | "viewer-resume"
+            | "viewer-info"
+            | "viewer-slideshow"
+            | "shortcuts-viewer"
+            | "theme-black-viewer"
     )
 }
 
@@ -195,7 +205,21 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "progress-3" => "progress-3",
             "progress-error" => "progress-error",
             "menu-file" => "menu-file",
-            "shortcuts-browser" => "shortcuts",
+            "shortcuts-browser" | "shortcuts-viewer" => "shortcuts",
+            _ => "",
+        }
+        .into(),
+    );
+    ui.set_viewer(
+        match view {
+            "viewer-image" | "theme-black-viewer" => "image",
+            "viewer-hidden" => "hidden",
+            "viewer-zoom-400" => "zoom",
+            "viewer-video" => "video",
+            "viewer-scrub" => "scrub",
+            "viewer-resume" => "resume",
+            "viewer-info" => "info",
+            "viewer-slideshow" => "slideshow",
             _ => "",
         }
         .into(),

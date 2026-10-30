@@ -12,6 +12,7 @@ pub mod safety;
 pub mod shots;
 pub mod theme;
 pub mod thumbs;
+pub mod video;
 
 pub use error::{Error, Result};
 
