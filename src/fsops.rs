@@ -1708,6 +1708,13 @@ fn deletion_date() -> String {
     format_deletion_date(secs, local_offset(secs))
 }
 
+/// A modification time in local time for the conflict dialog:
+/// "2026-10-30 18:58".
+pub fn short_date(secs: i64) -> String {
+    let full = format_deletion_date(secs, local_offset(secs));
+    full[..16].replace('T', " ")
+}
+
 /// Seconds east of UTC for the local zone at `secs`.
 fn local_offset(secs: i64) -> i64 {
     let t = secs as libc::time_t;
@@ -2135,6 +2142,15 @@ mod tests {
         assert!(err.to_string().contains("nothing was replaced"), "{err}");
         assert_eq!(std::fs::read(root.join("src")).unwrap(), b"mine");
         assert_eq!(racers(&root), KEEP_BOTH_TRIES);
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".robin-partial-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -71,6 +71,9 @@ pub fn known(view: &str) -> bool {
             | "cut"
             | "dnd-copy"
             | "dnd-move"
+            | "dnd-refused"
+            | "conflict-live"
+            | "move-refused-many"
             | "progress"
             | "confirm-delete"
             | "undo"
@@ -252,6 +255,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             .map(|l| RefusalLine {
                 path: l.path.into(),
                 note: l.note.unwrap_or_default().into(),
+                head: false,
             })
             .collect::<Vec<_>>(),
     ))));
@@ -276,15 +280,17 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "confirm-delete-permanent" => "delete",
             "conflict" => "conflict",
             "conflict-all" => "conflict-all",
+            "conflict-live" => "conflict-live",
             "progress-1" => "progress-1",
             "progress-3" => "progress-3",
             "progress-error" => "progress-error",
             "skipped" => "skipped",
             "skipped-details" => "skipped-details",
             "move-partial" => "toast-details",
-            "move-refused" | "move-refused-unreadable" | "move-refused-unreadable-two" => {
-                "move-refused"
-            }
+            "move-refused"
+            | "move-refused-unreadable"
+            | "move-refused-unreadable-two"
+            | "move-refused-many" => "move-refused",
             "menu-file" => "menu-file",
             "shortcuts-browser" | "shortcuts-viewer" => "shortcuts",
             _ => "",
@@ -742,6 +748,7 @@ fn row(
         badge: badge.into(),
         cut: false,
         drop: false,
+        drop_refused: false,
     }
 }
 
@@ -949,6 +956,67 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
             );
             ui.set_drag_glyph(if copy { "󰆏" } else { "󰪹" }.into());
         }
+        "dnd-refused" => {
+            // Dragging raw-exports back over itself: muted, no accent.
+            rows[0].selected = true;
+            rows[0].hovered = false;
+            rows[0].drop_refused = true;
+            ui.set_status_left("15 items · 1 selected".into());
+            ui.set_drag_label("Can't drop into itself".into());
+            ui.set_drag_glyph("󰜺".into());
+        }
+        "conflict-live" => {
+            let ask = crate::app::ConflictAsk {
+                prompt: crate::fsops::ConflictPrompt {
+                    name: "speeder-run.mp4".into(),
+                    existing_size: 48_300_000,
+                    existing_mtime: 1_792_000_000,
+                    incoming_size: 51_700_000,
+                    incoming_mtime: 1_793_400_000,
+                },
+                dest: "SANDISK".into(),
+                left: 4,
+            };
+            crate::app::conflict_props(ui, &ask, false);
+            ui.set_dialog_focus(1);
+        }
+        "move-refused-many" => {
+            use crate::fsops::{KeepReason, KeptEntry};
+            let kept = |p: &str, reason| KeptEntry {
+                path: p.into(),
+                reason,
+            };
+            let mut fonts: Vec<KeptEntry> = (1..=9)
+                .map(|i| {
+                    kept(
+                        &format!("Projects/vendor/fonts/Face-{i}.ttf"),
+                        KeepReason::ReadOnlyFolder,
+                    )
+                })
+                .collect();
+            fonts.push(kept("Projects/.cache", KeepReason::StickyFolder));
+            let mut refused: Vec<(std::ffi::OsString, Vec<KeptEntry>)> = vec![
+                ("Projects".into(), fonts),
+                (
+                    "holo-backup".into(),
+                    vec![kept("holo-backup/2026", KeepReason::ReadOnlyFilesystem)],
+                ),
+                (
+                    "shared".into(),
+                    vec![kept("shared/team.md", KeepReason::StickyFolder)],
+                ),
+            ];
+            // Enough items that the list scrolls instead of growing.
+            for name in ["tatooine-trip", "raw-exports", "archive-2025", "renders"] {
+                refused.push((
+                    name.into(),
+                    vec![kept(&format!("{name}/locked"), KeepReason::ReadOnlyFolder)],
+                ));
+            }
+            let view = crate::app::refusal_view(&refused);
+            crate::app::set_refusal(ui, &view);
+            ui.set_dialog_focus(i32::from(view.can_copy));
+        }
         "progress" => {
             ui.set_job_on(true);
             ui.set_job_glyph("󰆏".into());
@@ -993,7 +1061,7 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
         }
         _ => return,
     }
-    if matches!(view, "cut" | "dnd-copy" | "dnd-move") {
+    if matches!(view, "cut" | "dnd-copy" | "dnd-move" | "dnd-refused") {
         ui.set_files(ModelRc::new(Rc::new(VecModel::from(rows))));
     }
 }
