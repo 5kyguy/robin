@@ -383,6 +383,471 @@ pub struct MoveOpts<'a> {
     pub force_copy: bool,
     pub fail_before_unlink: bool,
     pub copy: CopyOpts<'a>,
+    /// What moved and what was left behind, for the completion toast.
+    pub report: TransferReport,
+    /// Walk the source first and refuse the move if anything in it could
+    /// not be removed after copying. Tests turn it off to reach the
+    /// fallback for removals that fail after the check.
+    pub check_removable: bool,
+    /// Copy only: never remove the source. Set by [`copy_instead`].
+    pub keep_source: bool,
+}
+
+/// Why a copied original could not be removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeepReason {
+    /// The folder holding the entry is not writable by us.
+    ReadOnlyFolder,
+    /// The folder is sticky and neither it nor the entry is ours.
+    StickyFolder,
+    ReadOnlyFilesystem,
+    /// A folder we can't open, so nothing inside it can be removed.
+    UnreadableFolder,
+}
+
+impl KeepReason {
+    pub fn describe(self) -> &'static str {
+        match self {
+            KeepReason::ReadOnlyFolder => "read-only folder",
+            KeepReason::StickyFolder => "shared folder owned by someone else",
+            KeepReason::ReadOnlyFilesystem => "read-only drive",
+            KeepReason::UnreadableFolder => "folder can't be opened",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptEntry {
+    /// Relative to the moved item, starting with its own name.
+    pub path: std::path::PathBuf,
+    pub reason: KeepReason,
+}
+
+/// How a transfer ended, for picking the toast.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferStatus {
+    Complete,
+    /// Some entries were skipped on purpose and stay in the source.
+    Skipped,
+    /// Everything was copied but some originals could not be removed.
+    Partial,
+}
+
+fn keep_reason(err: &Error, sticky: bool) -> Option<KeepReason> {
+    if io_is(err, Errno::PERM) && sticky {
+        Some(KeepReason::StickyFolder)
+    } else if io_is(err, Errno::ACCESS) || io_is(err, Errno::PERM) {
+        Some(KeepReason::ReadOnlyFolder)
+    } else if io_is(err, Errno::ROFS) {
+        Some(KeepReason::ReadOnlyFilesystem)
+    } else {
+        None
+    }
+}
+
+/// Why a cross-device move left an entry where it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Another filesystem is mounted here. Moving would empty that volume.
+    MountPoint,
+    Fifo,
+    Socket,
+    Device,
+}
+
+impl SkipReason {
+    pub fn describe(self) -> &'static str {
+        match self {
+            SkipReason::MountPoint => "another drive is mounted here",
+            SkipReason::Fifo => "named pipes are not copied",
+            SkipReason::Socket => "sockets are not copied",
+            SkipReason::Device => "device files are not copied",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedEntry {
+    /// Relative to the moved item, starting with its own name.
+    pub path: std::path::PathBuf,
+    pub reason: SkipReason,
+}
+
+/// The result of a transfer. Skipped entries stay in the source and are
+/// listed so they never vanish silently.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransferReport {
+    /// Files and symlinks copied to the destination.
+    pub moved: usize,
+    pub skipped: Vec<SkippedEntry>,
+    /// Copied, but the original is still in the source.
+    pub left_behind: Vec<KeptEntry>,
+}
+
+impl TransferReport {
+    pub fn status(&self) -> TransferStatus {
+        if !self.left_behind.is_empty() {
+            TransferStatus::Partial
+        } else if !self.skipped.is_empty() {
+            TransferStatus::Skipped
+        } else {
+            TransferStatus::Complete
+        }
+    }
+
+    /// The toast line, e.g. "Moved 212 items, skipped 3".
+    pub fn summary(&self) -> String {
+        let items = if self.moved == 1 { "item" } else { "items" };
+        if let Some(first) = self.left_behind.first() {
+            let mixed = self.left_behind.iter().any(|k| k.reason != first.reason);
+            let why = if mixed {
+                "see details"
+            } else {
+                first.reason.describe()
+            };
+            return format!(
+                "Copied {} {items}, but couldn't remove the originals ({why})",
+                self.moved
+            );
+        }
+        if self.skipped.is_empty() {
+            format!("Moved {} {items}", self.moved)
+        } else {
+            format!(
+                "Moved {} {items}, skipped {}",
+                self.moved,
+                self.skipped.len()
+            )
+        }
+    }
+
+    /// One line per skipped entry for the Details list.
+    pub fn details(&self) -> Vec<String> {
+        let kept = self.left_behind.iter().map(|k| {
+            format!(
+                "{} — left behind: {}",
+                k.path.display(),
+                k.reason.describe()
+            )
+        });
+        let skipped = self
+            .skipped
+            .iter()
+            .map(|s| format!("{} — {}", s.path.display(), s.reason.describe()));
+        kept.chain(skipped).collect()
+    }
+}
+
+/// The up-front refusal, worded for the move-refused dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// "Can't move Projects: 1 folder inside is read-only" for one reason,
+    /// "Can't move Projects: 2 items can't be removed afterwards" for several.
+    pub title: String,
+    /// The blocking paths: the read-only or unreadable folders themselves,
+    /// and the items in shared folders or on read-only drives.
+    pub lines: Vec<RefusalLine>,
+    /// False when a folder can't be read: it can't be copied either, so the
+    /// dialog offers a single Close button.
+    pub can_copy_instead: bool,
+    /// Label of the button that dismisses the dialog: "Cancel" next to
+    /// Copy instead, "Close" when it is the only button.
+    pub dismiss_label: &'static str,
+}
+
+/// One blocking path in the dialog, with a note shown under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusalLine {
+    pub path: String,
+    pub note: Option<String>,
+}
+
+pub const UNREADABLE_NOTE: &str = "Robin can't read this folder, so it can't be copied either.";
+
+/// What the move-refused dialog offers. Copy instead is the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RefusalChoice {
+    #[default]
+    CopyInstead,
+    Cancel,
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+pub fn refusal(name: &str, blocked: &[KeptEntry]) -> Refusal {
+    let mut folders: Vec<std::path::PathBuf> = Vec::new();
+    let mut shared = Vec::new();
+    let mut drive = Vec::new();
+    let mut locked = Vec::new();
+    for k in blocked {
+        match k.reason {
+            KeepReason::ReadOnlyFolder => {
+                let dir = k.path.parent().unwrap_or(&k.path).to_path_buf();
+                if !folders.contains(&dir) {
+                    folders.push(dir);
+                }
+            }
+            KeepReason::StickyFolder => shared.push(k.path.clone()),
+            KeepReason::ReadOnlyFilesystem => drive.push(k.path.clone()),
+            KeepReason::UnreadableFolder => locked.push(k.path.clone()),
+        }
+    }
+    let mut parts = Vec::new();
+    if !folders.is_empty() {
+        let verb = if folders.len() == 1 { "is" } else { "are" };
+        parts.push(format!(
+            "{} inside {verb} read-only",
+            plural(folders.len(), "folder", "folders")
+        ));
+    }
+    if !locked.is_empty() {
+        parts.push(format!(
+            "{} inside can't be opened",
+            plural(locked.len(), "folder", "folders")
+        ));
+    }
+    if !shared.is_empty() {
+        let verb = if shared.len() == 1 {
+            "belongs"
+        } else {
+            "belong"
+        };
+        parts.push(format!(
+            "{} {verb} to someone else",
+            plural(shared.len(), "item", "items")
+        ));
+    }
+    if !drive.is_empty() {
+        parts.push("the drive is read-only".to_string());
+    }
+    let line = |p: &std::path::PathBuf, note: Option<&str>| RefusalLine {
+        path: p.display().to_string(),
+        note: note.map(str::to_string),
+    };
+    let lines = folders
+        .iter()
+        .map(|p| line(p, None))
+        .chain(locked.iter().map(|p| line(p, Some(UNREADABLE_NOTE))))
+        .chain(shared.iter().chain(&drive).map(|p| line(p, None)))
+        .collect();
+    let can_copy_instead = locked.is_empty();
+    let why = if parts.len() == 1 {
+        parts.remove(0)
+    } else {
+        format!(
+            "{} can't be removed afterwards",
+            plural(blocked.len(), "item", "items")
+        )
+    };
+    Refusal {
+        title: format!("Can't move {name}: {why}"),
+        lines,
+        can_copy_instead,
+        dismiss_label: if can_copy_instead { "Cancel" } else { "Close" },
+    }
+}
+
+impl Refusal {
+    /// Lines that carry a note; the dialog grows one row for each.
+    pub fn note_count(&self) -> usize {
+        self.lines.iter().filter(|l| l.note.is_some()).count()
+    }
+}
+
+/// Copy `from` to `to` without touching the source: the move-refused
+/// dialog's Copy instead.
+pub fn copy_instead(
+    parent: &DirFd,
+    from: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    to: &std::ffi::OsStr,
+    copy: CopyOpts<'_>,
+) -> Result<(CopyOutcome, TransferReport)> {
+    // A folder we can't open can't be copied either: refuse before copying.
+    let from_c = component(from)?;
+    let stat = rustix::fs::statat(parent.as_fd(), from_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(from, e))?;
+    let mut blocked = Vec::new();
+    removal_blockers(parent, from, stat.st_dev, Path::new(from), 0, &mut blocked)?;
+    blocked.retain(|k| k.reason == KeepReason::UnreadableFolder);
+    if !blocked.is_empty() {
+        return Err(Error::Unreadable(blocked));
+    }
+    let mut opts = MoveOpts {
+        force_copy: true,
+        fail_before_unlink: false,
+        copy,
+        report: TransferReport::default(),
+        check_removable: false,
+        keep_source: true,
+    };
+    let outcome = move_child(parent, from, dest_parent, to, &mut opts)?;
+    Ok((outcome, opts.report))
+}
+
+/// Act on the move-refused dialog. Cancel does nothing and returns `None`.
+pub fn resolve_refusal(
+    choice: RefusalChoice,
+    parent: &DirFd,
+    from: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    to: &std::ffi::OsStr,
+    copy: CopyOpts<'_>,
+) -> Result<Option<(CopyOutcome, TransferReport)>> {
+    match choice {
+        RefusalChoice::Cancel => Ok(None),
+        RefusalChoice::CopyInstead => copy_instead(parent, from, dest_parent, to, copy).map(Some),
+    }
+}
+
+/// Collect every entry under `from` that a move could copy but not remove.
+fn removal_blockers(
+    parent: &DirFd,
+    from: &std::ffi::OsStr,
+    root_dev: u64,
+    rel: &Path,
+    depth: u32,
+    out: &mut Vec<KeptEntry>,
+) -> Result<()> {
+    if depth >= MAX_DEPTH {
+        return Err(Error::Message("directory is too deep".into()));
+    }
+    let c = component(from)?;
+    let stat = rustix::fs::statat(parent.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(from, e))?;
+    let kind = classify(stat.st_mode, stat.st_dev, root_dev);
+    if let EntryKind::Skip(_) = kind {
+        return Ok(());
+    }
+    if let Some(reason) = removal_denied(parent, &stat, rel)? {
+        out.push(KeptEntry {
+            path: rel.to_path_buf(),
+            reason,
+        });
+    }
+    if kind == EntryKind::Dir {
+        let opened = parent.open_dir_nofollow(from).and_then(|child| {
+            let entries = child.list()?;
+            Ok((child, entries))
+        });
+        let (child, entries) = match opened {
+            Ok(v) => v,
+            Err(e) if io_is(&e, Errno::ACCESS) || io_is(&e, Errno::PERM) => {
+                out.push(KeptEntry {
+                    path: rel.to_path_buf(),
+                    reason: KeepReason::UnreadableFolder,
+                });
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            removal_blockers(
+                &child,
+                &entry.name,
+                root_dev,
+                &rel.join(&entry.name),
+                depth + 1,
+                out,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether unlinking an entry with `stat` from `parent` would be refused.
+/// Only a permission answer is a reason; any other failure is an error.
+fn removal_denied(
+    parent: &DirFd,
+    stat: &rustix::fs::Stat,
+    rel: &Path,
+) -> Result<Option<KeepReason>> {
+    match rustix::fs::accessat(
+        parent.as_fd(),
+        c".",
+        rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+        AtFlags::EACCESS,
+    ) {
+        Ok(()) => {}
+        Err(Errno::ROFS) => return Ok(Some(KeepReason::ReadOnlyFilesystem)),
+        Err(Errno::ACCESS | Errno::PERM) => return Ok(Some(KeepReason::ReadOnlyFolder)),
+        Err(e) => return Err(Error::from_errno(rel, e)),
+    }
+    let dir = rustix::fs::fstat(parent.as_fd()).map_err(|e| Error::from_errno(rel, e))?;
+    if sticky_blocks(&dir, stat) {
+        return Ok(Some(KeepReason::StickyFolder));
+    }
+    Ok(None)
+}
+
+/// A sticky folder lets only the entry's owner, the folder's owner, or root
+/// remove an entry.
+fn sticky_blocks(dir: &rustix::fs::Stat, entry: &rustix::fs::Stat) -> bool {
+    let uid = rustix::process::geteuid().as_raw();
+    dir.st_mode & 0o1000 != 0 && uid != 0 && uid != entry.st_uid && uid != dir.st_uid
+}
+
+/// Whether `from` in `parent` is held by sticky-folder rules.
+fn sticky_denies(parent: &DirFd, from: &std::ffi::OsStr) -> bool {
+    let Ok(c) = component(from) else {
+        return false;
+    };
+    let (Ok(dir), Ok(entry)) = (
+        rustix::fs::fstat(parent.as_fd()),
+        rustix::fs::statat(parent.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW),
+    ) else {
+        return false;
+    };
+    sticky_blocks(&dir, &entry)
+}
+
+impl TransferReport {
+    /// Record a removal that failed after the copy. `parent` and `from`
+    /// are used to tell a sticky folder's EPERM from a read-only one.
+    fn keep(
+        &mut self,
+        parent: &DirFd,
+        from: &std::ffi::OsStr,
+        rel: &Path,
+        err: Error,
+    ) -> Result<CopyOutcome> {
+        match keep_reason(&err, sticky_denies(parent, from)) {
+            Some(reason) => {
+                self.left_behind.push(KeptEntry {
+                    path: rel.to_path_buf(),
+                    reason,
+                });
+                Ok(CopyOutcome::Skipped)
+            }
+            None => Err(err),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryKind {
+    Dir,
+    File,
+    Symlink,
+    Skip(SkipReason),
+}
+
+/// Decide how a cross-device move treats an entry. Anything on a different
+/// device than the moved root is a mount point and is never descended into.
+fn classify(mode: u32, dev: u64, root_dev: u64) -> EntryKind {
+    if dev != root_dev {
+        return EntryKind::Skip(SkipReason::MountPoint);
+    }
+    match mode & 0o170000 {
+        0o040000 => EntryKind::Dir,
+        0o100000 => EntryKind::File,
+        0o120000 => EntryKind::Symlink,
+        0o010000 => EntryKind::Skip(SkipReason::Fifo),
+        0o140000 => EntryKind::Skip(SkipReason::Socket),
+        _ => EntryKind::Skip(SkipReason::Device),
+    }
 }
 
 /// Move by rename when it works. `force_copy` exercises the cross-device path.
@@ -397,39 +862,162 @@ pub fn move_child(
     if !opts.force_copy {
         let from_c = component(from)?;
         let to_c = component(to)?;
-        match rename_noreplace(parent.as_fd(), &from_c, dest_parent.as_fd(), &to_c) {
-            Ok(()) => return Ok(CopyOutcome::Copied),
-            Err(err) if err == Errno::XDEV => {}
-            Err(err) if err == Errno::EXIST => {
-                return replace_or_rename(parent, from, dest_parent, to, &mut opts.copy);
-            }
+        let outcome = match rename_noreplace(parent.as_fd(), &from_c, dest_parent.as_fd(), &to_c) {
+            Ok(()) => Some(CopyOutcome::Copied),
+            Err(err) if err == Errno::XDEV => None,
+            Err(err) if err == Errno::EXIST => Some(replace_or_rename(
+                parent,
+                from,
+                dest_parent,
+                to,
+                &mut opts.copy,
+            )?),
             Err(err) => return Err(Error::from_errno(to, err)),
+        };
+        if let Some(outcome) = outcome {
+            if outcome == CopyOutcome::Copied {
+                opts.report.moved += 1;
+            }
+            return Ok(outcome);
         }
     }
-    if is_directory(parent, from)? {
-        return move_directory(parent, from, dest_parent, to, opts, 0);
+    let from_c = component(from)?;
+    let stat = rustix::fs::statat(parent.as_fd(), from_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(from, e))?;
+    let rel = std::path::PathBuf::from(from);
+    if opts.check_removable && !opts.keep_source {
+        let mut blocked = Vec::new();
+        removal_blockers(parent, from, stat.st_dev, &rel, 0, &mut blocked)?;
+        if !blocked.is_empty() {
+            return Err(Error::NotRemovable(blocked));
+        }
     }
-    if copy_file(parent, from, dest_parent, to, &mut opts.copy)? == CopyOutcome::Skipped {
+    move_entry(parent, from, dest_parent, to, opts, stat.st_dev, &rel, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn move_entry(
+    parent: &DirFd,
+    from: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    to: &std::ffi::OsStr,
+    opts: &mut MoveOpts<'_>,
+    root_dev: u64,
+    rel: &Path,
+    depth: u32,
+) -> Result<CopyOutcome> {
+    if opts.copy.cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let from_c = component(from)?;
+    let stat = rustix::fs::statat(parent.as_fd(), from_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(from, e))?;
+    match classify(stat.st_mode, stat.st_dev, root_dev) {
+        EntryKind::Skip(reason) => {
+            opts.report.skipped.push(SkippedEntry {
+                path: rel.to_path_buf(),
+                reason,
+            });
+            Ok(CopyOutcome::Skipped)
+        }
+        EntryKind::Dir => move_directory(parent, from, dest_parent, to, opts, root_dev, rel, depth),
+        EntryKind::Symlink => move_symlink(parent, from, dest_parent, to, &stat, opts, rel),
+        EntryKind::File => {
+            if copy_file(parent, from, dest_parent, to, &mut opts.copy)? == CopyOutcome::Skipped {
+                return Ok(CopyOutcome::Skipped);
+            }
+            rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(to, e))?;
+            if opts.fail_before_unlink {
+                return Err(Error::Message(
+                    "injected failure before unlinking the source".into(),
+                ));
+            }
+            opts.report.moved += 1;
+            if opts.keep_source {
+                return Ok(CopyOutcome::Copied);
+            }
+            match remove_child(parent, from, &mut |_| {}, opts.copy.cancel) {
+                Ok(()) => Ok(CopyOutcome::Copied),
+                Err(err) => opts.report.keep(parent, from, rel, err),
+            }
+        }
+    }
+}
+
+/// Recreate a symlink on the destination with the same target, then unlink
+/// the source link. The target is never followed.
+fn move_symlink(
+    parent: &DirFd,
+    from: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    to: &std::ffi::OsStr,
+    stat: &rustix::fs::Stat,
+    opts: &mut MoveOpts<'_>,
+    rel: &Path,
+) -> Result<CopyOutcome> {
+    let from_c = component(from)?;
+    let target = rustix::fs::readlinkat(parent.as_fd(), from_c.as_c_str(), Vec::new())
+        .map_err(|e| Error::from_errno(from, e))?;
+    let Some(dest_name) = resolve_dest_name(dest_parent, to, stat, &mut opts.copy)? else {
         return Ok(CopyOutcome::Skipped);
+    };
+    if exists(dest_parent, dest_name.as_os_str())?
+        && is_directory(dest_parent, dest_name.as_os_str())?
+    {
+        return Err(Error::Message(format!(
+            "refusing to replace directory {} with a symlink",
+            dest_name.to_string_lossy()
+        )));
     }
-    rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(to, e))?;
+    let to_c = component(dest_name.as_os_str())?;
+    let tmp = std::ffi::OsString::from(partial_name());
+    let tmp_c = component(tmp.as_os_str())?;
+    rustix::fs::symlinkat(target.as_c_str(), dest_parent.as_fd(), tmp_c.as_c_str())
+        .map_err(|e| Error::from_errno(&tmp, e))?;
+    let mut guard = UnlinkOnDrop {
+        dir: dest_parent.as_fd(),
+        name: tmp_c,
+        live: true,
+    };
+    rustix::fs::renameat(
+        dest_parent.as_fd(),
+        guard.name.as_c_str(),
+        dest_parent.as_fd(),
+        to_c.as_c_str(),
+    )
+    .map_err(|e| Error::from_errno(&dest_name, e))?;
+    guard.live = false;
+    rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
     if opts.fail_before_unlink {
         return Err(Error::Message(
             "injected failure before unlinking the source".into(),
         ));
     }
-    remove_child(parent, from, &mut |_| {}, opts.copy.cancel)?;
-    Ok(CopyOutcome::Copied)
+    opts.report.moved += 1;
+    if opts.keep_source {
+        return Ok(CopyOutcome::Copied);
+    }
+    match rustix::fs::unlinkat(parent.as_fd(), from_c.as_c_str(), AtFlags::empty()) {
+        Ok(()) => Ok(CopyOutcome::Copied),
+        Err(e) => opts
+            .report
+            .keep(parent, from, rel, Error::from_errno(from, e)),
+    }
 }
 
 /// Copy a directory across devices. The source directory is removed only when
-/// every child was [`CopyOutcome::Copied`].
+/// every child was [`CopyOutcome::Copied`]. A new destination directory is
+/// created private and writable, and gets the source mode and times only
+/// after its children are in, so a read-only source still copies.
+#[allow(clippy::too_many_arguments)]
 fn move_directory(
     parent: &DirFd,
     from: &std::ffi::OsStr,
     dest_parent: &DirFd,
     to: &std::ffi::OsStr,
     opts: &mut MoveOpts<'_>,
+    root_dev: u64,
+    rel: &Path,
     depth: u32,
 ) -> Result<CopyOutcome> {
     if opts.copy.cancel.is_cancelled() {
@@ -445,41 +1033,66 @@ fn move_directory(
     let Some(dest_name) = dest_name else {
         return Ok(CopyOutcome::Skipped);
     };
-    if exists(dest_parent, dest_name.as_os_str())? {
+    let created = if exists(dest_parent, dest_name.as_os_str())? {
         if !is_directory(dest_parent, dest_name.as_os_str())? {
             return Err(Error::Message(format!(
                 "refusing to replace a file with directory {}",
                 dest_name.to_string_lossy()
             )));
         }
+        false
     } else {
         let c = component(dest_name.as_os_str())?;
         rustix::fs::mkdirat(
             dest_parent.as_fd(),
             c.as_c_str(),
-            Mode::from_raw_mode(stat.st_mode & 0o777),
+            Mode::from_raw_mode(0o700),
         )
         .map_err(|e| Error::from_errno(&dest_name, e))?;
-    }
+        true
+    };
     let src = parent.open_dir_nofollow(from)?;
     let dst = dest_parent.open_dir_nofollow(dest_name.as_os_str())?;
     let mut all_copied = true;
-    for entry in src.list()? {
-        let outcome = if is_directory(&src, &entry.name)? {
-            move_directory(&src, &entry.name, &dst, &entry.name, opts, depth + 1)?
-        } else {
-            move_child(&src, &entry.name, &dst, &entry.name, opts)?
-        };
-        if outcome == CopyOutcome::Skipped {
-            all_copied = false;
+    // Children first; the mode and times are applied even if a child fails,
+    // so a partial copy does not stay 0700 or carry the copy time.
+    let children = (|| -> Result<()> {
+        for entry in src.list()? {
+            let child_rel = rel.join(&entry.name);
+            let outcome = move_entry(
+                &src,
+                &entry.name,
+                &dst,
+                &entry.name,
+                opts,
+                root_dev,
+                &child_rel,
+                depth + 1,
+            )?;
+            if outcome == CopyOutcome::Skipped {
+                all_copied = false;
+            }
         }
+        Ok(())
+    })();
+    if created {
+        rustix::fs::fchmod(dst.as_fd(), Mode::from_raw_mode(stat.st_mode & 0o777))
+            .map_err(|e| Error::from_errno(&dest_name, e))?;
+        set_times(dst.as_fd(), &stat).map_err(|e| Error::from_errno(&dest_name, e))?;
     }
+    children?;
     rustix::fs::fsync(dst.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
     if !all_copied {
         return Ok(CopyOutcome::Skipped);
     }
-    rustix::fs::unlinkat(parent.as_fd(), from_c.as_c_str(), AtFlags::REMOVEDIR)
-        .map_err(|e| Error::from_errno(from, e))?;
+    if opts.keep_source {
+        return Ok(CopyOutcome::Copied);
+    }
+    if let Err(e) = rustix::fs::unlinkat(parent.as_fd(), from_c.as_c_str(), AtFlags::REMOVEDIR) {
+        return opts
+            .report
+            .keep(parent, from, rel, Error::from_errno(from, e));
+    }
     rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
     Ok(CopyOutcome::Copied)
 }
@@ -960,24 +1573,42 @@ fn deletion_date() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0))
         .as_secs() as i64;
-    format_deletion_date(secs)
+    format_deletion_date(secs, local_offset(secs))
 }
 
-fn format_deletion_date(secs: i64) -> String {
+/// Seconds east of UTC for the local zone at `secs`.
+fn local_offset(secs: i64) -> i64 {
     let t = secs as libc::time_t;
     let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
     let ok = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
-    if !ok {
-        return String::from("1970-01-01T00:00:00");
+    if ok {
+        tm.tm_gmtoff as i64
+    } else {
+        0
     }
+}
+
+/// `DeletionDate` is local time without a zone, so the offset is applied
+/// here. Pure, so tests do not touch `TZ`.
+fn format_deletion_date(secs: i64, offset: i64) -> String {
+    let t = secs + offset;
+    let days = t.div_euclid(86_400);
+    let rem = t.rem_euclid(86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
     )
 }
 
@@ -1268,6 +1899,9 @@ mod tests {
                 force_copy: false,
                 fail_before_unlink: false,
                 copy: opts(&cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
+                check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap();
@@ -1293,6 +1927,9 @@ mod tests {
                 force_copy: true,
                 fail_before_unlink: true,
                 copy: opts(&cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
+                check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap_err();
@@ -1325,6 +1962,9 @@ mod tests {
                 force_copy: true,
                 fail_before_unlink: false,
                 copy: opts(&cancel, &mut policy, &mut skip),
+                report: TransferReport::default(),
+                check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap();
@@ -1368,6 +2008,9 @@ mod tests {
                 force_copy: true,
                 fail_before_unlink: false,
                 copy: opts(&cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
+                check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap();
@@ -1400,6 +2043,9 @@ mod tests {
                 force_copy: true,
                 fail_before_unlink: false,
                 copy: opts(&cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
+                check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap();
@@ -1438,6 +2084,9 @@ mod tests {
                 force_copy: false,
                 fail_before_unlink: false,
                 copy: opts(&cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
+                check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap();
@@ -1451,6 +2100,9 @@ mod tests {
                 force_copy: false,
                 fail_before_unlink: false,
                 copy: opts(&cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
+                check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap();
@@ -1559,29 +2211,21 @@ mod tests {
 
     #[test]
     fn deletion_date_is_local_not_utc() {
-        let prev = std::env::var_os("TZ");
-        std::env::set_var("TZ", "EST5");
-        reload_tz();
         assert_eq!(
-            format_deletion_date(1_700_000_000),
+            format_deletion_date(1_700_000_000, -5 * 3600),
             "2023-11-14T17:13:20",
             "DeletionDate must be local time"
         );
-        std::env::set_var("TZ", "UTC0");
-        reload_tz();
-        assert_eq!(format_deletion_date(1_700_000_000), "2023-11-14T22:13:20");
-        match prev {
-            Some(value) => std::env::set_var("TZ", value),
-            None => std::env::remove_var("TZ"),
-        }
-        reload_tz();
-    }
-
-    fn reload_tz() {
-        extern "C" {
-            fn tzset();
-        }
-        unsafe { tzset() }
+        assert_eq!(
+            format_deletion_date(1_700_000_000, 0),
+            "2023-11-14T22:13:20"
+        );
+        assert_eq!(
+            format_deletion_date(1_700_000_000, 5 * 3600 + 1800),
+            "2023-11-15T03:43:20"
+        );
+        assert_eq!(format_deletion_date(951_782_400, 0), "2000-02-29T00:00:00");
+        assert_eq!(format_deletion_date(0, -3600), "1969-12-31T23:00:00");
     }
 
     #[test]
@@ -1822,6 +2466,527 @@ mod tests {
         assert!(xattr_errno(Errno::NOTSUP).is_ok());
         let err = xattr_errno(Errno::PERM).unwrap_err();
         assert!(err.to_string().contains("xattr"), "{err}");
+    }
+
+    fn cross_device_move(root: &Path, from: &str, to: &str) -> (CopyOutcome, TransferReport) {
+        let dir = DirFd::open(root).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = replace_ask;
+        let mut opts = MoveOpts {
+            force_copy: true,
+            fail_before_unlink: false,
+            copy: CopyOpts {
+                cancel: &cancel,
+                policy: &mut policy,
+                ask: &mut ask,
+            },
+            report: TransferReport::default(),
+            check_removable: true,
+            keep_source: false,
+        };
+        let outcome = move_child(
+            &dir,
+            std::ffi::OsStr::new(from),
+            &dir,
+            std::ffi::OsStr::new(to),
+            &mut opts,
+        )
+        .unwrap();
+        (outcome, opts.report)
+    }
+
+    #[test]
+    fn mount_points_are_skipped_not_descended() {
+        let dir_mode = 0o040755;
+        assert_eq!(classify(dir_mode, 7, 7), EntryKind::Dir);
+        assert_eq!(
+            classify(dir_mode, 9, 7),
+            EntryKind::Skip(SkipReason::MountPoint),
+            "a child on another device is a mount point"
+        );
+        assert_eq!(
+            classify(0o100644, 9, 7),
+            EntryKind::Skip(SkipReason::MountPoint)
+        );
+        assert_eq!(classify(0o120777, 7, 7), EntryKind::Symlink);
+        assert_eq!(classify(0o100644, 7, 7), EntryKind::File);
+        assert_eq!(classify(0o010644, 7, 7), EntryKind::Skip(SkipReason::Fifo));
+        assert_eq!(
+            classify(0o140755, 7, 7),
+            EntryKind::Skip(SkipReason::Socket)
+        );
+        assert_eq!(
+            classify(0o020644, 7, 7),
+            EntryKind::Skip(SkipReason::Device)
+        );
+
+        // /proc is its own mount under /. Its device differs from the root's,
+        // so a move rooted at / would skip it instead of copying it.
+        let root = rustix::fs::stat("/").unwrap();
+        let proc_ = rustix::fs::stat("/proc").unwrap();
+        if proc_.st_dev != root.st_dev {
+            assert_eq!(
+                classify(proc_.st_mode, proc_.st_dev, root.st_dev),
+                EntryKind::Skip(SkipReason::MountPoint)
+            );
+        }
+    }
+
+    #[test]
+    fn cross_device_move_copies_symlinks_and_skips_fifos_and_sockets() {
+        let root = scratch("special");
+        let src = root.join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink("../elsewhere/target", src.join("link")).unwrap();
+        let fifo = std::ffi::CString::new(src.join("pipe").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        let _sock = std::os::unix::net::UnixListener::bind(src.join("sock")).unwrap();
+
+        let (outcome, report) = cross_device_move(&root, "src", "dest");
+        assert_eq!(
+            outcome,
+            CopyOutcome::Skipped,
+            "skipped children keep the source"
+        );
+        let dest = root.join("dest");
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"a");
+        assert_eq!(
+            std::fs::read_link(dest.join("link")).unwrap(),
+            Path::new("../elsewhere/target"),
+            "the link target is copied, not followed"
+        );
+        assert!(!dest.join("pipe").exists());
+        assert!(!dest.join("sock").exists());
+        // Copied entries leave the source; skipped ones stay put.
+        assert!(!src.join("a.txt").exists());
+        assert!(std::fs::symlink_metadata(src.join("link")).is_err());
+        assert!(std::fs::symlink_metadata(src.join("pipe")).is_ok());
+        assert!(std::fs::symlink_metadata(src.join("sock")).is_ok());
+        assert_eq!(report.moved, 2);
+        let mut skipped: Vec<_> = report
+            .skipped
+            .iter()
+            .map(|s| (s.path.clone(), s.reason))
+            .collect();
+        skipped.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            skipped,
+            vec![
+                (Path::new("src/pipe").to_path_buf(), SkipReason::Fifo),
+                (Path::new("src/sock").to_path_buf(), SkipReason::Socket),
+            ]
+        );
+        assert_eq!(report.summary(), "Moved 2 items, skipped 2");
+        assert_eq!(report.details().len(), 2);
+
+        // A top-level symlink moves on its own too.
+        std::os::unix::fs::symlink("a.txt", root.join("top-link")).unwrap();
+        let (outcome, _) = cross_device_move(&root, "top-link", "moved-link");
+        assert_eq!(outcome, CopyOutcome::Copied);
+        assert_eq!(
+            std::fs::read_link(root.join("moved-link")).unwrap(),
+            Path::new("a.txt")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `src/inner` is 0500 with a file in it, and dated 2020-09-13.
+    fn read_only_tree(label: &str) -> (std::path::PathBuf, SystemTime) {
+        let root = scratch(label);
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("inner")).unwrap();
+        std::fs::write(src.join("inner/f"), b"x").unwrap();
+        std::fs::set_permissions(src.join("inner"), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        let mtime = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        std::fs::File::open(src.join("inner"))
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        (root, mtime)
+    }
+
+    fn cleanup_read_only(root: &Path) {
+        for dir in ["src/inner", "dest/inner"] {
+            let _ =
+                std::fs::set_permissions(root.join(dir), std::fs::Permissions::from_mode(0o700));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn move_src(root: &Path, check_removable: bool) -> (Result<CopyOutcome>, TransferReport) {
+        let dir = DirFd::open(root).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = replace_ask;
+        let mut opts = MoveOpts {
+            force_copy: true,
+            fail_before_unlink: false,
+            copy: CopyOpts {
+                cancel: &cancel,
+                policy: &mut policy,
+                ask: &mut ask,
+            },
+            report: TransferReport::default(),
+            check_removable,
+            keep_source: false,
+        };
+        let result = move_child(
+            &dir,
+            std::ffi::OsStr::new("src"),
+            &dir,
+            std::ffi::OsStr::new("dest"),
+            &mut opts,
+        );
+        (result, opts.report)
+    }
+
+    fn running_as_root() -> bool {
+        rustix::process::geteuid().is_root()
+    }
+
+    #[test]
+    fn move_is_refused_up_front_when_originals_cannot_be_removed() {
+        if running_as_root() {
+            return;
+        }
+        let (root, _) = read_only_tree("preflight");
+        let (result, report) = move_src(&root, true);
+        match result {
+            Err(Error::NotRemovable(blocked)) => {
+                assert_eq!(
+                    blocked,
+                    vec![KeptEntry {
+                        path: Path::new("src/inner/f").to_path_buf(),
+                        reason: KeepReason::ReadOnlyFolder,
+                    }]
+                );
+                assert_eq!(
+                    refusal("src", &blocked),
+                    Refusal {
+                        title: "Can't move src: 1 folder inside is read-only".into(),
+                        lines: vec![RefusalLine {
+                            path: "src/inner".into(),
+                            note: None,
+                        }],
+                        can_copy_instead: true,
+                        dismiss_label: "Cancel",
+                    }
+                );
+            }
+            other => panic!("expected an up-front refusal, got {other:?}"),
+        }
+        assert!(!root.join("dest").exists(), "nothing is copied");
+        assert_eq!(report, TransferReport::default());
+        assert_eq!(std::fs::read(root.join("src/inner/f")).unwrap(), b"x");
+        cleanup_read_only(&root);
+    }
+
+    #[test]
+    fn removal_failing_after_the_copy_is_a_partial_move() {
+        if running_as_root() {
+            return;
+        }
+        // The preflight is off to stand in for a folder that turns read-only
+        // between the check and the unlink.
+        let (root, mtime) = read_only_tree("partial");
+        let (result, report) = move_src(&root, false);
+        assert_eq!(result.unwrap(), CopyOutcome::Skipped, "the source is kept");
+        let inner = root.join("dest/inner");
+        assert_eq!(std::fs::read(inner.join("f")).unwrap(), b"x");
+        assert_eq!(mode_bits(&inner), 0o500, "mode is set after the children");
+        assert_eq!(
+            std::fs::metadata(&inner).unwrap().modified().unwrap(),
+            mtime,
+            "times are set after the children"
+        );
+        assert_eq!(std::fs::read(root.join("src/inner/f")).unwrap(), b"x");
+        assert_eq!(report.status(), TransferStatus::Partial);
+        assert_eq!(
+            report.left_behind,
+            vec![KeptEntry {
+                path: Path::new("src/inner/f").to_path_buf(),
+                reason: KeepReason::ReadOnlyFolder,
+            }]
+        );
+        assert_eq!(
+            report.summary(),
+            "Copied 1 item, but couldn't remove the originals (read-only folder)"
+        );
+        assert_eq!(
+            report.details(),
+            vec!["src/inner/f — left behind: read-only folder".to_string()]
+        );
+        cleanup_read_only(&root);
+    }
+
+    #[test]
+    fn sticky_folder_blocks_removal_of_someone_elses_file() {
+        if running_as_root() {
+            return;
+        }
+        // /tmp is sticky and owned by root. A file there owned by root (or
+        // anyone else) cannot be removed by us. Use a file we don't own if
+        // one exists; otherwise check our own file passes.
+        let tmp = DirFd::open(Path::new("/tmp")).unwrap();
+        let mut ours = rustix::fs::fstat(tmp.as_fd()).unwrap();
+        ours.st_uid = rustix::process::geteuid().as_raw();
+        let rel = Path::new("x");
+        assert_eq!(removal_denied(&tmp, &ours, rel).unwrap(), None);
+        let mut theirs = ours;
+        theirs.st_uid = ours.st_uid.wrapping_add(4242);
+        let dir = rustix::fs::fstat(tmp.as_fd()).unwrap();
+        if dir.st_mode & 0o1000 != 0 && dir.st_uid != ours.st_uid {
+            assert_eq!(
+                removal_denied(&tmp, &theirs, rel).unwrap(),
+                Some(KeepReason::StickyFolder)
+            );
+        }
+    }
+
+    #[test]
+    fn refusal_title_counts_by_reason() {
+        let k = |p: &str, reason| KeptEntry {
+            path: p.into(),
+            reason,
+        };
+        let one = |p: &str, reason| refusal("Projects", &[k(p, reason)]).title;
+        assert_eq!(
+            one("Projects/x/1", KeepReason::StickyFolder),
+            "Can't move Projects: 1 item belongs to someone else"
+        );
+        assert_eq!(
+            refusal(
+                "Projects",
+                &[
+                    k("Projects/x/1", KeepReason::ReadOnlyFolder),
+                    k("Projects/y/2", KeepReason::ReadOnlyFolder),
+                ]
+            )
+            .title,
+            "Can't move Projects: 2 folders inside are read-only"
+        );
+        let r = refusal(
+            "a",
+            &[
+                k("a/x/1", KeepReason::ReadOnlyFolder),
+                k("a/x/2", KeepReason::ReadOnlyFolder),
+                k("a/y/3", KeepReason::ReadOnlyFolder),
+                k("a/s/4", KeepReason::StickyFolder),
+            ],
+        );
+        assert_eq!(r.title, "Can't move a: 4 items can't be removed afterwards");
+        let paths: Vec<_> = r.lines.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, vec!["a/x", "a/y", "a/s/4"]);
+        assert!(r.lines.iter().all(|l| l.note.is_none()));
+        assert!(
+            r.can_copy_instead,
+            "read-only and sticky can still be copied"
+        );
+        assert_eq!(r.dismiss_label, "Cancel");
+        assert_eq!(r.note_count(), 0);
+    }
+
+    #[test]
+    fn copy_instead_copies_and_keeps_the_source() {
+        let (root, mtime) = read_only_tree("copy-instead");
+        assert_eq!(RefusalChoice::default(), RefusalChoice::CopyInstead);
+        let dir = DirFd::open(&root).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = replace_ask;
+        let result = resolve_refusal(
+            RefusalChoice::default(),
+            &dir,
+            std::ffi::OsStr::new("src"),
+            &dir,
+            std::ffi::OsStr::new("dest"),
+            CopyOpts {
+                cancel: &cancel,
+                policy: &mut policy,
+                ask: &mut ask,
+            },
+        )
+        .unwrap();
+        let (outcome, report) = result.expect("copy instead runs a copy");
+        assert_eq!(outcome, CopyOutcome::Copied);
+        assert_eq!(report.status(), TransferStatus::Complete);
+        assert!(report.left_behind.is_empty());
+        let inner = root.join("dest/inner");
+        assert_eq!(std::fs::read(inner.join("f")).unwrap(), b"x");
+        assert_eq!(mode_bits(&inner), 0o500);
+        assert_eq!(
+            std::fs::metadata(&inner).unwrap().modified().unwrap(),
+            mtime
+        );
+        assert_eq!(std::fs::read(root.join("src/inner/f")).unwrap(), b"x");
+        cleanup_read_only(&root);
+    }
+
+    #[test]
+    fn cancel_on_the_refusal_copies_nothing() {
+        let (root, _) = read_only_tree("refusal-cancel");
+        let dir = DirFd::open(&root).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = replace_ask;
+        let result = resolve_refusal(
+            RefusalChoice::Cancel,
+            &dir,
+            std::ffi::OsStr::new("src"),
+            &dir,
+            std::ffi::OsStr::new("dest"),
+            CopyOpts {
+                cancel: &cancel,
+                policy: &mut policy,
+                ask: &mut ask,
+            },
+        )
+        .unwrap();
+        assert!(result.is_none());
+        assert!(!root.join("dest").exists());
+        cleanup_read_only(&root);
+    }
+
+    #[test]
+    fn unopenable_subfolder_is_a_refusal_not_an_io_error() {
+        if running_as_root() {
+            return;
+        }
+        for mode in [0o300, 0o000] {
+            let root = scratch("unopenable");
+            let src = root.join("src");
+            std::fs::create_dir_all(src.join("locked")).unwrap();
+            std::fs::write(src.join("locked/f"), b"x").unwrap();
+            std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            let (result, _) = move_src(&root, true);
+            std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            match result {
+                Err(Error::NotRemovable(blocked)) => {
+                    assert_eq!(
+                        blocked,
+                        vec![KeptEntry {
+                            path: "src/locked".into(),
+                            reason: KeepReason::UnreadableFolder,
+                        }],
+                        "mode {mode:o}"
+                    );
+                    assert_eq!(
+                        refusal("src", &blocked).title,
+                        "Can't move src: 1 folder inside can't be opened"
+                    );
+                }
+                other => panic!("mode {mode:o}: expected a refusal, got {other:?}"),
+            }
+            assert!(!root.join("dest").exists());
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn sticky_eperm_after_copy_is_a_sticky_reason() {
+        let err = Error::from_errno("x", Errno::PERM);
+        assert_eq!(keep_reason(&err, true), Some(KeepReason::StickyFolder));
+        assert_eq!(keep_reason(&err, false), Some(KeepReason::ReadOnlyFolder));
+        let acc = Error::from_errno("x", Errno::ACCESS);
+        assert_eq!(keep_reason(&acc, true), Some(KeepReason::ReadOnlyFolder));
+        assert_eq!(keep_reason(&Error::from_errno("x", Errno::IO), false), None);
+    }
+
+    #[test]
+    fn each_unreadable_folder_adds_a_note_row() {
+        let k = |p: &str, reason| KeptEntry {
+            path: p.into(),
+            reason,
+        };
+        let r = refusal(
+            "Projects",
+            &[
+                k("Projects/a", KeepReason::UnreadableFolder),
+                k("Projects/b", KeepReason::UnreadableFolder),
+                k("Projects/ro/f", KeepReason::ReadOnlyFolder),
+            ],
+        );
+        assert_eq!(r.note_count(), 2);
+        assert_eq!(r.dismiss_label, "Close");
+    }
+
+    #[test]
+    fn unreadable_folder_offers_only_close() {
+        let k = |p: &str, reason| KeptEntry {
+            path: p.into(),
+            reason,
+        };
+        let r = refusal(
+            "Projects",
+            &[
+                k("Projects/ro/f", KeepReason::ReadOnlyFolder),
+                k("Projects/locked", KeepReason::UnreadableFolder),
+            ],
+        );
+        assert!(!r.can_copy_instead);
+        assert_eq!(r.dismiss_label, "Close");
+        assert_eq!(r.note_count(), 1);
+        assert_eq!(
+            r.lines,
+            vec![
+                RefusalLine {
+                    path: "Projects/ro".into(),
+                    note: None,
+                },
+                RefusalLine {
+                    path: "Projects/locked".into(),
+                    note: Some(UNREADABLE_NOTE.into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_instead_refuses_an_unreadable_folder() {
+        if running_as_root() {
+            return;
+        }
+        let root = scratch("copy-unreadable");
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("locked")).unwrap();
+        std::fs::write(src.join("locked/f"), b"x").unwrap();
+        std::fs::write(src.join("a"), b"a").unwrap();
+        std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let dir = DirFd::open(&root).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = replace_ask;
+        let result = copy_instead(
+            &dir,
+            std::ffi::OsStr::new("src"),
+            &dir,
+            std::ffi::OsStr::new("dest"),
+            CopyOpts {
+                cancel: &cancel,
+                policy: &mut policy,
+                ask: &mut ask,
+            },
+        );
+        std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        match result {
+            Err(Error::Unreadable(blocked)) => assert_eq!(
+                blocked,
+                vec![KeptEntry {
+                    path: "src/locked".into(),
+                    reason: KeepReason::UnreadableFolder,
+                }]
+            ),
+            other => panic!("expected an unreadable refusal, got {other:?}"),
+        }
+        assert!(!root.join("dest").exists(), "nothing is copied");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn mode_bits(path: &Path) -> u32 {

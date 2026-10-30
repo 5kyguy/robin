@@ -11,7 +11,7 @@ use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::error::{Error, Result};
 use crate::theme::Theme;
-use crate::{AppWindow, GridLine, MapCell, Place, Row};
+use crate::{AppWindow, GridLine, MapCell, Place, RefusalLine, Row};
 
 pub fn known(view: &str) -> bool {
     matches!(
@@ -43,6 +43,12 @@ pub fn known(view: &str) -> bool {
             | "progress-1"
             | "progress-3"
             | "progress-error"
+            | "skipped"
+            | "skipped-details"
+            | "move-partial"
+            | "move-refused"
+            | "move-refused-unreadable"
+            | "move-refused-unreadable-two"
             | "menu-file"
             | "shortcuts-browser"
             | "reduce-motion"
@@ -194,6 +200,62 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         }
         .into(),
     );
+    let kept = |path: &str, reason| crate::fsops::KeptEntry {
+        path: path.into(),
+        reason,
+    };
+    let mut blocked = vec![
+        kept(
+            "Projects/robin/vendor/fonts/Inter.ttf",
+            crate::fsops::KeepReason::ReadOnlyFolder,
+        ),
+        kept(
+            "Projects/robin/vendor/fonts/Mono.ttf",
+            crate::fsops::KeepReason::ReadOnlyFolder,
+        ),
+    ];
+    if view == "move-refused-unreadable" {
+        blocked = vec![kept(
+            "Projects/robin/.cache",
+            crate::fsops::KeepReason::UnreadableFolder,
+        )];
+    }
+    if view == "move-refused-unreadable-two" {
+        blocked = vec![
+            kept(
+                "Projects/robin/.cache",
+                crate::fsops::KeepReason::UnreadableFolder,
+            ),
+            kept(
+                "Projects/robin/target/tmp",
+                crate::fsops::KeepReason::UnreadableFolder,
+            ),
+        ];
+    }
+    let refused = crate::fsops::refusal("Projects", &blocked);
+    ui.set_refusal_title(refused.title.as_str().into());
+    ui.set_refusal_can_copy(refused.can_copy_instead);
+    ui.set_refusal_dismiss(refused.dismiss_label.into());
+    ui.set_refusal_notes(refused.note_count() as i32);
+    ui.set_refusal_lines(ModelRc::new(Rc::new(VecModel::from(
+        refused
+            .lines
+            .into_iter()
+            .map(|l| RefusalLine {
+                path: l.path.into(),
+                note: l.note.unwrap_or_default().into(),
+            })
+            .collect::<Vec<_>>(),
+    ))));
+    let (tone, text, details) = toast(view);
+    ui.set_toast_tone(tone.into());
+    ui.set_toast_text(text.into());
+    ui.set_toast_details(ModelRc::new(Rc::new(VecModel::from(
+        details
+            .into_iter()
+            .map(slint::SharedString::from)
+            .collect::<Vec<_>>(),
+    ))));
     ui.set_overlay(
         match view {
             "path-edit" => "path-edit",
@@ -208,6 +270,12 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "progress-1" => "progress-1",
             "progress-3" => "progress-3",
             "progress-error" => "progress-error",
+            "skipped" => "skipped",
+            "skipped-details" => "skipped-details",
+            "move-partial" => "toast-details",
+            "move-refused" | "move-refused-unreadable" | "move-refused-unreadable-two" => {
+                "move-refused"
+            }
             "menu-file" => "menu-file",
             "shortcuts-browser" | "shortcuts-viewer" => "shortcuts",
             _ => "",
@@ -292,6 +360,50 @@ fn stats_cells(drilled: bool) -> Vec<MapCell> {
             }
         })
         .collect()
+}
+
+/// Tone, line, and details for the transfer toasts.
+fn toast(view: &str) -> (&'static str, String, Vec<String>) {
+    use crate::fsops::{KeepReason, KeptEntry};
+    let kept = |path: &str, reason| KeptEntry {
+        path: path.into(),
+        reason,
+    };
+    match view {
+        "move-partial" => {
+            let report = crate::fsops::TransferReport {
+                moved: 212,
+                skipped: Vec::new(),
+                left_behind: vec![
+                    kept("Projects/robin/vendor/fonts", KeepReason::ReadOnlyFolder),
+                    kept("Projects/robin/vendor/icons", KeepReason::ReadOnlyFolder),
+                ],
+            };
+            ("warning", report.summary(), report.details())
+        }
+        _ => {
+            let report = skipped_report();
+            ("", report.summary(), report.details())
+        }
+    }
+}
+
+/// The report a cross-device move of ~/Projects to SANDISK would produce.
+fn skipped_report() -> crate::fsops::TransferReport {
+    use crate::fsops::{SkipReason, SkippedEntry, TransferReport};
+    let skip = |path: &str, reason| SkippedEntry {
+        path: path.into(),
+        reason,
+    };
+    TransferReport {
+        moved: 212,
+        skipped: vec![
+            skip("Projects/robin/target/mnt", SkipReason::MountPoint),
+            skip("Projects/robin/.cache/build.fifo", SkipReason::Fifo),
+            skip("Projects/r2-d2/run/agent.sock", SkipReason::Socket),
+        ],
+        left_behind: Vec::new(),
+    }
 }
 
 fn places(view: &str) -> Vec<Place> {
