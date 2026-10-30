@@ -346,8 +346,12 @@ Checked against the 1.17.1 sources rather than assumed.
   `file://` is mangled; and drops the entire drop if any name isn't
   UTF-8. Slint doesn't expose the raw uri-list, so none of this can be
   undone. Copying makes the worst case a duplicate rather than a lost
-  or relocated file. Paths that are still symlinks under a no-follow
-  stat are refused with a warning.
+  or relocated file. A dropped symlink copies its target: winit resolved
+  it, and a path it can't resolve fails the whole drop inside winit, so
+  Robin never sees a link. The notices for a drop that copied nothing
+  and for an unwatchable folder use the neutral toast.
+- Subfolder item counts open each child without following links and
+  skip a child on another device (a mount point), leaving it blank.
 - The drop API depends on Slint's `unstable-winit-030` feature, which
   has no semver guarantee; that is why `slint` is pinned to `=1.17.1`.
   Any Slint bump must recheck `on_winit_window_event` and `DroppedFile`. `DroppedFile` has no position, no

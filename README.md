@@ -45,9 +45,10 @@ Why, and what does work (Robin uses Slint 1.17.1 on winit 0.30):
 - **Dropping into Robin on X11: works, with limits.** Files land in the
   open folder, and are always **copied**, never moved: winit hands Robin
   paths with symlinks already resolved, so moving could relocate a
-  link's target instead of the link. Dropped items that are still
-  links are refused. See `docs/DESIGN.md` for the details. winit 0.30 reports only the paths, with no pointer position
-  and no modifier keys, so a drop always lands in the open folder (not
+  link's target instead of the link. winit resolves links, so a dropped
+  symlink copies the file or folder it points to. Dropping items onto
+  the folder they are already in copies nothing and says so. winit 0.30
+  reports only the paths, with no pointer position and no modifier keys, so a drop always lands in the open folder (not
   the folder row under the pointer), Ctrl/Shift can't pick copy or
   move, and nothing highlights while dragging. Items already in the
   open folder, and folders dropped into themselves, are ignored.
