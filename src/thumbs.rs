@@ -231,6 +231,72 @@ fn mtime_string(time: SystemTime) -> String {
         .unwrap_or_else(|_| "0".into())
 }
 
+/// Writes the JPEG photos, video frame, and PDF page used by the grid renders.
+pub fn write_fixture_stills(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    save_jpeg(&dir.join("dune-sunset-0412.jpg"), 0)?;
+    save_jpeg(&dir.join("dune-sunset-0413.jpg"), 40)?;
+    save_jpeg(&dir.join("lars-homestead.jpg"), 80)?;
+    save_png(&dir.join("speeder-frame.png"), 0)?;
+    save_png(&dir.join("droid-manual.png"), 1)?;
+    save_png(&dir.join("cantina-band.png"), 2)?;
+    Ok(())
+}
+
+fn save_jpeg(path: &Path, shift: i32) -> Result<()> {
+    let image = sky(320, 180, shift);
+    image
+        .save(path)
+        .map_err(|e| Error::Message(format!("write {}: {e}", path.display())))
+}
+
+fn save_png(path: &Path, kind: u8) -> Result<()> {
+    let image = match kind {
+        0 => night(320, 180),
+        1 => document(320, 180),
+        _ => sky(320, 180, 110),
+    };
+    image
+        .save(path)
+        .map_err(|e| Error::Message(format!("write {}: {e}", path.display())))
+}
+
+fn night(width: u32, height: u32) -> image::RgbImage {
+    image::RgbImage::from_fn(width, height, |x, y| {
+        let t = y as f32 / height as f32;
+        let dx = x as f32 / width as f32 - 0.5;
+        let glow = (1.0 - (dx * dx + (t - 0.55).powi(2)) * 8.0).clamp(0.0, 1.0);
+        let r = (8.0 + glow * 30.0) as u8;
+        let g = (22.0 + glow * 90.0) as u8;
+        let b = (36.0 + glow * 110.0) as u8;
+        image::Rgb([r, g, b])
+    })
+}
+
+fn sky(width: u32, height: u32, shift: i32) -> image::RgbImage {
+    image::RgbImage::from_fn(width, height, |x, y| {
+        let t = y as f32 / height as f32;
+        let sun = ((x as f32 / width as f32) - 0.5).powi(2) + ((t - 0.62) * 1.4).powi(2);
+        let glow = (1.0 - sun * 6.0).clamp(0.0, 1.0);
+        let r = (40.0 + shift as f32 + t * 180.0 + glow * 160.0).clamp(0.0, 255.0) as u8;
+        let g = (16.0 + t * 70.0 + glow * 90.0).clamp(0.0, 255.0) as u8;
+        let b = (70.0 - t * 50.0 + glow * 20.0).clamp(0.0, 255.0) as u8;
+        image::Rgb([r, g, b])
+    })
+}
+
+fn document(width: u32, height: u32) -> image::RgbImage {
+    image::RgbImage::from_fn(width, height, |x, y| {
+        if y < 28 {
+            image::Rgb([28, 36, 48])
+        } else if y % 18 < 3 && x > 24 && x + 24 < width && y > 40 {
+            image::Rgb([180, 176, 168])
+        } else {
+            image::Rgb([244, 240, 230])
+        }
+    })
+}
+
 fn touch_index(cache_home: &Path, png: &Path) -> Result<()> {
     let index = cache_home.join("robin").join("thumb-index.txt");
     if let Some(parent) = index.parent() {
@@ -316,5 +382,24 @@ mod tests {
         let gone = evict_until(&mut index, 120);
         assert_eq!(gone, vec![PathBuf::from("old"), PathBuf::from("mid")]);
         assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn fixture_stills_are_real_images() {
+        let dir = std::env::temp_dir().join(format!("robin-stills-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_fixture_stills(&dir).unwrap();
+        let jpeg = fs::read(dir.join("dune-sunset-0412.jpg")).unwrap();
+        let page = fs::read(dir.join("droid-manual.png")).unwrap();
+        let frame = fs::read(dir.join("speeder-frame.png")).unwrap();
+        assert!(jpeg.starts_with(&[0xff, 0xd8, 0xff]), "jpeg magic");
+        assert!(page.starts_with(b"\x89PNG"));
+        assert!(frame.starts_with(b"\x89PNG"));
+        assert!(jpeg.len() > 2000, "jpeg {}", jpeg.len());
+        assert_ne!(&page[64..128], &frame[64..128]);
+        if std::env::var("ROBIN_WRITE_STILLS").is_ok() {
+            write_fixture_stills(Path::new("assets/thumbs")).unwrap();
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }
