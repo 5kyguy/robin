@@ -32,7 +32,7 @@ pub struct Clip {
     pub names: Vec<OsString>,
 }
 
-/// Ctrl+X / Ctrl+C / Ctrl+V. A cut is used up by its paste; a copy can be
+/// Ctrl+X / Ctrl+C / Ctrl+V. A cut is used up by a successful move; a copy can be
 /// pasted again.
 #[derive(Debug, Default)]
 pub struct Clipboard {
@@ -75,14 +75,23 @@ impl Clipboard {
     pub fn paste(&mut self, dest: &Path) -> Option<Job> {
         let clip = self.clip.clone()?;
         match clip.mode {
+            // The cut stays until a move succeeds; see `cut_moved`.
             ClipMode::Cut => {
-                self.clip = None;
                 if clip.dir == dest {
                     return None;
                 }
                 Some(Job::new(JobKind::Move, &clip.dir, clip.names, dest))
             }
             ClipMode::Copy => Some(Job::new(JobKind::Copy, &clip.dir, clip.names, dest)),
+        }
+    }
+
+    /// A move job finished cleanly: drop the cut if it is the one moved.
+    pub fn cut_moved(&mut self, job: &Job) {
+        if let Some(clip) = &self.clip {
+            if clip.mode == ClipMode::Cut && clip.dir == job.src && clip.names == job.names {
+                self.clip = None;
+            }
         }
     }
 
@@ -459,9 +468,24 @@ fn keep_both(_: &fsops::ConflictPrompt) -> Result<ConflictChoice> {
     })
 }
 
+/// Refuse when the destination is the item itself or anywhere inside it.
+/// Compares device and inode up the destination's real parent chain, so a
+/// symlinked or `..`-laden path into the folder is still caught.
 fn into_itself(job: &Job, name: &OsStr) -> Result<()> {
-    if job.dest.starts_with(job.src.join(name)) {
-        return Err(Error::Message("can't put a folder inside itself".into()));
+    use std::os::unix::fs::MetadataExt;
+    let Ok(item) = std::fs::symlink_metadata(job.src.join(name)) else {
+        return Ok(()); // gone; the operation reports it
+    };
+    if !item.is_dir() {
+        return Ok(());
+    }
+    let dest = std::fs::canonicalize(&job.dest).map_err(|e| Error::Message(e.to_string()))?;
+    for dir in dest.ancestors() {
+        if let Ok(meta) = std::fs::metadata(dir) {
+            if meta.dev() == item.dev() && meta.ino() == item.ino() {
+                return Err(Error::Message("can't put a folder inside itself".into()));
+            }
+        }
     }
     Ok(())
 }
@@ -617,6 +641,16 @@ mod tests {
         let job = clip.paste(Path::new("/b")).unwrap();
         assert_eq!(job.kind, JobKind::Move);
         assert_eq!(job.names, names(&["x", "y"]));
+        assert!(
+            clip.is_cut(src, OsStr::new("x")),
+            "kept until the move succeeds"
+        );
+        // A different cut is not dropped by an older job finishing.
+        clip.cut(src, names(&["x"]));
+        clip.cut_moved(&job);
+        assert!(clip.is_cut(src, OsStr::new("x")));
+        clip.cut(src, names(&["x", "y"]));
+        clip.cut_moved(&job);
         assert!(!clip.is_cut(src, OsStr::new("x")));
         assert!(clip.paste(Path::new("/c")).is_none());
     }
@@ -630,7 +664,8 @@ mod tests {
         assert_eq!(clip.paste(Path::new("/c")).unwrap().kind, JobKind::Copy);
         clip.cut(Path::new("/a"), names(&["x"]));
         assert!(clip.paste(Path::new("/a")).is_none());
-        assert!(clip.clip().is_none());
+        assert!(clip.clip().is_some(), "a same-folder paste keeps the cut");
+        clip.clear();
         clip.cut(Path::new("/a"), Vec::new());
         assert!(clip.clip().is_none(), "an empty cut keeps nothing");
     }
@@ -697,6 +732,28 @@ mod tests {
         let out = run(&into, &env(&root), &cancel, &mut |_| {});
         assert_eq!(out.failed.len(), 1);
         assert!(a.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_symlinked_path_into_the_folder_is_still_itself() {
+        let root = scratch("into-link");
+        let a = root.join("a");
+        fs::create_dir_all(a.join("sub/deep")).unwrap();
+        std::os::unix::fs::symlink(a.join("sub"), root.join("link")).unwrap();
+        let cancel = Cancel::new();
+        for (kind, dest) in [
+            (JobKind::Move, root.join("link")),
+            (JobKind::Copy, root.join("link/deep")),
+            (JobKind::Move, root.join("link/../sub")),
+        ] {
+            let job = Job::new(kind, &root, names(&["a"]), &dest);
+            let out = run(&job, &env(&root), &cancel, &mut |_| {});
+            assert_eq!(out.failed.len(), 1, "{kind:?} into {dest:?}: {out:?}");
+            assert!(out.failed[0].contains("inside itself"), "{out:?}");
+        }
+        assert!(a.join("sub/deep").is_dir());
+        assert_eq!(fs::read_dir(a.join("sub/deep")).unwrap().count(), 0);
         fs::remove_dir_all(&root).unwrap();
     }
 

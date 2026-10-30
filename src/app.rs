@@ -351,6 +351,16 @@ impl Controller {
 
     /// A finished job: the refused moves come back as a dialog.
     pub fn finish(&mut self, job: &Job, outcome: &Outcome) -> Option<Dialog> {
+        // A cut lives until its move fully succeeds; a refused, failed,
+        // cancelled or partial move keeps it so the user can try again.
+        if job.kind == JobKind::Move
+            && !outcome.cancelled
+            && outcome.failed.is_empty()
+            && outcome.refused.is_empty()
+            && outcome.done == job.names.len()
+        {
+            self.clip.cut_moved(job);
+        }
         let (name, kept) = outcome.refused.first()?;
         let refusal = fsops::refusal(&name.to_string_lossy(), kept);
         Some(Dialog::Refused {
@@ -840,11 +850,48 @@ mod tests {
             panic!("paste should run a job")
         };
         assert_eq!(job.kind, JobKind::Move);
-        assert_eq!(c.key("v", true, false), Action::None, "a cut is used up");
-        // Pasting a cut back into its own folder does nothing.
-        c.dir = c.dir.parent().unwrap().to_path_buf();
-        c.key("x", true, false);
+        assert!(c.clip.clip().is_some(), "paste start keeps the cut");
+        c.finish(
+            &job,
+            &Outcome {
+                done: 1,
+                ..Outcome::default()
+            },
+        );
+        assert!(c.clip.clip().is_none(), "a successful move uses the cut up");
         assert_eq!(c.key("v", true, false), Action::None);
+    }
+
+    #[test]
+    fn a_cut_survives_refused_failed_and_same_folder_pastes() {
+        let mut c = setup("cut-kept");
+        select(&mut c, "a.jpg");
+        c.key("x", true, false);
+        // Same folder: nothing runs, the cut stays.
+        assert_eq!(c.key("v", true, false), Action::None);
+        assert!(c.clip.clip().is_some());
+        c.dir = c.dir.join("raw-exports");
+        let Action::Run(job) = c.key("v", true, false) else {
+            panic!("paste should run a job")
+        };
+        let failed = Outcome {
+            failed: vec!["a.jpg: disk full".into()],
+            ..Outcome::default()
+        };
+        c.finish(&job, &failed);
+        assert!(c.clip.clip().is_some(), "a failed move keeps the cut");
+        let refused = Outcome {
+            refused: vec![("a.jpg".into(), Vec::new())],
+            ..Outcome::default()
+        };
+        c.finish(&job, &refused);
+        assert!(c.clip.clip().is_some(), "a refused move keeps the cut");
+        let cancelled = Outcome {
+            cancelled: true,
+            ..Outcome::default()
+        };
+        c.finish(&job, &cancelled);
+        assert!(c.clip.clip().is_some(), "a cancelled move keeps the cut");
     }
 
     #[test]
