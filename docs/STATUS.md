@@ -15,7 +15,8 @@ Designr's mockups are committed at `docs/mockups/{01-list,02-grid,03-viewer,04-s
 | Docs (plan, design spec, status) | in review |
 | Spikes | recorded below |
 | Skeleton, CI, `--demo`, `--render` harness | in review |
-| Browser | not started |
+| Directory model (sort, selection, search, grid rows) | in review |
+| Browser UI | not started |
 | Thumbnails | not started |
 | Fsops | not started |
 | Viewer | not started |

@@ -1,0 +1,504 @@
+//! Directory model. The window paints whatever [`Listing::view`] returns.
+//!
+//! Notify events are folded by [`Debounce`] before they touch the listing,
+//! so a burst of writes becomes one incremental update.
+
+use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
+
+use crate::safety::{DirFd, Dirent};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    Date,
+    Size,
+    Type,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nav {
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    pub name: OsString,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub len: u64,
+    pub mtime: SystemTime,
+    pub mode: u32,
+}
+
+impl Entry {
+    pub fn from_dirent(dirent: Dirent) -> Self {
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(dirent.mtime_secs.max(0) as u64);
+        Self {
+            name: dirent.name,
+            is_dir: dirent.is_dir,
+            is_symlink: dirent.is_symlink,
+            len: dirent.len,
+            mtime,
+            mode: dirent.mode,
+        }
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.name.to_string_lossy().starts_with('.')
+    }
+
+    pub fn extension(&self) -> String {
+        Path::new(&self.name)
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Listing {
+    entries: Vec<Entry>,
+    sort_key: SortKey,
+    sort_dir: SortDir,
+    folders_first: bool,
+    show_hidden: bool,
+    query: String,
+    selection: BTreeSet<OsString>,
+    cursor: Option<OsString>,
+}
+
+impl Default for Listing {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            sort_key: SortKey::Name,
+            sort_dir: SortDir::Asc,
+            folders_first: true,
+            show_hidden: false,
+            query: String::new(),
+            selection: BTreeSet::new(),
+            cursor: None,
+        }
+    }
+}
+
+impl Listing {
+    pub fn from_dir(dir: &DirFd) -> crate::Result<Self> {
+        let mut listing = Self::default();
+        listing.replace_dir(dir)?;
+        Ok(listing)
+    }
+
+    pub fn replace_dir(&mut self, dir: &DirFd) -> crate::Result<()> {
+        let entries = dir.list()?.into_iter().map(Entry::from_dirent).collect();
+        self.set_entries(entries);
+        Ok(())
+    }
+
+    pub fn set_entries(&mut self, entries: Vec<Entry>) {
+        let names: BTreeSet<_> = entries.iter().map(|e| e.name.clone()).collect();
+        self.selection.retain(|name| names.contains(name));
+        if self
+            .cursor
+            .as_ref()
+            .is_some_and(|name| !names.contains(name))
+        {
+            self.cursor = None;
+        }
+        self.entries = entries;
+    }
+
+    pub fn set_sort(&mut self, key: SortKey, dir: SortDir) {
+        self.sort_key = key;
+        self.sort_dir = dir;
+    }
+
+    pub fn set_show_hidden(&mut self, show: bool) {
+        self.show_hidden = show;
+    }
+
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
+    }
+
+    pub fn set_query(&mut self, query: &str) {
+        self.query = query.to_string();
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Names in the order the window should paint them.
+    pub fn view(&self) -> Vec<&Entry> {
+        let mut rows: Vec<&Entry> = self
+            .entries
+            .iter()
+            .filter(|entry| self.show_hidden || !entry.is_hidden())
+            .filter(|entry| fuzzy_match(&entry.name.to_string_lossy(), &self.query))
+            .collect();
+        rows.sort_by(|a, b| cmp_entries(a, b, self.sort_key, self.sort_dir, self.folders_first));
+        rows
+    }
+
+    pub fn hidden_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.is_hidden())
+            .count()
+    }
+
+    pub fn selection(&self) -> &BTreeSet<OsString> {
+        &self.selection
+    }
+
+    pub fn cursor(&self) -> Option<&OsString> {
+        self.cursor.as_ref()
+    }
+
+    pub fn select_only(&mut self, name: OsString) {
+        self.selection.clear();
+        self.selection.insert(name.clone());
+        self.cursor = Some(name);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.cursor = None;
+    }
+
+    /// Move the keyboard cursor. `columns` is 1 in the list and the tile
+    /// count of a grid row. `extend` keeps the previous selection (Shift).
+    pub fn move_cursor(&mut self, nav: Nav, extend: bool, columns: usize) {
+        let names: Vec<OsString> = self.view().iter().map(|e| e.name.clone()).collect();
+        if names.is_empty() {
+            self.clear_selection();
+            return;
+        }
+        let columns = columns.max(1);
+        let current = self
+            .cursor
+            .as_ref()
+            .and_then(|name| names.iter().position(|n| n == name))
+            .unwrap_or(0);
+        let next = match nav {
+            Nav::Home => 0,
+            Nav::End => names.len() - 1,
+            Nav::Left => current.saturating_sub(1),
+            Nav::Right => (current + 1).min(names.len() - 1),
+            Nav::Up => current.saturating_sub(columns),
+            Nav::Down => (current + columns).min(names.len() - 1),
+        };
+        let name = names[next].clone();
+        if extend {
+            self.selection.insert(name.clone());
+        } else {
+            self.selection.clear();
+            self.selection.insert(name.clone());
+        }
+        self.cursor = Some(name);
+    }
+
+    /// One virtual grid row, `columns` tiles wide. The last row may be short.
+    pub fn grid_rows(&self, columns: usize) -> Vec<Vec<&Entry>> {
+        let columns = columns.max(1);
+        self.view()
+            .chunks(columns)
+            .map(|chunk| chunk.to_vec())
+            .collect()
+    }
+
+    pub fn upsert(&mut self, entry: Entry) {
+        if let Some(slot) = self.entries.iter_mut().find(|e| e.name == entry.name) {
+            *slot = entry;
+        } else {
+            self.entries.push(entry);
+        }
+    }
+
+    pub fn remove_name(&mut self, name: &OsString) {
+        self.entries.retain(|entry| &entry.name != name);
+        self.selection.remove(name);
+        if self.cursor.as_ref() == Some(name) {
+            self.cursor = None;
+        }
+    }
+}
+
+fn cmp_entries(
+    a: &Entry,
+    b: &Entry,
+    key: SortKey,
+    dir: SortDir,
+    folders_first: bool,
+) -> std::cmp::Ordering {
+    if folders_first && a.is_dir != b.is_dir {
+        return if a.is_dir {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        };
+    }
+    let ordering = match key {
+        SortKey::Name => cmp_name(a, b),
+        SortKey::Date => a.mtime.cmp(&b.mtime).then_with(|| cmp_name(a, b)),
+        SortKey::Size => a.len.cmp(&b.len).then_with(|| cmp_name(a, b)),
+        SortKey::Type => a
+            .extension()
+            .cmp(&b.extension())
+            .then_with(|| cmp_name(a, b)),
+    };
+    if dir == SortDir::Desc {
+        ordering.reverse()
+    } else {
+        ordering
+    }
+}
+
+fn cmp_name(a: &Entry, b: &Entry) -> std::cmp::Ordering {
+    a.name
+        .to_string_lossy()
+        .to_lowercase()
+        .cmp(&b.name.to_string_lossy().to_lowercase())
+}
+
+/// Subsequence match, case-insensitive. An empty query matches everything.
+pub fn fuzzy_match(name: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let name = name.to_lowercase();
+    let mut rest = name.as_str();
+    for ch in query.to_lowercase().chars() {
+        let Some(index) = rest.find(ch) else {
+            return false;
+        };
+        rest = &rest[index + ch.len_utf8()..];
+    }
+    true
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Crumb {
+    pub label: String,
+    pub path: PathBuf,
+}
+
+/// `~/Pictures` becomes `~`, `Pictures` when `path` is under `home`.
+pub fn breadcrumbs(path: &Path, home: Option<&Path>) -> Vec<Crumb> {
+    let mut crumbs = Vec::new();
+    if let Some(home) = home {
+        if let Ok(rest) = path.strip_prefix(home) {
+            crumbs.push(Crumb {
+                label: "~".into(),
+                path: home.to_path_buf(),
+            });
+            let mut acc = home.to_path_buf();
+            for part in rest.components() {
+                acc.push(part);
+                crumbs.push(Crumb {
+                    label: part.as_os_str().to_string_lossy().into_owned(),
+                    path: acc.clone(),
+                });
+            }
+            return crumbs;
+        }
+    }
+    crumbs.push(Crumb {
+        label: "/".into(),
+        path: PathBuf::from("/"),
+    });
+    let mut acc = PathBuf::from("/");
+    for part in path.components().skip(1) {
+        acc.push(part);
+        crumbs.push(Crumb {
+            label: part.as_os_str().to_string_lossy().into_owned(),
+            path: acc.clone(),
+        });
+    }
+    crumbs
+}
+
+/// Coalesce a burst of directory events into one apply.
+#[derive(Debug)]
+pub struct Debounce {
+    delay: Duration,
+    dirty: bool,
+    last: Option<Instant>,
+}
+
+impl Debounce {
+    pub fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            dirty: false,
+            last: None,
+        }
+    }
+
+    pub fn push(&mut self, now: Instant) {
+        self.dirty = true;
+        self.last = Some(now);
+    }
+
+    /// True once `delay` has passed since the latest push.
+    pub fn ready(&mut self, now: Instant) -> bool {
+        let Some(last) = self.last else {
+            return false;
+        };
+        if self.dirty && now.saturating_duration_since(last) >= self.delay {
+            self.dirty = false;
+            self.last = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn entry(name: &str, is_dir: bool, len: u64, secs: u64) -> Entry {
+        Entry {
+            name: OsString::from(name),
+            is_dir,
+            is_symlink: false,
+            len,
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            mode: if is_dir { 0o040755 } else { 0o100644 },
+        }
+    }
+
+    fn names(listing: &Listing) -> Vec<String> {
+        listing
+            .view()
+            .iter()
+            .map(|e| e.name.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn sort_hides_dotfiles_and_puts_folders_first() {
+        let mut listing = Listing::default();
+        listing.set_entries(vec![
+            entry("b.txt", false, 10, 2),
+            entry("a-dir", true, 1, 1),
+            entry(".hidden", false, 3, 3),
+            entry("c.txt", false, 2, 4),
+        ]);
+        assert_eq!(names(&listing), ["a-dir", "b.txt", "c.txt"]);
+        assert_eq!(listing.hidden_count(), 1);
+        listing.set_show_hidden(true);
+        assert_eq!(names(&listing), ["a-dir", ".hidden", "b.txt", "c.txt"]);
+        listing.set_sort(SortKey::Size, SortDir::Desc);
+        assert_eq!(names(&listing)[0], "a-dir");
+        let files: Vec<_> = names(&listing).into_iter().skip(1).collect();
+        assert_eq!(files, ["b.txt", ".hidden", "c.txt"]);
+    }
+
+    #[test]
+    fn type_sort_groups_extensions() {
+        let mut listing = Listing {
+            folders_first: false,
+            ..Listing::default()
+        };
+        listing.set_entries(vec![
+            entry("b.rs", false, 1, 1),
+            entry("a.txt", false, 1, 1),
+            entry("c.rs", false, 1, 1),
+        ]);
+        listing.set_sort(SortKey::Type, SortDir::Asc);
+        assert_eq!(names(&listing), ["b.rs", "c.rs", "a.txt"]);
+    }
+
+    #[test]
+    fn fuzzy_query_and_keyboard() {
+        assert!(fuzzy_match("dune-sunset-0412.jpg", "dsj"));
+        assert!(!fuzzy_match("notes.txt", "xyz"));
+        let mut listing = Listing::default();
+        listing.set_entries(vec![
+            entry("alpha", false, 1, 1),
+            entry("beta", false, 1, 1),
+            entry("gamma", false, 1, 1),
+        ]);
+        listing.set_query("lp");
+        assert_eq!(names(&listing), ["alpha"]);
+        listing.set_query("");
+        listing.move_cursor(Nav::Home, false, 1);
+        listing.move_cursor(Nav::Down, true, 1);
+        assert_eq!(listing.selection().len(), 2);
+        listing.move_cursor(Nav::End, false, 3);
+        assert_eq!(listing.cursor().unwrap(), "gamma");
+        let rows = listing.grid_rows(2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].len(), 1);
+    }
+
+    #[test]
+    fn breadcrumbs_collapse_home() {
+        let home = Path::new("/home/sky");
+        let crumbs = breadcrumbs(Path::new("/home/sky/Pictures/2026"), Some(home));
+        let labels: Vec<_> = crumbs.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["~", "Pictures", "2026"]);
+        assert_eq!(crumbs[1].path, PathBuf::from("/home/sky/Pictures"));
+    }
+
+    #[test]
+    fn debounce_waits_for_quiet() {
+        let mut debounce = Debounce::new(Duration::from_millis(50));
+        let t0 = Instant::now();
+        assert!(!debounce.ready(t0));
+        debounce.push(t0);
+        assert!(!debounce.ready(t0 + Duration::from_millis(49)));
+        debounce.push(t0 + Duration::from_millis(40));
+        assert!(!debounce.ready(t0 + Duration::from_millis(80)));
+        assert!(debounce.ready(t0 + Duration::from_millis(90)));
+        assert!(!debounce.ready(t0 + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn incremental_upsert_and_remove() {
+        let mut listing = Listing::default();
+        listing.set_entries(vec![entry("a", false, 1, 1)]);
+        listing.upsert(entry("b", false, 2, 2));
+        listing.upsert(entry("a", false, 9, 1));
+        assert_eq!(listing.view()[0].len, 9);
+        listing.remove_name(&OsString::from("b"));
+        assert_eq!(names(&listing), ["a"]);
+    }
+
+    #[test]
+    fn reads_a_real_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "robin-model-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("note.txt"), b"hi").unwrap();
+        fs::write(root.join(".secret"), b"no").unwrap();
+        let dir = DirFd::open(&root).unwrap();
+        let listing = Listing::from_dir(&dir).unwrap();
+        assert_eq!(names(&listing), ["sub", "note.txt"]);
+        let _ = fs::remove_dir_all(root);
+    }
+}
