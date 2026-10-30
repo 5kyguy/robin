@@ -58,6 +58,10 @@ pub fn known(view: &str) -> bool {
             | "viewer-slideshow"
             | "shortcuts-viewer"
             | "theme-black-viewer"
+            | "stats-overview"
+            | "stats-treemap-drilled"
+            | "stats-empty-trash"
+            | "theme-black-stats"
     )
 }
 
@@ -220,6 +224,15 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "viewer-resume" => "resume",
             "viewer-info" => "info",
             "viewer-slideshow" => "slideshow",
+            _ => "",
+        }
+        .into(),
+    );
+    ui.set_stats_mode(
+        match view {
+            "stats-overview" | "theme-black-stats" => "overview",
+            "stats-treemap-drilled" => "drilled",
+            "stats-empty-trash" => "empty-trash",
             _ => "",
         }
         .into(),

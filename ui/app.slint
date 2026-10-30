@@ -377,6 +377,7 @@ export component AppWindow inherits Window {
     in property <string> state: "files";
     in property <string> overlay: "";
     in property <string> viewer: "";
+    in property <string> stats-mode: "";
     in property <string> status-left: "15 items · 1 hidden";
     in property <string> status-right: "812 GB free of 1.8 TB";
     in property <bool> hidden-on: false;
@@ -1527,6 +1528,69 @@ export component AppWindow inherits Window {
             height: 2px;
             width: parent.width * 0.4;
             background: accent;
+        }
+    }
+
+    if !harness && stats-mode != "": Rectangle {
+        background: bg;
+        x: side-w + 1px;
+        width: parent.width - side-w - 1px;
+        height: parent.height;
+        VerticalLayout {
+            padding: 24px;
+            spacing: 16px;
+            Text { text: "STATISTICS"; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; }
+            HorizontalLayout {
+                spacing: 12px;
+                alignment: center;
+                Text { text: "󰋊"; font-size: 16px; color: muted; }
+                Text { text: "r2-root  /"; font-size: 12px; color: text; }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 10px;
+                    border-radius: 5px;
+                    background: text.with-alpha(0.12);
+                    Rectangle { width: parent.width * 0.58; height: 10px; border-radius: 5px; background: accent; }
+                }
+                Text { text: "58%"; font-size: 28px; font-weight: 700; color: text; }
+            }
+            HorizontalLayout {
+                spacing: 12px;
+                alignment: center;
+                Text { text: "󰋊"; font-size: 16px; color: muted; }
+                Text { text: "archive  /mnt/archive"; font-size: 12px; color: text; }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 10px;
+                    border-radius: 5px;
+                    background: text.with-alpha(0.12);
+                    Rectangle { width: parent.width * 0.91; height: 10px; border-radius: 5px; background: warning; }
+                }
+                Text { text: "91%"; font-size: 28px; font-weight: 700; color: text; }
+            }
+            Text { text: stats-mode == "drilled" ? "LARGEST FOLDERS  ›  Videos" : "LARGEST FOLDERS"; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; }
+            HorizontalLayout {
+                spacing: 8px;
+                height: 160px;
+                Rectangle { width: parent.width * 0.45; height: 160px; background: accent.with-alpha(0.70); border-radius: 3px; Text { text: "Videos\n412 GB"; font-size: 11px; color: on-accent; horizontal-alignment: center; vertical-alignment: center; } }
+                Rectangle { width: parent.width * 0.25; height: 160px; background: accent.with-alpha(0.45); border-radius: 3px; Text { text: "Pictures\n141 GB"; font-size: 11px; color: text; horizontal-alignment: center; vertical-alignment: center; } }
+                Rectangle { horizontal-stretch: 1; height: 160px; background: accent.with-alpha(0.25); border-radius: 3px; Text { text: "Music\n58 GB"; font-size: 11px; color: text; horizontal-alignment: center; vertical-alignment: center; } }
+            }
+            if stats-mode == "empty-trash": Rectangle {
+                width: 440px;
+                height: 160px;
+                background: surface;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: hairline;
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 8px;
+                    Rectangle { height: 3px; background: danger; }
+                    Text { text: "Permanently delete 2 318 items (4.7 GB)?"; font-size: 13px; font-weight: 700; color: text; }
+                    Text { text: "This can't be undone."; font-size: 12px; color: muted; }
+                }
+            }
         }
     }
 
