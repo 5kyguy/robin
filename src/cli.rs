@@ -3,8 +3,6 @@
 
 use std::path::PathBuf;
 
-use slint::ComponentHandle;
-
 use crate::error::{Error, Result};
 use crate::fixture;
 use crate::theme::Theme;
@@ -68,13 +66,6 @@ fn default_demo_dir() -> PathBuf {
     std::env::temp_dir().join("robin-demo")
 }
 
-struct RenderArgs {
-    view: String,
-    size: (u32, u32),
-    theme: Theme,
-    out: PathBuf,
-}
-
 fn render<'a>(mut iter: impl Iterator<Item = &'a std::ffi::OsString>) -> Result<i32> {
     let view = iter
         .next()
@@ -113,17 +104,10 @@ fn render<'a>(mut iter: impl Iterator<Item = &'a std::ffi::OsString>) -> Result<
         }
     };
     let out = out.unwrap_or_else(|| PathBuf::from(format!("{view}.png")));
-    if view != "harness" {
-        return Err(Error::Message(format!(
-            "view `{view}` is not built yet. The harness frame is `harness`."
-        )));
+    if !crate::shots::known(&view) {
+        return Err(Error::Message(format!("view `{view}` is not built yet")));
     }
-    paint_harness(&RenderArgs {
-        view,
-        size,
-        theme,
-        out: out.clone(),
-    })?;
+    crate::shots::paint(&view, &theme, size, &out)?;
     println!("{}", out.display());
     Ok(0)
 }
@@ -142,47 +126,6 @@ fn parse_size(text: &str) -> Result<(u32, u32)> {
         return Err(Error::Message("size must be non-zero".into()));
     }
     Ok((w, h))
-}
-
-fn paint_harness(args: &RenderArgs) -> Result<()> {
-    // Scale 1 keeps a 1280×800 request at 1280×800 physical pixels.
-    // The software renderer implements take_snapshot. FemtoVG's GL backend
-    // does not until a frame has been presented, and it needs a GL display.
-    std::env::set_var("SLINT_SCALE_FACTOR", "1");
-    let _ = slint::BackendSelector::new()
-        .renderer_name("software".into())
-        .select();
-    let _ = slint::set_xdg_app_id("dev.skyguy.robin");
-    let ui = crate::AppWindow::new().map_err(|e| Error::Message(e.to_string()))?;
-    let theme = &args.theme;
-    ui.set_bg(theme.bg.to_slint());
-    ui.set_surface(theme.surface.to_slint());
-    ui.set_text(theme.text.to_slint());
-    ui.set_muted(theme.muted.to_slint());
-    ui.set_accent(theme.accent.to_slint());
-    ui.set_on_accent(theme.on_accent.to_slint());
-    ui.set_label(args.view.clone().into());
-    ui.window()
-        .set_size(slint::PhysicalSize::new(args.size.0, args.size.1));
-    ui.show().map_err(|e| Error::Message(e.to_string()))?;
-    let buffer = ui
-        .window()
-        .take_snapshot()
-        .map_err(|e| Error::Message(e.to_string()))?;
-    if let Some(parent) = args.out.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-        }
-    }
-    image::save_buffer(
-        &args.out,
-        buffer.as_bytes(),
-        buffer.width(),
-        buffer.height(),
-        image::ExtendedColorType::Rgba8,
-    )
-    .map_err(|e| Error::Message(format!("write {}: {e}", args.out.display())))?;
-    Ok(())
 }
 
 /// True when a display server is reachable. Render tests skip otherwise.
@@ -222,7 +165,7 @@ mod tests {
 
     #[test]
     fn unknown_view_is_an_error() {
-        let err = run(["--render", "browser-list"]).unwrap_err();
+        let err = run(["--render", "not-a-view"]).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("not built"), "{message}");
     }
