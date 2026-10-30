@@ -10,11 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.99.1"
-          components: rustfmt, clippy
       - name: system packages
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap xvfb libxkbcommon-x11-0
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap xvfb pkg-config libfontconfig1-dev libxkbcommon-x11-0
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: xvfb-run -a cargo test

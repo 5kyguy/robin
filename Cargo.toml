@@ -6,7 +6,7 @@ license = "GPL-3.0-only"
 description = "File manager and media viewer for the R2-D2 desktop"
 repository = "https://github.com/5kyguy/robin"
 readme = "README.md"
-rust-version = "1.85"
+rust-version = "1.99.1"
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
