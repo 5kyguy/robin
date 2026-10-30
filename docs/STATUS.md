@@ -19,6 +19,7 @@ Designr's mockups are committed at `docs/mockups/{01-list,02-grid,03-viewer,04-s
 | Browser UI | in review |
 | Thumbnails | in review |
 | Fsops | in review |
+| Viewer | in review |
 | Thumbnails | not started |
 | Fsops | not started |
 | Viewer | not started |

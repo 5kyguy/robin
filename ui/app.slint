@@ -299,6 +299,62 @@ component JobRow inherits Rectangle {
     }
 }
 
+component FilmTile inherits Rectangle {
+    in property <image> shot;
+    in property <bool> current;
+    in property <color> ring;
+    width: 72px;
+    height: 48px;
+    border-radius: 3px;
+    border-width: current ? 2px : 0px;
+    border-color: ring;
+    Image {
+        source: shot;
+        width: parent.width;
+        height: parent.height;
+        image-fit: cover;
+        opacity: current ? 1 : 0.62;
+    }
+    if current: Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-radius: 3px;
+        border-width: 2px;
+        border-color: ring;
+    }
+}
+
+component MetaRow inherits Rectangle {
+    in property <string> key;
+    in property <string> value;
+    in property <color> ink;
+    in property <color> muted-ink;
+    height: 20px;
+    Text {
+        text: key;
+        x: 0px;
+        y: 0px;
+        width: 120px;
+        height: parent.height;
+        font-size: 12px;
+        color: muted-ink;
+        horizontal-alignment: left;
+        vertical-alignment: center;
+    }
+    Text {
+        text: value;
+        x: 120px;
+        y: 0px;
+        width: parent.width - 120px;
+        height: parent.height;
+        font-size: 12px;
+        color: ink;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}
+
 export component AppWindow inherits Window {
     property <length> row-h: compact ? 24px : 30px;
     in property <bool> harness: true;
@@ -320,6 +376,7 @@ export component AppWindow inherits Window {
     in property <length> tile: 152px;
     in property <string> state: "files";
     in property <string> overlay: "";
+    in property <string> viewer: "";
     in property <string> status-left: "15 items · 1 hidden";
     in property <string> status-right: "812 GB free of 1.8 TB";
     in property <bool> hidden-on: false;
@@ -1218,6 +1275,258 @@ export component AppWindow inherits Window {
                 border-color: line;
                 Text { text: "Replace"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
             }
+        }
+    }
+
+    if !harness && viewer != "": Rectangle {
+        clip: true;
+        property <length> open-w: viewer == "info" ? parent.width - 328px : parent.width;
+        background: #000000;
+        Rectangle { background: bg.with-alpha(0.30); width: parent.width; height: parent.height; }
+        if viewer == "image" || viewer == "hidden" || viewer == "info" || viewer == "slideshow": Image {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            source: @image-url("../assets/viewer/dune-sunset.png");
+            image-fit: contain;
+        }
+        if viewer == "zoom": Image {
+            source: @image-url("../assets/viewer/dune-sunset.png");
+            width: parent.width * 4;
+            height: parent.height * 4;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            image-fit: contain;
+        }
+        if viewer == "video" || viewer == "scrub" || viewer == "resume": Image {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            source: @image-url("../assets/viewer/speeder-frame.png");
+            image-fit: contain;
+        }
+        if viewer != "hidden" && viewer != "slideshow": Rectangle {
+            y: 16px;
+            x: (open-w - self.width) / 2;
+            width: 560px;
+            height: 40px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 12px;
+                Text { text: "󰁍"; font-size: 16px; color: text; vertical-alignment: center; }
+                Text { text: viewer == "video" || viewer == "scrub" || viewer == "resume" ? "speeder-run.mp4" : "dune-sunset-0412.jpg"; font-size: 13px; font-weight: 700; color: text; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                Text { text: "6 / 248"; font-size: 11px; color: muted; vertical-alignment: center; }
+                Text { text: "󰋽"; font-size: 16px; color: text; vertical-alignment: center; }
+                Text { text: "󰐊"; font-size: 16px; color: text; vertical-alignment: center; }
+                Text { text: "󰇘"; font-size: 16px; color: text; vertical-alignment: center; }
+            }
+        }
+        if viewer != "hidden" && viewer != "slideshow": Rectangle {
+            y: parent.height - 138px;
+            x: (open-w - self.width) / 2;
+            width: 844px;
+            height: 60px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            HorizontalLayout {
+                padding: 6px;
+                spacing: 4px;
+                FilmTile { shot: @image-url("../assets/viewer/tile-a.png"); current: false; ring: root.accent; }
+                FilmTile { shot: @image-url("../assets/viewer/tile-b.png"); current: false; ring: root.accent; }
+                FilmTile { shot: @image-url("../assets/viewer/tile-c.png"); current: false; ring: root.accent; }
+                FilmTile { shot: @image-url("../assets/viewer/tile-d.png"); current: false; ring: root.accent; }
+                FilmTile { shot: @image-url("../assets/viewer/tile-e.png"); current: false; ring: root.accent; }
+                FilmTile { shot: @image-url("../assets/viewer/dune-sunset.png"); current: true; ring: root.accent; }
+                FilmTile { shot: @image-url("../assets/viewer/tile-f.png"); current: false; ring: root.accent; }
+                FilmTile { shot: @image-url("../assets/viewer/speeder-frame.png"); current: false; ring: root.accent; }
+                FilmTile { shot: @image-url("../assets/viewer/tile-a.png"); current: false; ring: root.accent; }
+                FilmTile { shot: @image-url("../assets/viewer/tile-b.png"); current: false; ring: root.accent; }
+                FilmTile { shot: @image-url("../assets/viewer/tile-c.png"); current: false; ring: root.accent; }
+            }
+        }
+        if viewer != "hidden" && viewer != "slideshow" && viewer != "video" && viewer != "scrub" && viewer != "resume": Rectangle {
+            y: parent.height - 16px - 46px;
+            x: (open-w - self.width) / 2;
+            width: 420px;
+            height: 46px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            HorizontalLayout {
+                alignment: center;
+                spacing: 16px;
+                Text { text: "󰁍   󰁔   −   fit   1:1   +   󰑙"; font-size: 14px; color: text; vertical-alignment: center; }
+            }
+        }
+        if viewer == "video" || viewer == "scrub" || viewer == "resume": Rectangle {
+            y: parent.height - 16px - 46px;
+            x: 60px;
+            width: parent.width - 120px;
+            height: 46px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            property <length> track-h: viewer == "scrub" ? 5px : 3px;
+            property <length> track-x: 156px;
+            property <length> track-w: self.width - 276px;
+            Text {
+                text: viewer == "video" ? "󰐊" : "󰏤";
+                x: 12px;
+                y: 0px;
+                width: 20px;
+                height: parent.height;
+                font-size: 16px;
+                color: text;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "01:12 / 04:30";
+                x: 40px;
+                y: 0px;
+                width: 108px;
+                height: parent.height;
+                font-size: 11px;
+                color: muted;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                x: track-x;
+                y: (parent.height - track-h) / 2;
+                width: track-w;
+                height: track-h;
+                border-radius: 2px;
+                background: text.with-alpha(0.20);
+                Rectangle { x: 0px; y: 0px; width: parent.width * 0.27; height: parent.height; background: accent; border-radius: 2px; }
+            }
+            Rectangle {
+                x: track-x + track-w * 0.27 - 6px;
+                y: (parent.height - 12px) / 2;
+                width: 12px;
+                height: 12px;
+                border-radius: 6px;
+                background: text;
+                border-width: 2px;
+                border-color: accent;
+            }
+            Text {
+                text: "1.0×";
+                x: parent.width - 96px;
+                y: 0px;
+                width: 40px;
+                height: parent.height;
+                font-size: 11px;
+                color: text;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "󰕾";
+                x: parent.width - 40px;
+                y: 0px;
+                width: 24px;
+                height: parent.height;
+                font-size: 16px;
+                color: text;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        if viewer == "info": Rectangle {
+            x: parent.width - 16px - 300px;
+            y: 72px;
+            width: 300px;
+            height: parent.height - 88px;
+            background: bg.with-alpha(0.92);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 0px;
+                alignment: start;
+                Text { text: "dune-sunset-0412.jpg"; font-size: 13px; font-weight: 700; color: text; height: 20px; }
+                Text { text: "~/Pictures/tatooine-trip"; font-size: 11px; color: muted; height: 18px; }
+                Rectangle { height: 12px; }
+                Text { text: "FILE"; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; height: 20px; }
+                MetaRow { key: "Size"; value: "6.2 MB"; ink: root.text; muted-ink: root.muted; }
+                MetaRow { key: "Type"; value: "JPEG"; ink: root.text; muted-ink: root.muted; }
+                MetaRow { key: "Dimensions"; value: "6000 × 4000"; ink: root.text; muted-ink: root.muted; }
+                MetaRow { key: "Modified"; value: "2026-10-30 15:41"; ink: root.text; muted-ink: root.muted; }
+                Rectangle { height: 12px; }
+                Text { text: "CAMERA"; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; height: 20px; }
+                MetaRow { key: "Model"; value: "Fujifilm X-T5"; ink: root.text; muted-ink: root.muted; }
+                MetaRow { key: "Lens"; value: "XF 23mm F1.4"; ink: root.text; muted-ink: root.muted; }
+                MetaRow { key: "ISO"; value: "160"; ink: root.text; muted-ink: root.muted; }
+                MetaRow { key: "Aperture"; value: "f/8"; ink: root.text; muted-ink: root.muted; }
+                MetaRow { key: "Shutter"; value: "1/500"; ink: root.text; muted-ink: root.muted; }
+                MetaRow { key: "Focal"; value: "23 mm"; ink: root.text; muted-ink: root.muted; }
+                Rectangle { height: 12px; }
+                Text { text: "LOCATION"; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; height: 20px; }
+                MetaRow { key: "Coords"; value: "33.98, 7.60"; ink: root.text; muted-ink: root.muted; }
+            }
+        }
+        if viewer == "zoom": Rectangle {
+            x: parent.width - 16px - 120px;
+            y: parent.height - 16px - 80px;
+            width: 120px;
+            height: 80px;
+            background: #000000;
+            border-width: 1px;
+            border-color: hairline;
+            Image {
+                source: @image-url("../assets/viewer/dune-sunset.png");
+                width: parent.width;
+                height: parent.height;
+                image-fit: cover;
+            }
+            Rectangle {
+                x: (parent.width - 30px) / 2;
+                y: (parent.height - 22px) / 2;
+                width: 30px;
+                height: 22px;
+                border-width: 1px;
+                border-color: accent;
+            }
+        }
+        if viewer == "zoom": Rectangle {
+            x: parent.width - 16px - 64px;
+            y: 64px;
+            width: 64px;
+            height: 22px;
+            background: bg.with-alpha(0.86);
+            border-radius: 2px;
+            border-width: 1px;
+            border-color: hairline;
+            Text { text: "400%"; font-size: 11px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        if viewer == "resume": Rectangle {
+            x: (parent.width - 280px) / 2;
+            y: parent.height - 194px;
+            width: 280px;
+            height: 40px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            Text { text: "Resume at 02:14?"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        if viewer == "slideshow": Rectangle {
+            y: parent.height - 2px;
+            height: 2px;
+            width: parent.width * 0.4;
+            background: accent;
         }
     }
 
