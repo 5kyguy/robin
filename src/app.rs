@@ -127,6 +127,8 @@ pub struct Controller {
     /// A fixed (now, UTC offset) for tests and renders; the system clock
     /// and zone otherwise.
     pub clock: Option<(i64, i64)>,
+    /// Item counts of the folders in the open folder, taken on each reread.
+    pub counts: std::collections::HashMap<OsString, usize>,
 }
 
 pub mod keys {
@@ -164,6 +166,7 @@ impl Controller {
             pressed: None,
             job_running: false,
             clock: None,
+            counts: Default::default(),
         }
     }
 
@@ -188,7 +191,22 @@ impl Controller {
 
     pub fn reload(&mut self) -> Result<()> {
         let fd = DirFd::open(&self.dir)?;
-        self.listing.replace_dir(&fd)
+        self.listing.replace_dir(&fd)?;
+        self.counts = self
+            .listing
+            .entries()
+            .iter()
+            .filter(|e| e.is_dir)
+            .filter_map(|e| {
+                let n = DirFd::open(&self.dir.join(&e.name))
+                    .ok()?
+                    .list()
+                    .ok()?
+                    .len();
+                Some((e.name.clone(), n))
+            })
+            .collect();
+        Ok(())
     }
 
     fn names(&self) -> Vec<OsString> {
@@ -517,16 +535,11 @@ impl Controller {
             .map(|(i, e)| Row {
                 glyph: if e.is_dir { "󰉋" } else { "󰈔" }.into(),
                 name: e.name.to_string_lossy().as_ref().into(),
-                size: if e.is_dir {
-                    String::new()
-                } else {
-                    human(e.len)
-                }
-                .into(),
+                size: size_line(e.is_dir, e.len, self.counts.get(&e.name).copied()).into(),
                 kind: if e.is_dir {
                     "Folder".into()
                 } else {
-                    e.extension().to_uppercase()
+                    kind_name(&e.extension())
                 }
                 .into(),
                 modified: crate::model::format_modified(secs(e.mtime), now, offset).into(),
@@ -1148,6 +1161,41 @@ pub fn conflict_props(ui: &AppWindow, ask: &ConflictAsk, apply_all: bool) {
 
 /// A conflict side's size line: a file's size, or a folder's item count
 /// as the list view shows it.
+/// Thunar-style type names for the Type column; unknown extensions read
+/// as "XYZ file" and files without one as "File".
+pub fn kind_name(ext: &str) -> String {
+    let ext = ext.to_ascii_lowercase();
+    let known = match ext.as_str() {
+        "jpg" | "jpeg" => "JPEG image",
+        "png" => "PNG image",
+        "gif" => "GIF image",
+        "webp" => "WebP image",
+        "heic" | "heif" => "HEIC image",
+        "svg" => "SVG image",
+        "tif" | "tiff" => "TIFF image",
+        "raw" | "cr2" | "nef" | "arw" | "dng" => "Raw image",
+        "mp4" | "m4v" => "MPEG-4 video",
+        "mkv" => "Matroska video",
+        "webm" => "WebM video",
+        "mov" => "QuickTime video",
+        "mp3" => "MP3 audio",
+        "flac" => "FLAC audio",
+        "ogg" | "opus" => "Ogg audio",
+        "wav" => "WAV audio",
+        "md" => "Markdown",
+        "txt" => "Plain text",
+        "toml" => "TOML",
+        "json" => "JSON",
+        "pdf" => "PDF document",
+        "zip" | "tar" | "gz" | "xz" | "zst" | "7z" => "Archive",
+        "rs" => "Rust source",
+        "sh" => "Shell script",
+        "" => "File",
+        _ => return format!("{} file", ext.to_uppercase()),
+    };
+    known.to_string()
+}
+
 pub fn size_line(dir: bool, size: u64, items: Option<usize>) -> String {
     match (dir, items) {
         (false, _) => human(size),
@@ -1982,5 +2030,26 @@ mod tests {
         c.refresh().unwrap();
         assert_eq!(c.dir, gone.parent().unwrap());
         assert_eq!(c.sort_header(), (1, false), "sort survives the fallback");
+    }
+
+    #[test]
+    fn folders_show_item_counts_and_files_a_type_name() {
+        let mut c = setup("counts");
+        for n in ["1.raw", "2.raw", ".hidden"] {
+            fs::write(c.dir.join("raw-exports").join(n), b"x").unwrap();
+        }
+        fs::write(c.dir.join("notes.md"), b"#").unwrap();
+        fs::write(c.dir.join("blob.xyz"), b"?").unwrap();
+        c.reload().unwrap();
+        let rows = c.rows();
+        let get = |n: &str| rows.iter().find(|r| r.name == n).unwrap().clone();
+        assert_eq!(get("raw-exports").size, "3 items");
+        assert_eq!(get("raw-exports").kind, "Folder");
+        assert_eq!(get("a.jpg").kind, "JPEG image");
+        assert_eq!(get("notes.md").kind, "Markdown");
+        assert_eq!(get("blob.xyz").kind, "XYZ file");
+        fs::write(c.dir.join("raw-exports/3.raw"), b"x").unwrap();
+        c.refresh().unwrap();
+        assert_eq!(c.rows()[0].size, "4 items", "counts are retaken on refresh");
     }
 }

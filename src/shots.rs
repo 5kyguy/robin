@@ -1131,6 +1131,14 @@ fn list_scene(ui: &AppWindow, view: &str) {
         e("shot-list.md", false, 1_200, 10 * 86_400),
         e("binary-sunset.flac", false, 39_000_000, 77 * 86_400),
     ]);
+    for (name, n) in [
+        ("raw-exports", 48),
+        ("tatooine-trip", 312),
+        ("Desert-10", 7),
+        ("Desert-9", 0),
+    ] {
+        ctl.counts.insert(name.into(), n);
+    }
     match view {
         "list-modified-sorted" => {
             ctl.sort_by(3);

@@ -177,6 +177,11 @@ impl Listing {
             .count()
     }
 
+    /// Everything read from the folder, hidden or filtered or not.
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
     pub fn selection(&self) -> &BTreeSet<OsString> {
         &self.selection
     }
