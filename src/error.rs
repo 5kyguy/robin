@@ -21,6 +21,9 @@ pub enum Error {
     /// these source entries could not be removed afterwards.
     #[error("can't move: {} item(s) can't be removed from the source, nothing was copied", .0.len())]
     NotRemovable(Vec<crate::fsops::KeptEntry>),
+    /// Copy instead was refused because these folders can't be read.
+    #[error("can't copy: {} folder(s) can't be read, nothing was copied", .0.len())]
+    Unreadable(Vec<crate::fsops::KeptEntry>),
 }
 
 impl Error {

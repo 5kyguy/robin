@@ -11,7 +11,7 @@ use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::error::{Error, Result};
 use crate::theme::Theme;
-use crate::{AppWindow, GridLine, MapCell, Place, Row};
+use crate::{AppWindow, GridLine, MapCell, Place, RefusalLine, Row};
 
 pub fn known(view: &str) -> bool {
     matches!(
@@ -47,6 +47,7 @@ pub fn known(view: &str) -> bool {
             | "skipped-details"
             | "move-partial"
             | "move-refused"
+            | "move-refused-unreadable"
             | "menu-file"
             | "shortcuts-browser"
             | "reduce-motion"
@@ -198,25 +199,37 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         }
         .into(),
     );
-    let refused = crate::fsops::refusal(
-        "Projects",
-        &[
-            crate::fsops::KeptEntry {
-                path: "Projects/robin/vendor/fonts/Inter.ttf".into(),
-                reason: crate::fsops::KeepReason::ReadOnlyFolder,
-            },
-            crate::fsops::KeptEntry {
-                path: "Projects/robin/vendor/fonts/Mono.ttf".into(),
-                reason: crate::fsops::KeepReason::ReadOnlyFolder,
-            },
-        ],
-    );
+    let kept = |path: &str, reason| crate::fsops::KeptEntry {
+        path: path.into(),
+        reason,
+    };
+    let mut blocked = vec![
+        kept(
+            "Projects/robin/vendor/fonts/Inter.ttf",
+            crate::fsops::KeepReason::ReadOnlyFolder,
+        ),
+        kept(
+            "Projects/robin/vendor/fonts/Mono.ttf",
+            crate::fsops::KeepReason::ReadOnlyFolder,
+        ),
+    ];
+    if view == "move-refused-unreadable" {
+        blocked = vec![kept(
+            "Projects/robin/.cache",
+            crate::fsops::KeepReason::UnreadableFolder,
+        )];
+    }
+    let refused = crate::fsops::refusal("Projects", &blocked);
     ui.set_refusal_title(refused.title.into());
-    ui.set_refusal_paths(ModelRc::new(Rc::new(VecModel::from(
+    ui.set_refusal_can_copy(refused.can_copy_instead);
+    ui.set_refusal_lines(ModelRc::new(Rc::new(VecModel::from(
         refused
-            .paths
+            .lines
             .into_iter()
-            .map(slint::SharedString::from)
+            .map(|l| RefusalLine {
+                path: l.path.into(),
+                note: l.note.unwrap_or_default().into(),
+            })
             .collect::<Vec<_>>(),
     ))));
     let (tone, text, details) = toast(view);
@@ -245,7 +258,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "skipped" => "skipped",
             "skipped-details" => "skipped-details",
             "move-partial" => "toast-details",
-            "move-refused" => "move-refused",
+            "move-refused" | "move-refused-unreadable" => "move-refused",
             "menu-file" => "menu-file",
             "shortcuts-browser" | "shortcuts-viewer" => "shortcuts",
             _ => "",

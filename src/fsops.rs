@@ -544,10 +544,22 @@ pub struct Refusal {
     /// "Can't move Projects: 1 folder inside is read-only" for one reason,
     /// "Can't move Projects: 2 items can't be removed afterwards" for several.
     pub title: String,
-    /// The blocking paths: the read-only folders themselves, and the items
-    /// in shared folders or on read-only drives.
-    pub paths: Vec<String>,
+    /// The blocking paths: the read-only or unreadable folders themselves,
+    /// and the items in shared folders or on read-only drives.
+    pub lines: Vec<RefusalLine>,
+    /// False when a folder can't be read: it can't be copied either, so the
+    /// dialog offers only Cancel.
+    pub can_copy_instead: bool,
 }
+
+/// One blocking path in the dialog, with a note shown under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusalLine {
+    pub path: String,
+    pub note: Option<String>,
+}
+
+pub const UNREADABLE_NOTE: &str = "Robin can't read this folder, so it can't be copied either.";
 
 /// What the move-refused dialog offers. Copy instead is the default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -607,13 +619,17 @@ pub fn refusal(name: &str, blocked: &[KeptEntry]) -> Refusal {
     if !drive.is_empty() {
         parts.push("the drive is read-only".to_string());
     }
-    let paths = folders
+    let line = |p: &std::path::PathBuf, note: Option<&str>| RefusalLine {
+        path: p.display().to_string(),
+        note: note.map(str::to_string),
+    };
+    let lines = folders
         .iter()
-        .chain(&locked)
-        .chain(&shared)
-        .chain(&drive)
-        .map(|p| p.display().to_string())
+        .map(|p| line(p, None))
+        .chain(locked.iter().map(|p| line(p, Some(UNREADABLE_NOTE))))
+        .chain(shared.iter().chain(&drive).map(|p| line(p, None)))
         .collect();
+    let can_copy_instead = locked.is_empty();
     let why = if parts.len() == 1 {
         parts.remove(0)
     } else {
@@ -624,7 +640,8 @@ pub fn refusal(name: &str, blocked: &[KeptEntry]) -> Refusal {
     };
     Refusal {
         title: format!("Can't move {name}: {why}"),
-        paths,
+        lines,
+        can_copy_instead,
     }
 }
 
@@ -637,6 +654,16 @@ pub fn copy_instead(
     to: &std::ffi::OsStr,
     copy: CopyOpts<'_>,
 ) -> Result<(CopyOutcome, TransferReport)> {
+    // A folder we can't open can't be copied either: refuse before copying.
+    let from_c = component(from)?;
+    let stat = rustix::fs::statat(parent.as_fd(), from_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(from, e))?;
+    let mut blocked = Vec::new();
+    removal_blockers(parent, from, stat.st_dev, Path::new(from), 0, &mut blocked)?;
+    blocked.retain(|k| k.reason == KeepReason::UnreadableFolder);
+    if !blocked.is_empty() {
+        return Err(Error::Unreadable(blocked));
+    }
     let mut opts = MoveOpts {
         force_copy: true,
         fail_before_unlink: false,
@@ -2629,7 +2656,11 @@ mod tests {
                     refusal("src", &blocked),
                     Refusal {
                         title: "Can't move src: 1 folder inside is read-only".into(),
-                        paths: vec!["src/inner".into()],
+                        lines: vec![RefusalLine {
+                            path: "src/inner".into(),
+                            note: None,
+                        }],
+                        can_copy_instead: true,
                     }
                 );
             }
@@ -2735,7 +2766,13 @@ mod tests {
             ],
         );
         assert_eq!(r.title, "Can't move a: 4 items can't be removed afterwards");
-        assert_eq!(r.paths, vec!["a/x", "a/y", "a/s/4"]);
+        let paths: Vec<_> = r.lines.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, vec!["a/x", "a/y", "a/s/4"]);
+        assert!(r.lines.iter().all(|l| l.note.is_none()));
+        assert!(
+            r.can_copy_instead,
+            "read-only and sticky can still be copied"
+        );
     }
 
     #[test]
@@ -2844,6 +2881,78 @@ mod tests {
         let acc = Error::from_errno("x", Errno::ACCESS);
         assert_eq!(keep_reason(&acc, true), Some(KeepReason::ReadOnlyFolder));
         assert_eq!(keep_reason(&Error::from_errno("x", Errno::IO), false), None);
+    }
+
+    #[test]
+    fn unreadable_folder_offers_only_cancel() {
+        let k = |p: &str, reason| KeptEntry {
+            path: p.into(),
+            reason,
+        };
+        let r = refusal(
+            "Projects",
+            &[
+                k("Projects/ro/f", KeepReason::ReadOnlyFolder),
+                k("Projects/locked", KeepReason::UnreadableFolder),
+            ],
+        );
+        assert!(!r.can_copy_instead);
+        assert_eq!(
+            r.lines,
+            vec![
+                RefusalLine {
+                    path: "Projects/ro".into(),
+                    note: None,
+                },
+                RefusalLine {
+                    path: "Projects/locked".into(),
+                    note: Some(UNREADABLE_NOTE.into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_instead_refuses_an_unreadable_folder() {
+        if running_as_root() {
+            return;
+        }
+        let root = scratch("copy-unreadable");
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("locked")).unwrap();
+        std::fs::write(src.join("locked/f"), b"x").unwrap();
+        std::fs::write(src.join("a"), b"a").unwrap();
+        std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let dir = DirFd::open(&root).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = replace_ask;
+        let result = copy_instead(
+            &dir,
+            std::ffi::OsStr::new("src"),
+            &dir,
+            std::ffi::OsStr::new("dest"),
+            CopyOpts {
+                cancel: &cancel,
+                policy: &mut policy,
+                ask: &mut ask,
+            },
+        );
+        std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        match result {
+            Err(Error::Unreadable(blocked)) => assert_eq!(
+                blocked,
+                vec![KeptEntry {
+                    path: "src/locked".into(),
+                    reason: KeepReason::UnreadableFolder,
+                }]
+            ),
+            other => panic!("expected an unreadable refusal, got {other:?}"),
+        }
+        assert!(!root.join("dest").exists(), "nothing is copied");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn mode_bits(path: &Path) -> u32 {
