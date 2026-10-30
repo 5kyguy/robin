@@ -1,63 +1,1086 @@
 import "../assets/fonts/JetBrainsMonoNerdFont-Regular.ttf";
 import "../assets/fonts/JetBrainsMonoNerdFont-Bold.ttf";
 import "../assets/fonts/JetBrainsMonoNerdFont-Medium.ttf";
+import { ListView } from "std-widgets.slint";
 
-// Harness window. Browser, viewer, and statistics replace this layout.
-// Colors arrive from Rust. The defaults are the cyan reference so a missed
-// binding is still on-palette.
+// Column x positions are computed once from the list width. Header and rows
+// both call these. Name is whatever is left; the other cells do not move.
+export global Columns {
+    out property <length> pad: 12px;
+    out property <length> icon-w: 20px;
+    out property <length> name-x: 40px;
+    out property <length> gutter: 16px;
+    out property <length> size-w: 88px;
+    out property <length> type-w: 120px;
+    out property <length> mod-w: 140px;
+    public pure function mod-x(row-w: length) -> length {
+        row-w - pad - mod-w
+    }
+    public pure function type-x(row-w: length) -> length {
+        mod-x(row-w) - gutter - type-w
+    }
+    public pure function size-x(row-w: length) -> length {
+        type-x(row-w) - gutter - size-w
+    }
+    public pure function name-w(row-w: length) -> length {
+        size-x(row-w) - gutter - name-x
+    }
+}
+
+export struct Place {
+    glyph: string,
+    name: string,
+    count: string,
+    selected: bool,
+    usage: float,
+    level: int,
+    section: int,
+}
+
+export struct Row {
+    glyph: string,
+    name: string,
+    size: string,
+    kind: string,
+    modified: string,
+    selected: bool,
+    hovered: bool,
+    hidden: bool,
+    role: int,
+    badge: string,
+}
+
+export struct GridLine {
+    n: int,
+    g0: string, n0: string, r0: int, b0: string, s0: bool, h0: bool,
+    g1: string, n1: string, r1: int, b1: string, s1: bool, h1: bool,
+    g2: string, n2: string, r2: int, b2: string, s2: bool, h2: bool,
+    g3: string, n3: string, r3: int, b3: string, s3: bool, h3: bool,
+    g4: string, n4: string, r4: int, b4: string, s4: bool, h4: bool,
+    g5: string, n5: string, r5: int, b5: string, s5: bool, h5: bool,
+}
+
+component SideRow inherits Rectangle {
+    in property <string> glyph;
+    in property <string> name;
+    in property <string> count;
+    in property <bool> picked;
+    in property <bool> rail;
+    in property <length> side-row;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> accent;
+    in property <color> selected-bg;
+    height: side-row;
+    border-radius: 6px;
+    background: picked ? selected-bg : transparent;
+    border-width: picked ? 1px : 0px;
+    border-color: accent;
+    Text {
+        text: glyph;
+        x: 12px;
+        y: 0px;
+        width: 18px;
+        height: parent.height;
+        font-size: 14px;
+        color: muted;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if !rail: Text {
+        text: name;
+        x: 38px;
+        y: 0px;
+        width: parent.width - 38px - 72px;
+        height: parent.height;
+        font-size: 12px;
+        color: ink;
+        horizontal-alignment: left;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    if !rail: Text {
+        text: count;
+        x: parent.width - 8px - 64px;
+        y: 0px;
+        width: 64px;
+        height: parent.height;
+        font-size: 11px;
+        color: muted;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+}
+
+component Tile inherits Rectangle {
+    in property <string> glyph;
+    in property <string> name;
+    in property <int> role;
+    in property <string> badge;
+    in property <bool> picked;
+    in property <bool> hot;
+    in property <length> tile;
+    in property <color> ink;
+    in property <color> accent;
+    in property <color> danger;
+    in property <color> warning;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> selected-bg;
+    in property <color> hover-bg;
+    width: tile;
+    height: tile + 44px;
+    border-radius: 6px;
+    background: picked ? selected-bg : hot ? hover-bg : transparent;
+    VerticalLayout {
+        padding: 6px;
+        alignment: center;
+        Rectangle {
+            width: tile - 12px;
+            height: tile - 12px;
+            border-radius: 4px;
+            background: surface;
+            Text {
+                text: glyph;
+                font-size: tile * 0.32;
+                color: role == 2 ? danger : role == 3 ? warning : role == 1 ? accent : role == 4 ? muted : ink;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if badge != "": Text {
+                text: badge;
+                y: 4px;
+                x: 4px;
+                font-size: 9px;
+                font-weight: 600;
+                color: ink;
+            }
+        }
+        Text {
+            text: name;
+            font-size: 12px;
+            color: ink;
+            horizontal-alignment: center;
+            overflow: elide;
+            wrap: word-wrap;
+            height: 32px;
+        }
+    }
+}
+
+component JobRow inherits Rectangle {
+    in property <string> glyph;
+    in property <string> label;
+    in property <string> detail;
+    in property <float> amount;
+    in property <bool> failed;
+    in property <color> ink;
+    in property <color> muted-ink;
+    in property <color> accent-ink;
+    in property <color> danger-ink;
+    in property <length> row-h: 44px;
+    height: row-h;
+    property <length> btn: 28px;
+    property <length> action-w: failed ? 112px : btn * 2 + 2px;
+    property <length> action-x: self.width - 8px - action-w;
+    property <length> stats-w: 228px;
+    property <length> stats-x: action-x - 8px - stats-w;
+    property <length> label-w: 280px;
+    property <length> bar-x: 40px + label-w + 12px;
+    Text {
+        text: glyph;
+        x: 12px;
+        y: 0px;
+        width: 20px;
+        height: parent.height;
+        font-size: 16px;
+        color: failed ? danger-ink : accent-ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    Text {
+        text: label;
+        x: 40px;
+        y: 0px;
+        width: label-w;
+        height: parent.height;
+        font-size: 12px;
+        color: ink;
+        horizontal-alignment: left;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Rectangle {
+        x: bar-x;
+        y: (parent.height - 4px) / 2;
+        width: max(stats-x - 12px - bar-x, 200px);
+        height: 4px;
+        border-radius: 2px;
+        background: ink.with-alpha(0.12);
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width * amount;
+            height: parent.height;
+            border-radius: 2px;
+            background: failed ? danger-ink : accent-ink;
+        }
+    }
+    Text {
+        text: detail;
+        x: stats-x;
+        y: 0px;
+        width: stats-w;
+        height: parent.height;
+        font-size: 11px;
+        color: muted-ink;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    if !failed: Rectangle {
+        x: action-x;
+        y: (parent.height - btn) / 2;
+        width: btn;
+        height: btn;
+        border-radius: 3px;
+        Text {
+            text: "󰏤";
+            font-size: 14px;
+            color: ink;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    if !failed: Rectangle {
+        x: action-x + btn + 2px;
+        y: (parent.height - btn) / 2;
+        width: btn;
+        height: btn;
+        border-radius: 3px;
+        Text {
+            text: "󰅖";
+            font-size: 14px;
+            color: ink;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    if failed: Text {
+        text: "Retry";
+        x: action-x;
+        y: 0px;
+        width: 56px;
+        height: parent.height;
+        font-size: 11px;
+        color: ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if failed: Text {
+        text: "Skip";
+        x: action-x + 56px;
+        y: 0px;
+        width: 56px;
+        height: parent.height;
+        font-size: 11px;
+        color: muted-ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
 export component AppWindow inherits Window {
+    property <length> row-h: compact ? 24px : 30px;
+    in property <bool> harness: true;
     in property <color> bg: #061216;
     in property <color> surface: #0e1e26;
     in property <color> text: #e7fbff;
     in property <color> muted: #7ec8d4;
     in property <color> accent: #00e5ff;
     in property <color> on-accent: #042028;
+    in property <color> line: #1e6a78;
+    in property <color> danger: #ff2a4a;
+    in property <color> on-danger: #fff5f6;
+    in property <color> warning: #ffb000;
+    in property <color> on-warning: #1a1200;
     in property <string> label: "Robin";
+    in property <bool> compact: false;
+    in property <bool> grid: false;
+    in property <bool> collapsed: false;
+    in property <length> tile: 152px;
+    in property <string> state: "files";
+    in property <string> overlay: "";
+    in property <string> status-left: "15 items · 1 hidden";
+    in property <string> status-right: "812 GB free of 1.8 TB";
+    in property <bool> hidden-on: false;
+    in property <string> crumbs: "~  ›  Pictures";
+    in property <string> path-text: "/home/sky/Pictures";
+    in property <string> search-query: "";
+    in property <string> search-count: "";
+    in property <string> dialog-title: "";
+    in property <string> dialog-body: "";
+    in property <[Place]> places;
+    in property <[Place]> pinned-places;
+    in property <[Place]> device-places;
+    in property <[Place]> trash-places;
+    in property <[Row]> files;
+    in property <[GridLine]> grid-rows;
+    in property <[string]> menu-labels;
+
     title: "Robin";
     default-font-family: "JetBrainsMono Nerd Font";
     default-font-size: 12px;
     background: bg;
 
-    VerticalLayout {
+    property <length> side-row: compact ? 26px : 30px;
+    property <length> toolbar-h: compact ? 40px : 46px;
+    property <length> icon-box: compact ? 28px : 34px;
+    property <length> status-h: compact ? 22px : 26px;
+    property <length> side-w: collapsed ? 52px : 232px;
+    property <color> hairline: text.with-alpha(0.12);
+    property <color> hover: text.with-alpha(0.06);
+    property <color> selected: accent.with-alpha(0.18);
+    property <color> selected-active: accent.with-alpha(0.28);
+    property <color> divider: line;
+
+    if harness: VerticalLayout {
         padding: 16px;
         spacing: 8px;
         alignment: start;
-
-        Text {
-            text: "󰋜";
-            font-size: 14px;
-            color: accent;
-        }
-
-        Text {
-            text: label;
-            font-size: 18px;
-            font-weight: 700;
-            color: text;
-        }
-
-        Text {
-            text: "in development";
-            font-size: 11px;
-            color: muted;
-        }
-
+        Text { text: "󰋜"; font-size: 14px; color: accent; }
+        Text { text: label; font-size: 18px; font-weight: 700; color: text; }
+        Text { text: "in development"; font-size: 11px; color: muted; }
         Rectangle {
             background: surface;
             height: 30px;
             border-radius: 6px;
             border-width: 1px;
-            border-color: text.with-alpha(0.12);
+            border-color: hairline;
             HorizontalLayout {
                 padding-left: 8px;
-                alignment: start;
-                Text {
-                    text: label;
-                    font-size: 12px;
-                    color: text;
-                    vertical-alignment: center;
+                Text { text: label; font-size: 12px; color: text; vertical-alignment: center; }
+            }
+        }
+    }
+
+    if !harness: HorizontalLayout {
+        Rectangle {
+            width: side-w;
+            vertical-stretch: 1;
+            background: surface;
+            VerticalLayout {
+                padding-top: 8px;
+                padding-bottom: 8px;
+                spacing: 0px;
+                if !collapsed: HorizontalLayout {
+                    Rectangle { width: 12px; }
+                    Text {
+                        text: "PINNED";
+                        height: 24px;
+                        font-size: 11px;
+                        font-weight: 700;
+                        letter-spacing: 1px;
+                        color: muted;
+                        vertical-alignment: center;
+                    }
+                }
+                for place in pinned-places: SideRow {
+                    glyph: place.glyph;
+                    name: place.name;
+                    count: place.count;
+                    picked: place.selected;
+                    rail: root.collapsed;
+                    side-row: root.side-row;
+                    ink: root.text;
+                    muted: root.muted;
+                    accent: root.accent;
+                    selected-bg: root.selected;
+                }
+                Rectangle { height: 8px; }
+                if !collapsed: HorizontalLayout {
+                    Rectangle { width: 12px; }
+                    Text {
+                        text: "DEVICES";
+                        height: 24px;
+                        font-size: 11px;
+                        font-weight: 700;
+                        letter-spacing: 1px;
+                        color: muted;
+                        vertical-alignment: center;
+                    }
+                }
+                for place in device-places: VerticalLayout {
+                    spacing: 1px;
+                    SideRow {
+                        glyph: place.glyph;
+                        name: place.name;
+                        count: place.count;
+                        picked: false;
+                        rail: root.collapsed;
+                        side-row: root.side-row;
+                        ink: root.text;
+                        muted: root.muted;
+                        accent: root.accent;
+                        selected-bg: root.selected;
+                    }
+                    if !root.collapsed && place.usage >= 0: Rectangle {
+                        height: 4px;
+                        Rectangle {
+                            x: 38px;
+                            y: 0px;
+                            width: parent.width - 38px - 8px;
+                            height: 3px;
+                            border-radius: 2px;
+                            background: root.text.with-alpha(0.12);
+                            Rectangle {
+                                x: 0px;
+                                y: 0px;
+                                width: parent.width * place.usage;
+                                height: parent.height;
+                                border-radius: 2px;
+                                background: place.level == 2 ? root.danger : place.level == 1 ? root.warning : root.accent;
+                            }
+                        }
+                    }
+                }
+                Rectangle { height: 8px; }
+                if !collapsed: HorizontalLayout {
+                    Rectangle { width: 12px; }
+                    Text {
+                        text: "TRASH";
+                        height: 24px;
+                        font-size: 11px;
+                        font-weight: 700;
+                        letter-spacing: 1px;
+                        color: muted;
+                        vertical-alignment: center;
+                    }
+                }
+                for place in trash-places: SideRow {
+                    glyph: place.glyph;
+                    name: place.name;
+                    count: place.count;
+                    picked: false;
+                    rail: root.collapsed;
+                    side-row: root.side-row;
+                    ink: root.text;
+                    muted: root.muted;
+                    accent: root.accent;
+                    selected-bg: root.selected;
+                }
+                Rectangle { vertical-stretch: 1; }
+                SideRow {
+                    glyph: "󰄨";
+                    name: "Statistics";
+                    count: "";
+                    picked: false;
+                    rail: root.collapsed;
+                    side-row: root.side-row;
+                    ink: root.text;
+                    muted: root.muted;
+                    accent: root.accent;
+                    selected-bg: root.selected;
                 }
             }
+        }
+        Rectangle { width: 1px; background: divider; }
+        VerticalLayout {
+            Rectangle {
+                height: toolbar-h;
+                background: bg;
+                property <length> iy: (self.height - icon-box) / 2;
+                property <length> nav-w: icon-box * 3 + 4px;
+                property <length> right-w: icon-box * 4 + 18px;
+                property <length> crumb-x: 8px + nav-w + 12px;
+                property <length> right-x: self.width - 8px - right-w;
+                Rectangle {
+                    x: 8px;
+                    y: iy;
+                    width: icon-box;
+                    height: icon-box;
+                    border-radius: 3px;
+                    Text { text: "󰁍"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    x: 8px + icon-box + 2px;
+                    y: iy;
+                    width: icon-box;
+                    height: icon-box;
+                    border-radius: 3px;
+                    Text { text: "󰁔"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    x: 8px + (icon-box + 2px) * 2;
+                    y: iy;
+                    width: icon-box;
+                    height: icon-box;
+                    border-radius: 3px;
+                    Text { text: "󰁝"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    x: crumb-x;
+                    y: (parent.height - 30px) / 2;
+                    width: right-x - 12px - crumb-x;
+                    height: 30px;
+                    border-radius: 6px;
+                    background: surface;
+                    border-width: overlay == "path-invalid" ? 2px : 1px;
+                    border-color: overlay == "path-invalid" ? danger : overlay == "path-edit" ? accent : hairline;
+                    if overlay != "search" && overlay != "path-edit" && overlay != "path-invalid" && overlay != "path-complete": Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        text: crumbs;
+                        font-size: 12px;
+                        color: muted;
+                        vertical-alignment: center;
+                        horizontal-alignment: left;
+                        overflow: elide;
+                    }
+                    if overlay == "search": Text {
+                        x: 8px;
+                        width: parent.width - 48px;
+                        height: parent.height;
+                        text: search-query;
+                        font-size: 12px;
+                        color: text;
+                        vertical-alignment: center;
+                        horizontal-alignment: left;
+                    }
+                    if overlay == "search": Text {
+                        x: parent.width - 40px;
+                        width: 32px;
+                        height: parent.height;
+                        text: search-count;
+                        font-size: 11px;
+                        color: muted;
+                        vertical-alignment: center;
+                        horizontal-alignment: right;
+                    }
+                    if overlay == "path-edit" || overlay == "path-invalid" || overlay == "path-complete": Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        text: path-text;
+                        font-size: 12px;
+                        color: text;
+                        vertical-alignment: center;
+                        horizontal-alignment: left;
+                        overflow: elide;
+                    }
+                }
+                Rectangle {
+                    x: right-x;
+                    y: iy;
+                    width: icon-box;
+                    height: icon-box;
+                    border-radius: 3px;
+                    Text { text: "󰍉"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    x: right-x + icon-box + 6px;
+                    y: (parent.height - 20px) / 2;
+                    width: 1px;
+                    height: 20px;
+                    background: text.with-alpha(0.14);
+                }
+                Rectangle {
+                    x: right-x + icon-box + 14px;
+                    y: iy;
+                    width: icon-box;
+                    height: icon-box;
+                    border-radius: 3px;
+                    background: !grid ? selected : transparent;
+                    Text { text: "󰈚"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    x: right-x + icon-box * 2 + 16px;
+                    y: iy;
+                    width: icon-box;
+                    height: icon-box;
+                    border-radius: 3px;
+                    background: grid ? selected : transparent;
+                    Text { text: "󰕰"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    x: right-x + icon-box * 3 + 18px;
+                    y: iy;
+                    width: icon-box;
+                    height: icon-box;
+                    border-radius: 3px;
+                    Text { text: "󰇘"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+            Rectangle { height: 1px; background: divider; }
+
+            Rectangle {
+                vertical-stretch: 1;
+                background: bg;
+                if state == "files" && !grid: VerticalLayout {
+                    Rectangle {
+                        height: 26px;
+                        Text {
+                            text: "NAME  󰁝";
+                            x: Columns.name-x;
+                            y: 0px;
+                            width: Columns.name-w(parent.width);
+                            height: parent.height;
+                            font-size: 11px;
+                            font-weight: 700;
+                            letter-spacing: 1px;
+                            color: accent;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: "SIZE";
+                            x: Columns.size-x(parent.width);
+                            y: 0px;
+                            width: Columns.size-w;
+                            height: parent.height;
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: muted;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: "TYPE";
+                            x: Columns.type-x(parent.width);
+                            y: 0px;
+                            width: Columns.type-w;
+                            height: parent.height;
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: muted;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: "MODIFIED";
+                            x: Columns.mod-x(parent.width);
+                            y: 0px;
+                            width: Columns.mod-w;
+                            height: parent.height;
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: muted;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                    Rectangle { height: 1px; background: divider; }
+                    ListView {
+                        vertical-stretch: 1;
+                        for row in files: Rectangle {
+                            width: parent.width;
+                            height: row-h;
+                            background: row.selected ? selected-active : row.hovered ? hover : transparent;
+                            border-radius: 6px;
+                            Text {
+                                text: row.glyph;
+                                x: Columns.pad;
+                                y: 0px;
+                                width: Columns.icon-w;
+                                height: parent.height;
+                                font-size: 14px;
+                                color: row.role == 2 ? danger : row.role == 3 ? warning : row.role == 1 ? accent : row.role == 4 ? muted : text;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: row.name;
+                                x: Columns.name-x;
+                                y: 0px;
+                                width: Columns.name-w(parent.width);
+                                height: parent.height;
+                                font-size: 12px;
+                                font-weight: row.selected ? 700 : 400;
+                                color: text;
+                                opacity: row.hidden ? 0.6 : 1;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: row.size;
+                                x: Columns.size-x(parent.width);
+                                y: 0px;
+                                width: Columns.size-w;
+                                height: parent.height;
+                                font-size: 12px;
+                                color: muted;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: row.kind;
+                                x: Columns.type-x(parent.width);
+                                y: 0px;
+                                width: Columns.type-w;
+                                height: parent.height;
+                                font-size: 12px;
+                                color: muted;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: row.modified;
+                                x: Columns.mod-x(parent.width);
+                                y: 0px;
+                                width: Columns.mod-w;
+                                height: parent.height;
+                                font-size: 12px;
+                                color: muted;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+                if state == "files" && grid: ListView {
+                    vertical-stretch: 1;
+                    for line in grid-rows: HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        padding-top: 8px;
+                        padding-bottom: 0px;
+                        spacing: 8px;
+                        height: tile + 60px;
+                        if line.n > 0: Tile {
+                            glyph: line.g0; name: line.n0; role: line.r0; badge: line.b0; picked: line.s0; hot: line.h0;
+                            tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
+                        }
+                        if line.n > 1: Tile {
+                            glyph: line.g1; name: line.n1; role: line.r1; badge: line.b1; picked: line.s1; hot: line.h1;
+                            tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
+                        }
+                        if line.n > 2: Tile {
+                            glyph: line.g2; name: line.n2; role: line.r2; badge: line.b2; picked: line.s2; hot: line.h2;
+                            tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
+                        }
+                        if line.n > 3: Tile {
+                            glyph: line.g3; name: line.n3; role: line.r3; badge: line.b3; picked: line.s3; hot: line.h3;
+                            tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
+                        }
+                        if line.n > 4: Tile {
+                            glyph: line.g4; name: line.n4; role: line.r4; badge: line.b4; picked: line.s4; hot: line.h4;
+                            tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
+                        }
+                        if line.n > 5: Tile {
+                            glyph: line.g5; name: line.n5; role: line.r5; badge: line.b5; picked: line.s5; hot: line.h5;
+                            tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
+                        }
+                    }
+                }
+                if state == "empty" || state == "denied" || state == "unmounted" || state == "ejected" || state == "nosearch" || state == "loading": VerticalLayout {
+                    alignment: center;
+                    width: parent.width;
+                    Text {
+                        text: state == "empty" ? "󰉖" : state == "denied" ? "󰌾" : state == "nosearch" ? "󰍉" : state == "loading" ? "" : "󰕓";
+                        font-size: 64px;
+                        color: state == "denied" || state == "ejected" ? warning.with-alpha(0.6) : muted.with-alpha(0.6);
+                        horizontal-alignment: center;
+                        width: parent.width;
+                    }
+                    Rectangle { height: 12px; }
+                    Text {
+                        text: state == "empty" ? "This folder is empty" : state == "denied" ? "No permission to open ~/secret" : state == "unmounted" ? "SANDISK is not mounted" : state == "ejected" ? "SANDISK was removed" : state == "nosearch" ? "Nothing matches \"kotlin\"" : "Reading…";
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: text;
+                        horizontal-alignment: center;
+                        width: parent.width;
+                    }
+                    Rectangle { height: 6px; }
+                    Text {
+                        text: state == "empty" ? "Drop files here or press Ctrl+N" : state == "denied" ? "Owned by root (drwx------)" : state == "nosearch" ? "Searched 4 812 items in ~/Projects" : state == "loading" ? "18 240 items" : "";
+                        font-size: 11px;
+                        color: muted;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                        width: parent.width;
+                    }
+                }
+            }
+
+            if overlay == "progress-1" || overlay == "progress-3" || overlay == "progress-error": Rectangle {
+                height: overlay == "progress-3" ? 116px : 44px;
+                background: surface;
+                VerticalLayout {
+                    alignment: start;
+                    JobRow {
+                        row-h: 44px;
+                        glyph: "󰆏";
+                        label: "Copying 1 204 files to SANDISK";
+                        detail: "2.1 / 6.4 GB · 84 MB/s · 52s left";
+                        amount: overlay == "progress-error" ? 0.4 : 0.33;
+                        failed: overlay == "progress-error";
+                        ink: root.text;
+                        muted-ink: root.muted;
+                        accent-ink: root.accent;
+                        danger-ink: root.danger;
+                    }
+                    if overlay == "progress-3": JobRow {
+                        row-h: 36px;
+                        glyph: "󰪹";
+                        label: "Moving 12 files to archive";
+                        detail: "840 MB / 1.2 GB · 40 MB/s";
+                        amount: 0.7;
+                        failed: false;
+                        ink: root.text;
+                        muted-ink: root.muted;
+                        accent-ink: root.accent;
+                        danger-ink: root.danger;
+                    }
+                    if overlay == "progress-3": JobRow {
+                        row-h: 36px;
+                        glyph: "󰩺";
+                        label: "Moving 3 items to trash";
+                        detail: "12 MB";
+                        amount: 0.15;
+                        failed: false;
+                        ink: root.text;
+                        muted-ink: root.muted;
+                        accent-ink: root.accent;
+                        danger-ink: root.danger;
+                    }
+                }
+            }
+
+            Rectangle { height: 1px; background: divider; }
+            Rectangle {
+                height: status-h;
+                background: bg;
+                property <length> free-w: 188px;
+                Text {
+                    text: status-left;
+                    x: 12px;
+                    y: 0px;
+                    width: parent.width - 24px - free-w;
+                    height: parent.height;
+                    font-size: 11px;
+                    color: muted;
+                    horizontal-alignment: left;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    text: status-right;
+                    x: parent.width - 12px - free-w;
+                    y: 0px;
+                    width: free-w;
+                    height: parent.height;
+                    font-size: 11px;
+                    color: muted;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+
+    if !harness && (overlay == "trash" || overlay == "trash-no" || overlay == "delete" || overlay == "menu-file" || overlay == "shortcuts"): Rectangle {
+        background: #000000.with-alpha(0.6);
+        if overlay == "delete" || overlay == "trash" || overlay == "trash-no": Rectangle {
+            width: 440px;
+            height: overlay == "delete" ? 220px : 200px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: surface;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            if overlay == "delete": Rectangle {
+                height: 3px;
+                background: danger;
+                border-radius: 10px;
+            }
+            VerticalLayout {
+                padding: 20px;
+                spacing: 8px;
+                if overlay == "delete": Text { text: "󰀦  Permanently delete 3 items?"; font-size: 13px; font-weight: 700; color: text; }
+                if overlay != "delete": Text {
+                    text: overlay == "trash-no" ? "This drive has no trash" : "Move 3 items to trash?";
+                    font-size: 13px;
+                    font-weight: 700;
+                    color: text;
+                }
+                Text {
+                    text: overlay == "delete" ? "This can't be undone." : overlay == "trash-no" ? "Robin will not copy these files home." : "You can restore them from Trash.";
+                    font-size: 12px;
+                    color: muted;
+                }
+                Text { text: "dune-sunset-0412.jpg\ndune-sunset-0413.jpg\nspeeder-run.mp4"; font-size: 11px; color: muted; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    Rectangle {
+                        width: 88px;
+                        height: 32px;
+                        border-radius: 6px;
+                        border-width: overlay == "delete" ? 2px : 1px;
+                        border-color: overlay == "delete" ? accent : line;
+                        Text { text: "Cancel"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        min-width: 88px;
+                        height: 32px;
+                        border-radius: 6px;
+                        background: overlay == "delete" || overlay == "trash-no" ? danger : accent;
+                        opacity: overlay == "delete" ? 0.42 : 1;
+                        Text {
+                            text: overlay == "delete" || overlay == "trash-no" ? "Delete permanently" : "Move to Trash";
+                            font-size: 12px;
+                            color: overlay == "delete" || overlay == "trash-no" ? on-danger : on-accent;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+        if overlay == "menu-file": Rectangle {
+            x: 280px;
+            y: 180px;
+            width: 248px;
+            height: 161px;
+            background: surface;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            VerticalLayout {
+                padding: 4px;
+                spacing: 0px;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 8px;
+                    height: 28px;
+                    Text { text: "󰈔"; font-size: 14px; color: muted; vertical-alignment: center; }
+                    Text { text: "Open"; font-size: 12px; color: text; vertical-alignment: center; horizontal-stretch: 1; }
+                    Text { text: "Enter"; font-size: 11px; color: muted; vertical-alignment: center; }
+                }
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 8px;
+                    height: 28px;
+                    Text { text: "󰏫"; font-size: 14px; color: muted; vertical-alignment: center; }
+                    Text { text: "Rename"; font-size: 12px; color: text; vertical-alignment: center; horizontal-stretch: 1; }
+                    Text { text: "F2"; font-size: 11px; color: muted; vertical-alignment: center; }
+                }
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 8px;
+                    height: 28px;
+                    Text { text: "󰆏"; font-size: 14px; color: muted; vertical-alignment: center; }
+                    Text { text: "Copy path"; font-size: 12px; color: text; vertical-alignment: center; horizontal-stretch: 1; }
+                    Text { text: "Ctrl+C"; font-size: 11px; color: muted; vertical-alignment: center; }
+                }
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 8px;
+                    height: 28px;
+                    Text { text: "󰩺"; font-size: 14px; color: muted; vertical-alignment: center; }
+                    Text { text: "Move to trash"; font-size: 12px; color: text; vertical-alignment: center; horizontal-stretch: 1; }
+                    Text { text: "Del"; font-size: 11px; color: muted; vertical-alignment: center; }
+                }
+                Rectangle {
+                    height: 9px;
+                    Rectangle {
+                        y: 4px;
+                        height: 1px;
+                        background: divider;
+                    }
+                }
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 8px;
+                    height: 28px;
+                    Text { text: "󰀦"; font-size: 14px; color: danger; vertical-alignment: center; }
+                    Text { text: "Delete permanently"; font-size: 12px; color: danger; vertical-alignment: center; horizontal-stretch: 1; }
+                    Text { text: "Shift+Del"; font-size: 11px; color: danger; vertical-alignment: center; }
+                }
+            }
+        }
+        if overlay == "shortcuts": Rectangle {
+            width: 720px;
+            height: 340px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 8px;
+                Text { text: "SHORTCUTS"; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; }
+                HorizontalLayout {
+                    spacing: 24px;
+                    VerticalLayout {
+                        spacing: 0px;
+                        Text { text: "↑ ↓ / j k     move"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "← → / h l     previous / next"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "Home / End     first / last"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "Enter     open"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "Ctrl+L     edit path"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "Ctrl+F     search"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "Ctrl+B     collapse sidebar"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "Ctrl+H     hidden files"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "Ctrl+= / -     tile size"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "F2     rename"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "Ctrl+Shift+N     new folder"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "Ctrl+Alt+N     new file"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                    }
+                    VerticalLayout {
+                        spacing: 0px;
+                        Text { text: "Del     move to trash"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "Shift+Del     delete permanently"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "+  −  0  1     zoom"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "r / R     rotate"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "f     filmstrip"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "i     info"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "s     slideshow"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "Space     play, or next image"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: ", / .     frame step"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "j / k     seek ∓5s"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "m     mute"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "Esc / q     back"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "?     this list"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                        Text { text: "F11     fullscreen"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                    }
+                }
+            }
+        }
+    }
+
+    if !harness && overlay == "path-complete": Rectangle {
+        x: side-w + 120px;
+        y: toolbar-h;
+        width: 360px;
+        background: surface;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: hairline;
+        VerticalLayout {
+            Text { text: "Pictures"; height: 28px; font-size: 12px; color: text; vertical-alignment: center; }
+            Text { text: "Projects"; height: 28px; font-size: 12px; color: text; vertical-alignment: center; }
+            Text { text: "Public"; height: 28px; font-size: 12px; color: text; vertical-alignment: center; }
         }
     }
 }
