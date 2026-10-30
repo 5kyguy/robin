@@ -46,7 +46,7 @@ pub fn known(view: &str) -> bool {
             | "skipped"
             | "skipped-details"
             | "move-partial"
-            | "move-blocked"
+            | "move-refused"
             | "menu-file"
             | "shortcuts-browser"
             | "reduce-motion"
@@ -198,6 +198,24 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         }
         .into(),
     );
+    let refused = crate::fsops::refusal(&[
+        crate::fsops::KeptEntry {
+            path: "Projects/robin/vendor/fonts/Inter.ttf".into(),
+            reason: crate::fsops::KeepReason::ReadOnlyFolder,
+        },
+        crate::fsops::KeptEntry {
+            path: "Projects/robin/vendor/fonts/Mono.ttf".into(),
+            reason: crate::fsops::KeepReason::ReadOnlyFolder,
+        },
+    ]);
+    ui.set_refusal_title(refused.title.into());
+    ui.set_refusal_paths(ModelRc::new(Rc::new(VecModel::from(
+        refused
+            .paths
+            .into_iter()
+            .map(slint::SharedString::from)
+            .collect::<Vec<_>>(),
+    ))));
     let (tone, text, details) = toast(view);
     ui.set_toast_tone(tone.into());
     ui.set_toast_text(text.into());
@@ -223,7 +241,8 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "progress-error" => "progress-error",
             "skipped" => "skipped",
             "skipped-details" => "skipped-details",
-            "move-partial" | "move-blocked" => "toast-details",
+            "move-partial" => "toast-details",
+            "move-refused" => "move-refused",
             "menu-file" => "menu-file",
             "shortcuts-browser" | "shortcuts-viewer" => "shortcuts",
             _ => "",
@@ -328,19 +347,6 @@ fn toast(view: &str) -> (&'static str, String, Vec<String>) {
                 ],
             };
             ("warning", report.summary(), report.details())
-        }
-        "move-blocked" => {
-            let (title, lines) = crate::fsops::refusal_text(
-                "Projects",
-                &[
-                    kept(
-                        "Projects/robin/vendor/fonts/Inter.ttf",
-                        KeepReason::ReadOnlyFolder,
-                    ),
-                    kept("Projects/shared/notes.md", KeepReason::StickyFolder),
-                ],
-            );
-            ("danger", title, lines)
         }
         _ => {
             let report = skipped_report();

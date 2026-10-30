@@ -389,6 +389,8 @@ pub struct MoveOpts<'a> {
     /// not be removed after copying. Tests turn it off to reach the
     /// fallback for removals that fail after the check.
     pub check_removable: bool,
+    /// Copy only: never remove the source. Set by [`copy_instead`].
+    pub keep_source: bool,
 }
 
 /// Why a copied original could not be removed.
@@ -531,18 +533,112 @@ impl TransferReport {
     }
 }
 
-/// The up-front refusal, worded for the UI: a title line and one line per
-/// blocking path.
-pub fn refusal_text(name: &str, blocked: &[KeptEntry]) -> (String, Vec<String>) {
-    let n = blocked.len();
-    let items = if n == 1 { "item" } else { "items" };
-    (
-        format!("Can't move {name}: {n} {items} can't be removed afterwards. Nothing was copied."),
-        blocked
-            .iter()
-            .map(|k| format!("{} — {}", k.path.display(), k.reason.describe()))
-            .collect(),
-    )
+/// The up-front refusal, worded for the move-refused dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// "Can't move: 1 folder inside is read-only", counted per reason.
+    pub title: String,
+    /// The blocking paths: the read-only folders themselves, and the items
+    /// in shared folders or on read-only drives.
+    pub paths: Vec<String>,
+}
+
+/// What the move-refused dialog offers. Copy instead is the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RefusalChoice {
+    #[default]
+    CopyInstead,
+    Cancel,
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+pub fn refusal(blocked: &[KeptEntry]) -> Refusal {
+    let mut folders: Vec<std::path::PathBuf> = Vec::new();
+    let mut shared = Vec::new();
+    let mut drive = Vec::new();
+    for k in blocked {
+        match k.reason {
+            KeepReason::ReadOnlyFolder => {
+                let dir = k.path.parent().unwrap_or(&k.path).to_path_buf();
+                if !folders.contains(&dir) {
+                    folders.push(dir);
+                }
+            }
+            KeepReason::StickyFolder => shared.push(k.path.clone()),
+            KeepReason::ReadOnlyFilesystem => drive.push(k.path.clone()),
+        }
+    }
+    let mut parts = Vec::new();
+    if !folders.is_empty() {
+        let verb = if folders.len() == 1 { "is" } else { "are" };
+        parts.push(format!(
+            "{} inside {verb} read-only",
+            plural(folders.len(), "folder", "folders")
+        ));
+    }
+    if !shared.is_empty() {
+        let verb = if shared.len() == 1 {
+            "belongs"
+        } else {
+            "belong"
+        };
+        parts.push(format!(
+            "{} {verb} to someone else",
+            plural(shared.len(), "item", "items")
+        ));
+    }
+    if !drive.is_empty() {
+        parts.push("the drive is read-only".to_string());
+    }
+    let paths = folders
+        .iter()
+        .chain(&shared)
+        .chain(&drive)
+        .map(|p| p.display().to_string())
+        .collect();
+    Refusal {
+        title: format!("Can't move: {}", parts.join(", ")),
+        paths,
+    }
+}
+
+/// Copy `from` to `to` without touching the source: the move-refused
+/// dialog's Copy instead.
+pub fn copy_instead(
+    parent: &DirFd,
+    from: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    to: &std::ffi::OsStr,
+    copy: CopyOpts<'_>,
+) -> Result<(CopyOutcome, TransferReport)> {
+    let mut opts = MoveOpts {
+        force_copy: true,
+        fail_before_unlink: false,
+        copy,
+        report: TransferReport::default(),
+        check_removable: false,
+        keep_source: true,
+    };
+    let outcome = move_child(parent, from, dest_parent, to, &mut opts)?;
+    Ok((outcome, opts.report))
+}
+
+/// Act on the move-refused dialog. Cancel does nothing and returns `None`.
+pub fn resolve_refusal(
+    choice: RefusalChoice,
+    parent: &DirFd,
+    from: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    to: &std::ffi::OsStr,
+    copy: CopyOpts<'_>,
+) -> Result<Option<(CopyOutcome, TransferReport)>> {
+    match choice {
+        RefusalChoice::Cancel => Ok(None),
+        RefusalChoice::CopyInstead => copy_instead(parent, from, dest_parent, to, copy).map(Some),
+    }
 }
 
 /// Collect every entry under `from` that a move could copy but not remove.
@@ -680,7 +776,7 @@ pub fn move_child(
     let stat = rustix::fs::statat(parent.as_fd(), from_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|e| Error::from_errno(from, e))?;
     let rel = std::path::PathBuf::from(from);
-    if opts.check_removable {
+    if opts.check_removable && !opts.keep_source {
         let mut blocked = Vec::new();
         removal_blockers(parent, from, stat.st_dev, &rel, 0, &mut blocked)?;
         if !blocked.is_empty() {
@@ -728,6 +824,9 @@ fn move_entry(
                 ));
             }
             opts.report.moved += 1;
+            if opts.keep_source {
+                return Ok(CopyOutcome::Copied);
+            }
             match remove_child(parent, from, &mut |_| {}, opts.copy.cancel) {
                 Ok(()) => Ok(CopyOutcome::Copied),
                 Err(err) => opts.report.keep(rel, err),
@@ -786,6 +885,9 @@ fn move_symlink(
         ));
     }
     opts.report.moved += 1;
+    if opts.keep_source {
+        return Ok(CopyOutcome::Copied);
+    }
     match rustix::fs::unlinkat(parent.as_fd(), from_c.as_c_str(), AtFlags::empty()) {
         Ok(()) => Ok(CopyOutcome::Copied),
         Err(e) => opts.report.keep(rel, Error::from_errno(from, e)),
@@ -871,6 +973,9 @@ fn move_directory(
     rustix::fs::fsync(dst.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
     if !all_copied {
         return Ok(CopyOutcome::Skipped);
+    }
+    if opts.keep_source {
+        return Ok(CopyOutcome::Copied);
     }
     if let Err(e) = rustix::fs::unlinkat(parent.as_fd(), from_c.as_c_str(), AtFlags::REMOVEDIR) {
         return opts.report.keep(rel, Error::from_errno(from, e));
@@ -1683,6 +1788,7 @@ mod tests {
                 copy: opts(&cancel, &mut policy, &mut ask),
                 report: TransferReport::default(),
                 check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap();
@@ -1710,6 +1816,7 @@ mod tests {
                 copy: opts(&cancel, &mut policy, &mut ask),
                 report: TransferReport::default(),
                 check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap_err();
@@ -1744,6 +1851,7 @@ mod tests {
                 copy: opts(&cancel, &mut policy, &mut skip),
                 report: TransferReport::default(),
                 check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap();
@@ -1789,6 +1897,7 @@ mod tests {
                 copy: opts(&cancel, &mut policy, &mut ask),
                 report: TransferReport::default(),
                 check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap();
@@ -1823,6 +1932,7 @@ mod tests {
                 copy: opts(&cancel, &mut policy, &mut ask),
                 report: TransferReport::default(),
                 check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap();
@@ -1863,6 +1973,7 @@ mod tests {
                 copy: opts(&cancel, &mut policy, &mut ask),
                 report: TransferReport::default(),
                 check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap();
@@ -1878,6 +1989,7 @@ mod tests {
                 copy: opts(&cancel, &mut policy, &mut ask),
                 report: TransferReport::default(),
                 check_removable: true,
+                keep_source: false,
             },
         )
         .unwrap();
@@ -2258,6 +2370,7 @@ mod tests {
             },
             report: TransferReport::default(),
             check_removable: true,
+            keep_source: false,
         };
         let outcome = move_child(
             &dir,
@@ -2405,6 +2518,7 @@ mod tests {
             },
             report: TransferReport::default(),
             check_removable,
+            keep_source: false,
         };
         let result = move_child(
             &dir,
@@ -2436,12 +2550,13 @@ mod tests {
                         reason: KeepReason::ReadOnlyFolder,
                     }]
                 );
-                let (title, lines) = refusal_text("src", &blocked);
                 assert_eq!(
-                    title,
-                    "Can't move src: 1 item can't be removed afterwards. Nothing was copied."
+                    refusal(&blocked),
+                    Refusal {
+                        title: "Can't move: 1 folder inside is read-only".into(),
+                        paths: vec!["src/inner".into()],
+                    }
                 );
-                assert_eq!(lines, vec!["src/inner/f — read-only folder".to_string()]);
             }
             other => panic!("expected an up-front refusal, got {other:?}"),
         }
@@ -2510,6 +2625,86 @@ mod tests {
                 Some(KeepReason::StickyFolder)
             );
         }
+    }
+
+    #[test]
+    fn refusal_title_counts_by_reason() {
+        let k = |p: &str, reason| KeptEntry {
+            path: p.into(),
+            reason,
+        };
+        let r = refusal(&[
+            k("a/x/1", KeepReason::ReadOnlyFolder),
+            k("a/x/2", KeepReason::ReadOnlyFolder),
+            k("a/y/3", KeepReason::ReadOnlyFolder),
+            k("a/s/4", KeepReason::StickyFolder),
+        ]);
+        assert_eq!(
+            r.title,
+            "Can't move: 2 folders inside are read-only, 1 item belongs to someone else"
+        );
+        assert_eq!(r.paths, vec!["a/x", "a/y", "a/s/4"]);
+    }
+
+    #[test]
+    fn copy_instead_copies_and_keeps_the_source() {
+        let (root, mtime) = read_only_tree("copy-instead");
+        assert_eq!(RefusalChoice::default(), RefusalChoice::CopyInstead);
+        let dir = DirFd::open(&root).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = replace_ask;
+        let result = resolve_refusal(
+            RefusalChoice::default(),
+            &dir,
+            std::ffi::OsStr::new("src"),
+            &dir,
+            std::ffi::OsStr::new("dest"),
+            CopyOpts {
+                cancel: &cancel,
+                policy: &mut policy,
+                ask: &mut ask,
+            },
+        )
+        .unwrap();
+        let (outcome, report) = result.expect("copy instead runs a copy");
+        assert_eq!(outcome, CopyOutcome::Copied);
+        assert_eq!(report.status(), TransferStatus::Complete);
+        assert!(report.left_behind.is_empty());
+        let inner = root.join("dest/inner");
+        assert_eq!(std::fs::read(inner.join("f")).unwrap(), b"x");
+        assert_eq!(mode_bits(&inner), 0o500);
+        assert_eq!(
+            std::fs::metadata(&inner).unwrap().modified().unwrap(),
+            mtime
+        );
+        assert_eq!(std::fs::read(root.join("src/inner/f")).unwrap(), b"x");
+        cleanup_read_only(&root);
+    }
+
+    #[test]
+    fn cancel_on_the_refusal_copies_nothing() {
+        let (root, _) = read_only_tree("refusal-cancel");
+        let dir = DirFd::open(&root).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = replace_ask;
+        let result = resolve_refusal(
+            RefusalChoice::Cancel,
+            &dir,
+            std::ffi::OsStr::new("src"),
+            &dir,
+            std::ffi::OsStr::new("dest"),
+            CopyOpts {
+                cancel: &cancel,
+                policy: &mut policy,
+                ask: &mut ask,
+            },
+        )
+        .unwrap();
+        assert!(result.is_none());
+        assert!(!root.join("dest").exists());
+        cleanup_read_only(&root);
     }
 
     fn mode_bits(path: &Path) -> u32 {

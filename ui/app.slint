@@ -476,6 +476,8 @@ export component AppWindow inherits Window {
     in property <[string]> toast-details;
     // "" neutral, "warning" partial move, "danger" refused up front.
     in property <string> toast-tone: "";
+    in property <string> refusal-title;
+    in property <[string]> refusal-paths;
 
     title: "Robin";
     default-font-family: "JetBrainsMono Nerd Font";
@@ -1038,7 +1040,7 @@ export component AppWindow inherits Window {
         }
     }
 
-    if !harness && (overlay == "trash" || overlay == "trash-no" || overlay == "delete" || overlay == "menu-file" || overlay == "shortcuts"): Rectangle {
+    if !harness && (overlay == "trash" || overlay == "trash-no" || overlay == "delete" || overlay == "move-refused" || overlay == "menu-file" || overlay == "shortcuts"): Rectangle {
         background: #000000.with-alpha(0.6);
         if overlay == "delete" || overlay == "trash" || overlay == "trash-no": Rectangle {
             width: 440px;
@@ -1095,6 +1097,51 @@ export component AppWindow inherits Window {
                             horizontal-alignment: center;
                             vertical-alignment: center;
                         }
+                    }
+                }
+            }
+        }
+        if overlay == "move-refused": Rectangle {
+            width: 460px;
+            height: 160px + refusal-paths.length * 18px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: surface;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 8px;
+                Text { text: refusal-title; font-size: 13px; font-weight: 700; color: text; wrap: word-wrap; }
+                Text {
+                    text: "Robin can copy it there instead and leave the original where it is.";
+                    font-size: 12px;
+                    color: muted;
+                    wrap: word-wrap;
+                }
+                for path in refusal-paths: Text { text: path; font-size: 11px; color: muted; height: 18px; overflow: elide; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    Rectangle {
+                        width: 88px;
+                        height: 32px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: line;
+                        Text { text: "Cancel"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    // Default button: filled, with the focus ring.
+                    Rectangle {
+                        width: 112px;
+                        height: 32px;
+                        border-radius: 6px;
+                        background: accent;
+                        border-width: 2px;
+                        border-color: text;
+                        Text { text: "Copy instead"; font-size: 12px; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
                     }
                 }
             }
@@ -1876,7 +1923,8 @@ export component AppWindow inherits Window {
         property <bool> open: overlay == "skipped-details" || overlay == "toast-details";
         property <color> tone: toast-tone == "warning" ? warning : toast-tone == "danger" ? danger : muted;
         property <length> line-h: 20px;
-        width: 800px;
+        // Fit the line, 520px to 800px, and never wider than the window.
+        width: min(max(520px, min(800px, toast-line.preferred-width + 42px + 120px)), parent.width - side-w - 32px);
         height: open ? 52px + 12px + toast-details.length * line-h + 12px : 52px;
         x: side-w + (parent.width - side-w - self.width) / 2;
         y: parent.height - status-h - 16px - self.height;
@@ -1905,7 +1953,7 @@ export component AppWindow inherits Window {
             color: tone;
             vertical-alignment: center;
         }
-        Text {
+        toast-line := Text {
             text: toast-text;
             x: 42px;
             y: 0px;
