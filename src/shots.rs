@@ -266,29 +266,30 @@ fn stats_cells(drilled: bool) -> Vec<MapCell> {
     };
     let mut ranked = weights.clone();
     ranked.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
-    let steps = ranked.len().saturating_sub(1).max(1) as f32;
-    let shade: std::collections::HashMap<String, f32> = ranked
+    let rank_of: std::collections::HashMap<String, usize> = ranked
         .iter()
         .enumerate()
-        .map(|(index, (name, _))| {
-            let t = index as f32 / steps;
-            // Bright on the large cells, then a tight band so the small
-            // tiles do not step through a long run of faint alphas.
-            let shade = 0.46 + 0.50 * (1.0 - t).powi(2);
-            (name.clone(), shade)
-        })
+        .map(|(index, (name, _))| (name.clone(), index))
         .collect();
     let labels: std::collections::HashMap<_, _> = weights.iter().cloned().collect();
+    // 1px off each shared edge is a 2px surface gutter.
+    const GUTTER: f32 = 1.0;
     crate::stats::squarify(&weights, 623.0, 300.0)
         .into_iter()
-        .map(|rect| MapCell {
-            x: rect.x,
-            y: rect.y,
-            w: rect.w,
-            h: rect.h,
-            name: rect.name.clone().into(),
-            detail: format!("{} GB", labels[&rect.name]).into(),
-            shade: shade[&rect.name],
+        .map(|rect| {
+            let rank = rank_of[&rect.name] as f32;
+            // Largest cell is full accent. Each lower rank steps down, and a
+            // deeper squarify row is clearly darker than the row above it.
+            let shade = (1.0 - rank * 0.08 - rect.depth as f32 * 0.15).clamp(0.18, 1.0);
+            MapCell {
+                x: rect.x + GUTTER,
+                y: rect.y + GUTTER,
+                w: (rect.w - GUTTER * 2.0).max(1.0),
+                h: (rect.h - GUTTER * 2.0).max(1.0),
+                name: rect.name.clone().into(),
+                detail: format!("{} GB", labels[&rect.name]).into(),
+                shade,
+            }
         })
         .collect()
 }
@@ -804,5 +805,35 @@ mod tests {
         ] {
             assert!(known(name), "{name}");
         }
+    }
+
+    #[test]
+    fn treemap_tiles_keep_a_surface_gutter() {
+        let cells = stats_cells(false);
+        let videos = cells.iter().find(|c| c.name == "Videos").unwrap();
+        assert!((videos.shade - 1.0).abs() < 0.001, "{}", videos.shade);
+        let mut gaps = Vec::new();
+        for a in &cells {
+            for b in &cells {
+                if a.name == b.name {
+                    continue;
+                }
+                let ax2 = a.x + a.w;
+                let ay2 = a.y + a.h;
+                let bx2 = b.x + b.w;
+                let by2 = b.y + b.h;
+                let overlap_y = a.y < by2 - 1.0 && b.y < ay2 - 1.0;
+                let overlap_x = a.x < bx2 - 1.0 && b.x < ax2 - 1.0;
+                if overlap_y && b.x >= ax2 - 0.5 {
+                    gaps.push(b.x - ax2);
+                }
+                if overlap_x && b.y >= ay2 - 0.5 {
+                    gaps.push(b.y - ay2);
+                }
+            }
+        }
+        let min = gaps.iter().copied().fold(f32::MAX, f32::min);
+        assert!((min - 2.0).abs() < 0.2, "gutter should be 2px, min {min}");
+        assert!(cells.iter().any(|c| c.shade < videos.shade - 0.1));
     }
 }

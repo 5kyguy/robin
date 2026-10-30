@@ -415,6 +415,23 @@ component TypeRow inherits Rectangle {
     }
 }
 
+// Track with the fill pinned to the left edge. A width-only child is centred.
+component Meter inherits Rectangle {
+    in property <float> amount;
+    in property <color> fill;
+    in property <color> track;
+    background: track;
+    border-radius: 4px;
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width * amount;
+        height: parent.height;
+        border-radius: 4px;
+        background: fill;
+    }
+}
+
 export component AppWindow inherits Window {
     property <length> row-h: compact ? 24px : 30px;
     in property <bool> harness: true;
@@ -1639,28 +1656,28 @@ export component AppWindow inherits Window {
             Text { text: "󰋊"; x: 16px; y: 40px; width: 18px; height: 36px; font-size: 14px; color: muted; vertical-alignment: center; }
             Text { text: "r2-root"; x: 42px; y: 38px; width: 120px; height: 18px; font-size: 12px; color: text; }
             Text { text: "/"; x: 42px; y: 54px; width: 120px; height: 16px; font-size: 11px; color: muted; }
-            Rectangle {
+            Meter {
                 x: 160px;
                 y: 54px;
                 width: parent.width - 160px - 280px;
                 height: 8px;
-                border-radius: 4px;
-                background: root.text.with-alpha(0.12);
-                Rectangle { width: parent.width * 0.58; height: 8px; border-radius: 4px; background: root.accent; }
+                amount: 0.58;
+                fill: root.accent;
+                track: root.text.with-alpha(0.12);
             }
             Text { text: "58%"; x: parent.width - 268px; y: 36px; width: 72px; height: 28px; font-size: 22px; font-weight: 700; color: text; horizontal-alignment: right; }
             Text { text: "812 GB free of 1.8 TB"; x: parent.width - 188px; y: 42px; width: 172px; height: 20px; font-size: 11px; color: muted; }
             Text { text: "󰋊"; x: 16px; y: 82px; width: 18px; height: 36px; font-size: 14px; color: muted; vertical-alignment: center; }
             Text { text: "archive"; x: 42px; y: 80px; width: 120px; height: 18px; font-size: 12px; color: text; }
             Text { text: "/mnt/archive"; x: 42px; y: 96px; width: 120px; height: 16px; font-size: 11px; color: muted; }
-            Rectangle {
+            Meter {
                 x: 160px;
                 y: 96px;
                 width: parent.width - 160px - 280px;
                 height: 8px;
-                border-radius: 4px;
-                background: root.text.with-alpha(0.12);
-                Rectangle { width: parent.width * 0.91; height: 8px; border-radius: 4px; background: root.warning; }
+                amount: 0.91;
+                fill: root.warning;
+                track: root.text.with-alpha(0.12);
             }
             Text { text: "91%"; x: parent.width - 268px; y: 78px; width: 72px; height: 28px; font-size: 22px; font-weight: 700; color: text; horizontal-alignment: right; }
             Text { text: "362 GB free of 4 TB"; x: parent.width - 188px; y: 84px; width: 172px; height: 20px; font-size: 11px; color: muted; }
@@ -1690,11 +1707,12 @@ export component AppWindow inherits Window {
                 y: 40px;
                 width: map-w;
                 height: map-h;
+                background: surface;
                 for cell in map-cells: Rectangle {
-                    x: cell.x + 1px;
-                    y: cell.y + 1px;
-                    width: max(cell.w - 2px, 1px);
-                    height: max(cell.h - 2px, 1px);
+                    x: cell.x;
+                    y: cell.y;
+                    width: cell.w;
+                    height: cell.h;
                     background: root.accent.with-alpha(cell.shade);
                     border-radius: 3px;
                     property <bool> light: cell.shade >= 0.45;

@@ -33,6 +33,9 @@ pub struct Rect {
     pub h: f32,
     pub name: String,
     pub bytes: u64,
+    /// Squarify recursion depth. Deeper rows sit inside the remainder of a
+    /// parent row and are drawn darker than that parent.
+    pub depth: u32,
 }
 
 /// Squarified treemap of `weights` into a `width` by `height` box.
@@ -49,11 +52,19 @@ pub fn squarify(weights: &[(String, u64)], width: f32, height: f32) -> Vec<Rect>
     items.sort_by_key(|item| item.1.to_bits());
     items.reverse();
     let mut out = Vec::new();
-    layout(&items, 0.0, 0.0, width, height, &mut out);
+    layout(&items, 0.0, 0.0, width, height, 0, &mut out);
     out
 }
 
-fn layout(items: &[(String, f32)], x: f32, y: f32, w: f32, h: f32, out: &mut Vec<Rect>) {
+fn layout(
+    items: &[(String, f32)],
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    depth: u32,
+    out: &mut Vec<Rect>,
+) {
     if items.is_empty() || w <= 0.0 || h <= 0.0 {
         return;
     }
@@ -65,6 +76,7 @@ fn layout(items: &[(String, f32)], x: f32, y: f32, w: f32, h: f32, out: &mut Vec
             h,
             name: items[0].0.clone(),
             bytes: items[0].1 as u64,
+            depth,
         });
         return;
     }
@@ -94,22 +106,26 @@ fn layout(items: &[(String, f32)], x: f32, y: f32, w: f32, h: f32, out: &mut Vec
             area / thickness
         };
         if vertical {
-            out.push(Rect {
-                x,
-                y: y + cursor,
-                w,
-                h: length,
-                name: name.clone(),
-                bytes: *area as u64,
-            });
-        } else {
+            // Horizontal strip along the top. `thickness` is its height.
             out.push(Rect {
                 x: x + cursor,
                 y,
                 w: length,
-                h,
+                h: thickness,
                 name: name.clone(),
                 bytes: *area as u64,
+                depth,
+            });
+        } else {
+            // Vertical strip along the left. `thickness` is its width.
+            out.push(Rect {
+                x,
+                y: y + cursor,
+                w: thickness,
+                h: length,
+                name: name.clone(),
+                bytes: *area as u64,
+                depth,
             });
         }
         cursor += length;
@@ -121,6 +137,7 @@ fn layout(items: &[(String, f32)], x: f32, y: f32, w: f32, h: f32, out: &mut Vec
             y + thickness,
             w,
             h - thickness,
+            depth + 1,
             out,
         );
     } else {
@@ -130,6 +147,7 @@ fn layout(items: &[(String, f32)], x: f32, y: f32, w: f32, h: f32, out: &mut Vec
             y,
             w - thickness,
             h,
+            depth + 1,
             out,
         );
     }
@@ -225,6 +243,14 @@ mod tests {
         assert!((area - 6000.0).abs() < 400.0, "{area}");
         assert_eq!(cells[0].name, "videos");
         assert!(cells.iter().all(|c| c.w > 0.0 && c.h > 0.0));
+        for (i, a) in cells.iter().enumerate() {
+            for b in cells.iter().skip(i + 1) {
+                let ox = (a.x + a.w).min(b.x + b.w) - a.x.max(b.x);
+                let oy = (a.y + a.h).min(b.y + b.h) - a.y.max(b.y);
+                assert!(ox < 0.5 || oy < 0.5, "{} overlaps {}", a.name, b.name);
+            }
+        }
+        assert!(cells.iter().any(|c| c.depth > cells[0].depth));
     }
 
     #[test]
