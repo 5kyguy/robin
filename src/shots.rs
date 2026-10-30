@@ -198,16 +198,19 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         }
         .into(),
     );
-    let refused = crate::fsops::refusal(&[
-        crate::fsops::KeptEntry {
-            path: "Projects/robin/vendor/fonts/Inter.ttf".into(),
-            reason: crate::fsops::KeepReason::ReadOnlyFolder,
-        },
-        crate::fsops::KeptEntry {
-            path: "Projects/robin/vendor/fonts/Mono.ttf".into(),
-            reason: crate::fsops::KeepReason::ReadOnlyFolder,
-        },
-    ]);
+    let refused = crate::fsops::refusal(
+        "Projects",
+        &[
+            crate::fsops::KeptEntry {
+                path: "Projects/robin/vendor/fonts/Inter.ttf".into(),
+                reason: crate::fsops::KeepReason::ReadOnlyFolder,
+            },
+            crate::fsops::KeptEntry {
+                path: "Projects/robin/vendor/fonts/Mono.ttf".into(),
+                reason: crate::fsops::KeepReason::ReadOnlyFolder,
+            },
+        ],
+    );
     ui.set_refusal_title(refused.title.into());
     ui.set_refusal_paths(ModelRc::new(Rc::new(VecModel::from(
         refused

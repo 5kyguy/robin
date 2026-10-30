@@ -536,7 +536,8 @@ impl TransferReport {
 /// The up-front refusal, worded for the move-refused dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {
-    /// "Can't move: 1 folder inside is read-only", counted per reason.
+    /// "Can't move Projects: 1 folder inside is read-only" for one reason,
+    /// "Can't move Projects: 2 items can't be removed afterwards" for several.
     pub title: String,
     /// The blocking paths: the read-only folders themselves, and the items
     /// in shared folders or on read-only drives.
@@ -555,7 +556,7 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-pub fn refusal(blocked: &[KeptEntry]) -> Refusal {
+pub fn refusal(name: &str, blocked: &[KeptEntry]) -> Refusal {
     let mut folders: Vec<std::path::PathBuf> = Vec::new();
     let mut shared = Vec::new();
     let mut drive = Vec::new();
@@ -599,8 +600,16 @@ pub fn refusal(blocked: &[KeptEntry]) -> Refusal {
         .chain(&drive)
         .map(|p| p.display().to_string())
         .collect();
+    let why = if parts.len() == 1 {
+        parts.remove(0)
+    } else {
+        format!(
+            "{} can't be removed afterwards",
+            plural(blocked.len(), "item", "items")
+        )
+    };
     Refusal {
-        title: format!("Can't move: {}", parts.join(", ")),
+        title: format!("Can't move {name}: {why}"),
         paths,
     }
 }
@@ -2551,9 +2560,9 @@ mod tests {
                     }]
                 );
                 assert_eq!(
-                    refusal(&blocked),
+                    refusal("src", &blocked),
                     Refusal {
-                        title: "Can't move: 1 folder inside is read-only".into(),
+                        title: "Can't move src: 1 folder inside is read-only".into(),
                         paths: vec!["src/inner".into()],
                     }
                 );
@@ -2633,16 +2642,32 @@ mod tests {
             path: p.into(),
             reason,
         };
-        let r = refusal(&[
-            k("a/x/1", KeepReason::ReadOnlyFolder),
-            k("a/x/2", KeepReason::ReadOnlyFolder),
-            k("a/y/3", KeepReason::ReadOnlyFolder),
-            k("a/s/4", KeepReason::StickyFolder),
-        ]);
+        let one = |p: &str, reason| refusal("Projects", &[k(p, reason)]).title;
         assert_eq!(
-            r.title,
-            "Can't move: 2 folders inside are read-only, 1 item belongs to someone else"
+            one("Projects/x/1", KeepReason::StickyFolder),
+            "Can't move Projects: 1 item belongs to someone else"
         );
+        assert_eq!(
+            refusal(
+                "Projects",
+                &[
+                    k("Projects/x/1", KeepReason::ReadOnlyFolder),
+                    k("Projects/y/2", KeepReason::ReadOnlyFolder),
+                ]
+            )
+            .title,
+            "Can't move Projects: 2 folders inside are read-only"
+        );
+        let r = refusal(
+            "a",
+            &[
+                k("a/x/1", KeepReason::ReadOnlyFolder),
+                k("a/x/2", KeepReason::ReadOnlyFolder),
+                k("a/y/3", KeepReason::ReadOnlyFolder),
+                k("a/s/4", KeepReason::StickyFolder),
+            ],
+        );
+        assert_eq!(r.title, "Can't move a: 4 items can't be removed afterwards");
         assert_eq!(r.paths, vec!["a/x", "a/y", "a/s/4"]);
     }
 
