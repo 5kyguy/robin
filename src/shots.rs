@@ -82,6 +82,7 @@ pub fn known(view: &str) -> bool {
             | "list-modified-sorted"
             | "list-name-natural"
             | "list-name-desc"
+            | "watch-fallback"
     )
 }
 
@@ -947,7 +948,7 @@ fn menu() -> Vec<slint::SharedString> {
 /// The views of the wired file operations: cut rows, a drag over a folder,
 /// a running job, the keyboard-focused confirms, and the undo toast.
 fn fileops_scene(ui: &AppWindow, view: &str) {
-    if view.starts_with("list-") {
+    if view.starts_with("list-") || view == "watch-fallback" {
         return list_scene(ui, view);
     }
     let mut rows = files(false);
@@ -1154,6 +1155,20 @@ fn list_scene(ui: &AppWindow, view: &str) {
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
     ui.set_status_left(crate::ops::count(ctl.listing.view().len()).into());
+    // The two neutral notices, with the same text the app shows.
+    let notice = match view {
+        "watch-fallback" => Some(crate::app::watch_fallback_notice(Path::new(
+            "/mnt/archive/Pictures",
+        ))),
+        _ => None,
+    };
+    if let Some((text, details)) = notice {
+        ui.set_toast_tone("".into());
+        ui.set_toast_text(text.into());
+        crate::app::set_toast_rows(ui, &crate::app::detail_rows(&details, false, false));
+        ui.set_toast_on(true);
+        ui.set_toast_open(true);
+    }
 }
 
 #[cfg(test)]

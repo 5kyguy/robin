@@ -152,8 +152,9 @@ pub fn drop_check(op: Op, src: &Path, names: &[OsString], dest: &Path) -> DropCh
 #[derive(Debug, Default)]
 pub struct ExternalDrop {
     pub jobs: Vec<Job>,
-    /// Dropped paths that are symlinks, refused rather than followed.
-    pub symlinks: Vec<PathBuf>,
+    /// Items skipped because they are already in the destination, or
+    /// are the destination's own ancestors.
+    pub already_here: usize,
 }
 
 /// Files dropped on the window by another app, as copy jobs into `dest`,
@@ -164,7 +165,8 @@ pub struct ExternalDrop {
 /// as its target, and moving would take the target away from wherever it
 /// really lives. Slint doesn't expose the raw `text/uri-list`, so the link
 /// itself can't be recovered; copying at worst duplicates the target.
-/// Paths that still are links (no-follow stat) are refused. Items already
+/// winit resolves links before Robin sees a path, so a dropped symlink
+/// copies its target. Items already
 /// in `dest` (compared after canonicalizing it) and folders dropped into
 /// themselves are skipped.
 pub fn external_drop(paths: &[PathBuf], dest: &Path) -> ExternalDrop {
@@ -175,10 +177,6 @@ pub fn external_drop(paths: &[PathBuf], dest: &Path) -> ExternalDrop {
         let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
             continue;
         };
-        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-            out.symlinks.push(path.clone());
-            continue;
-        }
         match groups.iter_mut().find(|(p, _)| p == parent) {
             Some((_, names)) => {
                 if !names.iter().any(|n| n == name) {
@@ -188,15 +186,14 @@ pub fn external_drop(paths: &[PathBuf], dest: &Path) -> ExternalDrop {
             None => groups.push((parent.to_path_buf(), vec![name.to_os_string()])),
         }
     }
-    out.jobs = groups
-        .into_iter()
-        .filter(|(src, _)| {
-            let real_src = std::fs::canonicalize(src).unwrap_or_else(|_| src.clone());
-            real_src != real_dest
-        })
-        .filter(|(src, names)| drop_allowed(Op::Copy, src, names, dest))
-        .map(|(src, names)| Job::transfer(Op::Copy, &src, names, dest))
-        .collect();
+    for (src, names) in groups {
+        let real_src = std::fs::canonicalize(&src).unwrap_or_else(|_| src.clone());
+        if real_src == real_dest || !drop_allowed(Op::Copy, &src, &names, dest) {
+            out.already_here += names.len();
+            continue;
+        }
+        out.jobs.push(Job::transfer(Op::Copy, &src, names, dest));
+    }
     out
 }
 
@@ -1305,12 +1302,7 @@ mod tests {
         std::os::unix::fs::symlink(&dest, root.join("dest-link")).unwrap();
         let via_link = external_drop(&[dest.join("here.txt")], &root.join("dest-link"));
         assert!(via_link.jobs.is_empty());
-        // A path that is still a link is refused, not followed.
-        std::os::unix::fs::symlink(a.join("1.jpg"), b.join("link.jpg")).unwrap();
-        let plan = external_drop(&[b.join("link.jpg"), b.join("2.jpg")], &dest);
-        assert_eq!(plan.symlinks, [b.join("link.jpg")]);
-        assert_eq!(plan.jobs.len(), 1);
-        assert_eq!(plan.jobs[0].names, ["2.jpg"]);
+        assert_eq!(via_link.already_here, 1);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

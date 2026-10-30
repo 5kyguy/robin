@@ -129,16 +129,34 @@ impl Snapshot {
             .into_iter()
             .map(crate::model::Entry::from_dirent)
             .collect();
-        let counts = entries
-            .iter()
-            .filter(|e| e.is_dir)
-            .filter_map(|e| {
-                let n = DirFd::open(&dir.join(&e.name)).ok()?.list().ok()?.len();
-                Some((e.name.clone(), n))
-            })
-            .collect();
+        let counts = subfolder_counts(&fd, &entries, |a, b| device(a) == device(b));
         Ok(Self { entries, counts })
     }
+}
+
+fn device(fd: &DirFd) -> Option<u64> {
+    rustix::fs::fstat(fd.as_fd()).ok().map(|st| st.st_dev)
+}
+
+/// Item counts for the subfolders in `entries`. Each is opened without
+/// following links, and one on another device than `parent` (a mount
+/// point, which may be slow or asleep) is left uncounted, so blank.
+fn subfolder_counts(
+    parent: &DirFd,
+    entries: &[crate::model::Entry],
+    same_device: impl Fn(&DirFd, &DirFd) -> bool,
+) -> std::collections::HashMap<OsString, usize> {
+    entries
+        .iter()
+        .filter(|e| e.is_dir)
+        .filter_map(|e| {
+            let child = parent.open_dir_nofollow(&e.name).ok()?;
+            if !same_device(parent, &child) {
+                return None;
+            }
+            Some((e.name.clone(), child.list().ok()?.len()))
+        })
+        .collect()
 }
 
 pub struct Controller {
@@ -570,7 +588,7 @@ impl Controller {
             .iter()
             .enumerate()
             .map(|(i, e)| Row {
-                glyph: if e.is_dir { "󰉋" } else { "󰈔" }.into(),
+                glyph: file_icon(e.is_dir, &e.extension()).0.into(),
                 name: e.name.to_string_lossy().as_ref().into(),
                 size: size_line(e.is_dir, e.len, self.counts.get(&e.name).copied()).into(),
                 kind: if e.is_dir {
@@ -583,7 +601,7 @@ impl Controller {
                 selected: self.listing.selection().contains(&e.name),
                 hovered: false,
                 hidden: e.is_hidden(),
-                role: i32::from(e.is_dir),
+                role: file_icon(e.is_dir, &e.extension()).1,
                 badge: SharedString::new(),
                 cut: self.clip.is_cut(&self.dir, &e.name),
                 drop: target == Some(i),
@@ -928,25 +946,41 @@ fn flush_drops(ui: &AppWindow, st: &Shared) {
             None => by_dest.push((dest, vec![path])),
         }
     }
-    let mut symlinks = 0;
+    let (mut here, mut jobs) = (0, 0);
     for (dest, paths) in by_dest {
         let plan = ops::external_drop(&paths, &dest);
-        symlinks += plan.symlinks.len();
+        here += plan.already_here;
+        jobs += plan.jobs.len();
         for job in plan.jobs {
             apply(ui, st, Action::Run(job)); // queued behind a running job
         }
     }
-    if symlinks > 0 {
-        show_toast(
-            ui,
-            st,
-            "warning",
-            format!("Ignored {} dropped link(s)", symlinks),
-            vec!["Links from other apps can't be copied safely yet.".into()],
-            false,
-            "",
-        );
+    if let Some((text, details)) = drop_notice(jobs, here) {
+        show_toast(ui, st, "", text, details, false, "");
     }
+}
+
+/// The neutral notice after a drop that copied nothing because
+/// everything was already in the folder.
+pub fn drop_notice(jobs: usize, here: usize) -> Option<(String, Vec<String>)> {
+    (jobs == 0 && here > 0).then(|| {
+        (
+            "Nothing to copy".into(),
+            vec![format!("{} already in this folder", ops::count(here))],
+        )
+    })
+}
+
+/// The one-time neutral notice for a folder without a live watch.
+pub fn watch_fallback_notice(dir: &Path) -> (String, Vec<String>) {
+    (
+        "Live refresh is unavailable here".into(),
+        vec![format!(
+            "{} can't be watched; checking it every {} s instead.",
+            dir.display(),
+            crate::watch::SLOW_POLL.as_secs()
+        )],
+    )
 }
 
 /// Follow the open folder and reread it, off the UI thread, once outside
@@ -960,12 +994,8 @@ fn poll_watch(ui: &AppWindow, st: &Shared) {
             ui,
             st,
             "",
-            "Live refresh is unavailable here".into(),
-            vec![format!(
-                "{} can't be watched; checking it every {} s instead.",
-                dir.display(),
-                crate::watch::SLOW_POLL.as_secs()
-            )],
+            watch_fallback_notice(&dir).0,
+            watch_fallback_notice(&dir).1,
             false,
             "",
         );
@@ -1361,6 +1391,25 @@ pub fn conflict_props(ui: &AppWindow, ask: &ConflictAsk, apply_all: bool) {
 /// as the list view shows it.
 /// Thunar-style type names for the Type column; unknown extensions read
 /// as "XYZ file" and files without one as "File".
+/// The glyph and colour role for a row. Roles: 0 ink, 1 accent (cyan),
+/// 2 danger (red), 3 warning (amber), 4 muted, as in `ui/app.slint`.
+pub fn file_icon(is_dir: bool, ext: &str) -> (&'static str, i32) {
+    if is_dir {
+        return ("󰉋", 1);
+    }
+    match ext.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "heif" | "svg" | "tif" | "tiff"
+        | "raw" | "cr2" | "cr3" | "nef" | "arw" | "dng" => ("󰈟", 0),
+        "mp4" | "m4v" | "mkv" | "webm" | "mov" | "avi" => ("󰕧", 1),
+        "mp3" | "flac" | "ogg" | "opus" | "wav" | "m4a" => ("󰎆", 1),
+        "pdf" => ("󰈦", 2),
+        "zip" | "tar" | "gz" | "zst" | "xz" | "bz2" | "7z" | "rar" => ("󰗄", 3),
+        "toml" | "json" | "yaml" | "yml" | "ini" | "conf" => ("\u{e6b2}", 1),
+        "md" | "txt" => ("\u{f0354}", 0),
+        _ => ("󰈔", 4),
+    }
+}
+
 pub fn kind_name(ext: &str) -> String {
     let ext = ext.to_ascii_lowercase();
     let known = match ext.as_str() {
@@ -2228,6 +2277,66 @@ mod tests {
         c.refresh().unwrap();
         assert_eq!(c.dir, gone.parent().unwrap());
         assert_eq!(c.sort_header(), (1, false), "sort survives the fallback");
+    }
+
+    #[test]
+    fn file_types_get_distinct_glyphs_and_colours() {
+        let pdf = file_icon(false, "pdf");
+        let zst = file_icon(false, "ZST");
+        let mp4 = file_icon(false, "mp4");
+        let flac = file_icon(false, "flac");
+        let jpg = file_icon(false, "jpg");
+        let other = file_icon(false, "xcf");
+        assert_eq!(pdf.1, 2, "pdf is red");
+        assert_eq!(zst.1, 3, "archives are amber");
+        assert_eq!((mp4.1, flac.1), (1, 1), "video and audio are cyan");
+        assert_eq!(other.1, 4, "unknown is muted");
+        assert_eq!(file_icon(true, ""), ("󰉋", 1));
+        let glyphs = [pdf.0, zst.0, mp4.0, flac.0, jpg.0, other.0];
+        for (i, g) in glyphs.iter().enumerate() {
+            assert!(!glyphs[i + 1..].contains(g), "{g} reused");
+        }
+        let mut c = setup("icons");
+        fs::write(c.dir.join("m.pdf"), b"%").unwrap();
+        c.reload().unwrap();
+        let row = c.rows().into_iter().find(|r| r.name == "m.pdf").unwrap();
+        assert_eq!((row.glyph.as_str(), row.role), pdf, "rows use the map");
+    }
+
+    #[test]
+    fn counts_skip_other_devices_and_links() {
+        let c = setup("count-dev");
+        let dir = c.dir.clone();
+        fs::create_dir(dir.join("mnt")).unwrap();
+        fs::write(dir.join("mnt/x"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.join("raw-exports"), dir.join("link")).unwrap();
+        let fd = DirFd::open(&dir).unwrap();
+        let entries: Vec<_> = fd
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(crate::model::Entry::from_dirent)
+            .collect();
+        let key = |n: &str| OsString::from(n);
+        let all = subfolder_counts(&fd, &entries, |_, _| true);
+        assert_eq!(all.get(&key("mnt")), Some(&1));
+        assert!(!all.contains_key(&key("link")), "links aren't followed");
+        // A dev-mismatch seam: pretend "mnt" is a mount point.
+        let mnt_ino = rustix::fs::fstat(fd.open_dir_nofollow("mnt".as_ref()).unwrap().as_fd())
+            .unwrap()
+            .st_ino;
+        let split = subfolder_counts(&fd, &entries, |_, child| {
+            rustix::fs::fstat(child.as_fd()).unwrap().st_ino != mnt_ino
+        });
+        assert!(!split.contains_key(&key("mnt")), "other device stays blank");
+        assert_eq!(split.get(&key("raw-exports")), Some(&0));
+    }
+
+    #[test]
+    fn a_drop_onto_its_own_folder_says_nothing_was_copied() {
+        assert_eq!(drop_notice(2, 0), None);
+        assert_eq!(drop_notice(2, 1), None, "partial skips stay quiet");
+        assert_eq!(drop_notice(0, 3).unwrap().0, "Nothing to copy");
     }
 
     #[test]
