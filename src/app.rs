@@ -167,6 +167,25 @@ impl Controller {
         }
     }
 
+    /// Reread after an outside change. If the folder itself went away,
+    /// fall back to the nearest ancestor that still exists.
+    pub fn refresh(&mut self) -> Result<()> {
+        if self.reload().is_ok() {
+            return Ok(());
+        }
+        let mut dir = self.dir.clone();
+        while dir.pop() {
+            if DirFd::open(&dir).is_ok() {
+                let (key, order) = self.listing.sort();
+                self.dir = dir;
+                self.listing = Listing::default();
+                self.listing.set_sort(key, order);
+                return self.reload();
+            }
+        }
+        self.reload()
+    }
+
     pub fn reload(&mut self) -> Result<()> {
         let fd = DirFd::open(&self.dir)?;
         self.listing.replace_dir(&fd)
@@ -657,6 +676,10 @@ struct State {
     toast_all: Vec<String>,
     toast_pinned: bool,
     arm_timer: slint::Timer,
+    /// Live refresh: the watch on `ctl.dir`, its debounce and poll timer.
+    watch: Option<crate::watch::Watch>,
+    debounce: crate::model::Debounce,
+    watch_timer: slint::Timer,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -682,9 +705,23 @@ pub fn run(dir: PathBuf) -> Result<i32> {
         toast_all: Vec::new(),
         toast_pinned: false,
         arm_timer: slint::Timer::default(),
+        watch: None,
+        debounce: crate::model::Debounce::new(Duration::from_millis(WATCH_DEBOUNCE_MS)),
+        watch_timer: slint::Timer::default(),
     }));
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
     redraw(&ui, &state.borrow());
+    let w = ui.as_weak();
+    let st = state.clone();
+    state.borrow().watch_timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(100),
+        move || {
+            if let Some(ui) = w.upgrade() {
+                poll_watch(&ui, &st);
+            }
+        },
+    );
 
     let w = ui.as_weak();
     let st = state.clone();
@@ -779,6 +816,38 @@ pub fn run(dir: PathBuf) -> Result<i32> {
     Ok(0)
 }
 
+const WATCH_DEBOUNCE_MS: u64 = 200;
+
+/// Follow the open folder and reread it once outside changes settle,
+/// keeping the selection (by name) and the scroll position.
+fn poll_watch(ui: &AppWindow, st: &Shared) {
+    let mut s = st.borrow_mut();
+    if s.watch.as_ref().map(|w| w.dir()) != Some(s.ctl.dir.as_path()) {
+        s.watch = crate::watch::Watch::new(&s.ctl.dir).ok();
+        s.debounce = crate::model::Debounce::new(Duration::from_millis(WATCH_DEBOUNCE_MS));
+    }
+    let now = std::time::Instant::now();
+    if s.watch.as_ref().is_some_and(|w| w.pending()) {
+        s.debounce.push(now);
+    }
+    if !s.debounce.ready(now) {
+        return;
+    }
+    let before = s.ctl.dir.clone();
+    if s.ctl.refresh().is_err() {
+        return;
+    }
+    let (list_y, grid_y) = (ui.get_list_scroll(), ui.get_grid_scroll());
+    redraw(ui, &s);
+    if s.ctl.dir == before {
+        ui.set_list_scroll(list_y);
+        ui.set_grid_scroll(grid_y);
+    } else {
+        ui.set_list_scroll(0.0);
+        ui.set_grid_scroll(0.0);
+    }
+}
+
 fn redraw(ui: &AppWindow, s: &State) {
     let ctl = &s.ctl;
     ui.set_files(ModelRc::new(Rc::new(VecModel::from(ctl.rows()))));
@@ -860,7 +929,9 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
         Action::Navigate(dir) => {
             let mut s = st.borrow_mut();
             let old = std::mem::replace(&mut s.ctl.dir, dir);
+            let (key, order) = s.ctl.listing.sort();
             s.ctl.listing = Listing::default();
+            s.ctl.listing.set_sort(key, order);
             if let Err(e) = s.ctl.reload() {
                 s.ctl.dir = old;
                 let _ = s.ctl.reload();
@@ -869,6 +940,8 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
                 return;
             }
             redraw(ui, &s);
+            ui.set_list_scroll(0.0);
+            ui.set_grid_scroll(0.0);
         }
         Action::Answer(choice) => {
             if let Some(tx) = st.borrow_mut().reply.take() {
@@ -1850,5 +1923,39 @@ mod tests {
         let today = get("a.jpg");
         assert_eq!(today.len(), 5, "{today}");
         assert_eq!(&today[2..3], ":");
+    }
+
+    #[test]
+    fn refresh_picks_up_outside_changes_and_keeps_the_selection() {
+        let mut c = setup("refresh");
+        c.listing.select_only("b.jpg".into());
+        fs::write(c.dir.join("new.jpg"), b"n").unwrap();
+        fs::remove_file(c.dir.join("a.jpg")).unwrap();
+        c.refresh().unwrap();
+        let names: Vec<String> = c.rows().iter().map(|r| r.name.to_string()).collect();
+        assert_eq!(names, ["raw-exports", "b.jpg", "new.jpg"]);
+        let selected: Vec<String> = c
+            .rows()
+            .iter()
+            .filter(|r| r.selected)
+            .map(|r| r.name.to_string())
+            .collect();
+        assert_eq!(selected, ["b.jpg"]);
+        fs::remove_file(c.dir.join("b.jpg")).unwrap();
+        c.refresh().unwrap();
+        assert!(c.listing.selection().is_empty());
+    }
+
+    #[test]
+    fn refresh_falls_back_to_the_parent_when_the_folder_goes_away() {
+        let mut c = setup("refresh-gone");
+        c.sort_by(1);
+        let gone = c.dir.join("raw-exports");
+        c.dir = gone.clone();
+        c.reload().unwrap();
+        fs::remove_dir(&gone).unwrap();
+        c.refresh().unwrap();
+        assert_eq!(c.dir, gone.parent().unwrap());
+        assert_eq!(c.sort_header(), (1, false), "sort survives the fallback");
     }
 }

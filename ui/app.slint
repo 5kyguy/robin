@@ -535,6 +535,9 @@ export component AppWindow inherits Window {
     in property <int> sort-column: 0;
     in property <bool> sort-desc: false;
     callback sort-by(int);
+    // Scroll offsets, kept across live refreshes and reset on navigation.
+    in-out property <length> list-scroll: 0px;
+    in-out property <length> grid-scroll: 0px;
     in property <[GridLine]> grid-rows;
     in property <[string]> menu-labels;
     in property <string> toast-text: "";
@@ -961,6 +964,7 @@ export component AppWindow inherits Window {
                     Rectangle { height: 1px; background: divider; }
                     ListView {
                         vertical-stretch: 1;
+                        viewport-y <=> root.list-scroll;
                         for row[i] in files: Rectangle {
                             width: parent.width;
                             height: row-h;
@@ -1049,6 +1053,7 @@ export component AppWindow inherits Window {
                 }
                 if state == "files" && grid: ListView {
                     vertical-stretch: 1;
+                    viewport-y <=> root.grid-scroll;
                     for line in grid-rows: HorizontalLayout {
                         padding-left: 16px;
                         padding-right: 16px;
