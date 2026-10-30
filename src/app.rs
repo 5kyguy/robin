@@ -17,7 +17,7 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use crate::fsops::{
     self, Cancel, Conflict, ConflictChoice, ConflictKind, ConflictPrompt, KeptEntry, TrashChoice,
 };
-use crate::model::{Listing, Nav};
+use crate::model::{Listing, Nav, SortDir, SortKey};
 use crate::ops::{self, Clipboard, Env, Job, JobKind, Mods, Op, Outcome, Progress, Trashed};
 use crate::safety::DirFd;
 use crate::{AppWindow, Error, Result, Row};
@@ -124,6 +124,9 @@ pub struct Controller {
     pub drag: Option<Drag>,
     pressed: Option<usize>,
     pub job_running: bool,
+    /// A fixed (now, UTC offset) for tests and renders; the system clock
+    /// and zone otherwise.
+    pub clock: Option<(i64, i64)>,
 }
 
 pub mod keys {
@@ -160,6 +163,7 @@ impl Controller {
             drag: None,
             pressed: None,
             job_running: false,
+            clock: None,
         }
     }
 
@@ -452,7 +456,39 @@ impl Controller {
         })
     }
 
+    /// A column header click: 0 Name, 1 Size, 2 Type, 3 Modified.
+    pub fn sort_by(&mut self, column: i32) -> Action {
+        let key = match column {
+            0 => SortKey::Name,
+            1 => SortKey::Size,
+            2 => SortKey::Type,
+            3 => SortKey::Date,
+            _ => return Action::None,
+        };
+        self.listing.toggle_sort(key);
+        Action::Redraw
+    }
+
+    /// (column, descending) for the header arrow.
+    pub fn sort_header(&self) -> (i32, bool) {
+        let (key, dir) = self.listing.sort();
+        let column = match key {
+            SortKey::Name => 0,
+            SortKey::Size => 1,
+            SortKey::Type => 2,
+            SortKey::Date => 3,
+        };
+        (column, dir == SortDir::Desc)
+    }
+
     pub fn rows(&self) -> Vec<Row> {
+        let now = self
+            .clock
+            .map_or_else(|| secs(std::time::SystemTime::now()), |c| c.0);
+        let offset = |t| {
+            self.clock
+                .map_or_else(|| crate::model::local_offset(t), |c| c.1)
+        };
         let target = self.drag.as_ref().and_then(|d| d.target);
         let refused = self.drag.as_ref().and_then(|d| d.refused);
         self.listing
@@ -474,7 +510,7 @@ impl Controller {
                     e.extension().to_uppercase()
                 }
                 .into(),
-                modified: SharedString::new(),
+                modified: crate::model::format_modified(secs(e.mtime), now, offset).into(),
                 selected: self.listing.selection().contains(&e.name),
                 hovered: false,
                 hidden: e.is_hidden(),
@@ -560,6 +596,13 @@ pub fn refusal_view(refused: &[(OsString, Vec<KeptEntry>)]) -> RefusalView {
         dismiss: if can_copy { "Cancel" } else { "Close" },
         notes,
         items: parts.len(),
+    }
+}
+
+fn secs(t: std::time::SystemTime) -> i64 {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
     }
 }
 
@@ -680,6 +723,14 @@ pub fn run(dir: PathBuf) -> Result<i32> {
     });
     let w = ui.as_weak();
     let st = state.clone();
+    ui.on_sort_by(move |column| {
+        let action = st.borrow_mut().ctl.sort_by(column);
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
     ui.on_dialog_button(move |i| {
         let action = st.borrow_mut().ctl.button(i);
         if let Some(ui) = w.upgrade() {
@@ -731,6 +782,9 @@ pub fn run(dir: PathBuf) -> Result<i32> {
 fn redraw(ui: &AppWindow, s: &State) {
     let ctl = &s.ctl;
     ui.set_files(ModelRc::new(Rc::new(VecModel::from(ctl.rows()))));
+    let (column, desc) = ctl.sort_header();
+    ui.set_sort_column(column);
+    ui.set_sort_desc(desc);
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let crumbs: Vec<String> = crate::model::breadcrumbs(&ctl.dir, home.as_deref())
         .iter()
@@ -1748,5 +1802,53 @@ mod tests {
         assert_eq!(c.drag_label().unwrap().0, "Can't drop into itself");
         let row = &c.rows()[i];
         assert!(row.drop_refused && !row.drop);
+    }
+
+    #[test]
+    fn header_clicks_sort_and_reverse_with_folders_first() {
+        let mut c = setup("sort-header");
+        fs::write(c.dir.join("c.jpg"), b"ccccc").unwrap();
+        c.reload().unwrap();
+        let names = |c: &Controller| -> Vec<String> {
+            c.rows().iter().map(|r| r.name.to_string()).collect()
+        };
+        assert_eq!(c.sort_header(), (0, false));
+        assert_eq!(c.sort_by(1), Action::Redraw);
+        assert_eq!(c.sort_header(), (1, false));
+        assert_eq!(names(&c), ["raw-exports", "a.jpg", "b.jpg", "c.jpg"]);
+        c.sort_by(1);
+        assert_eq!(c.sort_header(), (1, true));
+        assert_eq!(names(&c), ["raw-exports", "c.jpg", "b.jpg", "a.jpg"]);
+        c.sort_by(0);
+        assert_eq!(c.sort_header(), (0, false));
+        c.sort_by(0);
+        assert_eq!(names(&c), ["raw-exports", "c.jpg", "b.jpg", "a.jpg"]);
+        assert_eq!(c.sort_by(9), Action::None);
+    }
+
+    #[test]
+    fn modified_column_is_filled_like_thunar() {
+        let mut c = setup("modified");
+        let now = secs(std::time::SystemTime::now());
+        let old = fs::File::options()
+            .write(true)
+            .open(c.dir.join("b.jpg"))
+            .unwrap();
+        old.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+            .unwrap();
+        c.clock = Some((now, 0));
+        c.reload().unwrap();
+        let rows = c.rows();
+        let get = |n: &str| {
+            rows.iter()
+                .find(|r| r.name == n)
+                .unwrap()
+                .modified
+                .to_string()
+        };
+        assert_eq!(get("b.jpg"), "2023-11-14");
+        let today = get("a.jpg");
+        assert_eq!(today.len(), 5, "{today}");
+        assert_eq!(&today[2..3], ":");
     }
 }
