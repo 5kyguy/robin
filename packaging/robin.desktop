@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Robin
+GenericName=File manager
+Comment=File manager and media viewer for R2-D2
+Exec=robin %F
+Icon=robin
+Terminal=false
+Categories=FileManager;Utility;
+MimeType=inode/directory;
+StartupWMClass=dev.skyguy.robin
+StartupNotify=true
