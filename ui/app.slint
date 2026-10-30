@@ -1697,25 +1697,33 @@ export component AppWindow inherits Window {
                     height: max(cell.h - 2px, 1px);
                     background: root.accent.with-alpha(cell.shade);
                     border-radius: 3px;
-                    if cell.w >= 64px && cell.h >= 28px: Text {
-                        text: cell.name;
-                        x: 8px;
-                        y: 6px;
-                        width: parent.width - 16px;
-                        height: 16px;
-                        font-size: 12px;
-                        color: cell.shade >= 0.5 ? root.on-accent : root.text;
-                        overflow: elide;
-                    }
-                    if cell.w >= 64px && cell.h >= 44px: Text {
-                        text: cell.detail;
-                        x: 8px;
-                        y: 22px;
-                        width: parent.width - 16px;
-                        height: 14px;
-                        font-size: 11px;
-                        color: cell.shade >= 0.5 ? root.on-accent : root.muted;
-                        overflow: elide;
+                    property <bool> light: cell.shade >= 0.45;
+                    property <color> label-ink: light ? root.on-accent : root.text;
+                    property <color> detail-ink: light ? root.on-accent : root.muted;
+                    TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        property <bool> labeled: (cell.w >= 48px && cell.h >= 28px) || self.has-hover;
+                        if labeled: Text {
+                            text: cell.name;
+                            x: 8px;
+                            y: 6px;
+                            width: parent.width - 16px;
+                            height: 16px;
+                            font-size: 12px;
+                            color: label-ink;
+                            overflow: elide;
+                        }
+                        if labeled && cell.h >= 42px: Text {
+                            text: cell.detail;
+                            x: 8px;
+                            y: 22px;
+                            width: parent.width - 16px;
+                            height: 14px;
+                            font-size: 11px;
+                            color: detail-ink;
+                            overflow: elide;
+                        }
                     }
                 }
             }

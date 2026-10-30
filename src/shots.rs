@@ -270,7 +270,13 @@ fn stats_cells(drilled: bool) -> Vec<MapCell> {
     let shade: std::collections::HashMap<String, f32> = ranked
         .iter()
         .enumerate()
-        .map(|(index, (name, _))| (name.clone(), 0.70 - (index as f32 / steps) * 0.45))
+        .map(|(index, (name, _))| {
+            let t = index as f32 / steps;
+            // Bright on the large cells, then a tight band so the small
+            // tiles do not step through a long run of faint alphas.
+            let shade = 0.46 + 0.50 * (1.0 - t).powi(2);
+            (name.clone(), shade)
+        })
         .collect();
     let labels: std::collections::HashMap<_, _> = weights.iter().cloned().collect();
     crate::stats::squarify(&weights, 623.0, 300.0)
