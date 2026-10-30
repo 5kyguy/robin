@@ -302,8 +302,12 @@ pub fn copy_file(
     if is_dir(stat.st_mode) {
         return Err(Error::Message("refusing to copy a directory".into()));
     }
-    let dest_name = resolve_dest_name(dest_parent, to, &stat, opts)?;
-    let Some(dest_name) = dest_name else {
+    let dest = resolve_dest_name(dest_parent, to, &stat, opts)?;
+    let Some(DestName {
+        name: dest_name,
+        replace,
+    }) = dest
+    else {
         return Ok(CopyOutcome::Skipped);
     };
     let to_c = component(dest_name.as_os_str())?;
@@ -362,7 +366,6 @@ pub fn copy_file(
         copy_xattrs(&src, output.as_fd())?;
         drop(output);
     }
-    let replace = exists(dest_parent, dest_name.as_os_str())?;
     if replace {
         rustix::fs::renameat(
             dest_parent.as_fd(),
@@ -372,8 +375,9 @@ pub fn copy_file(
         )
         .map_err(|e| Error::from_errno(&dest_name, e))?;
     } else {
-        rename_noreplace(dest_parent.as_fd(), &guard.name, dest_parent.as_fd(), &to_c)
-            .map_err(|e| Error::from_errno(&dest_name, e))?;
+        land_keep_both(dest_parent, to, dest_name, |c| {
+            rename_noreplace(dest_parent.as_fd(), &guard.name, dest_parent.as_fd(), c)
+        })?;
     }
     guard.live = false;
     Ok(CopyOutcome::Copied)
@@ -958,10 +962,15 @@ fn move_symlink(
     let from_c = component(from)?;
     let target = rustix::fs::readlinkat(parent.as_fd(), from_c.as_c_str(), Vec::new())
         .map_err(|e| Error::from_errno(from, e))?;
-    let Some(dest_name) = resolve_dest_name(dest_parent, to, stat, &mut opts.copy)? else {
+    let Some(DestName {
+        name: dest_name,
+        replace,
+    }) = resolve_dest_name(dest_parent, to, stat, &mut opts.copy)?
+    else {
         return Ok(CopyOutcome::Skipped);
     };
-    if exists(dest_parent, dest_name.as_os_str())?
+    if replace
+        && exists(dest_parent, dest_name.as_os_str())?
         && is_directory(dest_parent, dest_name.as_os_str())?
     {
         return Err(Error::Message(format!(
@@ -979,13 +988,20 @@ fn move_symlink(
         name: tmp_c,
         live: true,
     };
-    rustix::fs::renameat(
-        dest_parent.as_fd(),
-        guard.name.as_c_str(),
-        dest_parent.as_fd(),
-        to_c.as_c_str(),
-    )
-    .map_err(|e| Error::from_errno(&dest_name, e))?;
+    let dest_name = if replace {
+        rustix::fs::renameat(
+            dest_parent.as_fd(),
+            guard.name.as_c_str(),
+            dest_parent.as_fd(),
+            to_c.as_c_str(),
+        )
+        .map_err(|e| Error::from_errno(&dest_name, e))?;
+        dest_name
+    } else {
+        land_keep_both(dest_parent, to, dest_name, |c| {
+            rename_noreplace(dest_parent.as_fd(), &guard.name, dest_parent.as_fd(), c)
+        })?
+    };
     guard.live = false;
     rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
     if opts.fail_before_unlink {
@@ -1029,27 +1045,33 @@ fn move_directory(
     let from_c = component(from)?;
     let stat = rustix::fs::statat(parent.as_fd(), from_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|e| Error::from_errno(from, e))?;
-    let dest_name = resolve_dest_name(dest_parent, to, &stat, &mut opts.copy)?;
-    let Some(dest_name) = dest_name else {
+    let dest = resolve_dest_name(dest_parent, to, &stat, &mut opts.copy)?;
+    let Some(DestName {
+        name: dest_name,
+        replace,
+    }) = dest
+    else {
         return Ok(CopyOutcome::Skipped);
     };
-    let created = if exists(dest_parent, dest_name.as_os_str())? {
+    // Replace merges into the existing folder; anything else makes a new
+    // one and never merges into a folder that appeared meanwhile.
+    let (dest_name, created) = if replace {
         if !is_directory(dest_parent, dest_name.as_os_str())? {
             return Err(Error::Message(format!(
                 "refusing to replace a file with directory {}",
                 dest_name.to_string_lossy()
             )));
         }
-        false
+        (dest_name, false)
     } else {
-        let c = component(dest_name.as_os_str())?;
-        rustix::fs::mkdirat(
-            dest_parent.as_fd(),
-            c.as_c_str(),
-            Mode::from_raw_mode(0o700),
-        )
-        .map_err(|e| Error::from_errno(&dest_name, e))?;
-        true
+        let name = land_keep_both(dest_parent, to, dest_name, |c| {
+            rustix::fs::mkdirat(
+                dest_parent.as_fd(),
+                c.as_c_str(),
+                Mode::from_raw_mode(0o700),
+            )
+        })?;
+        (name, true)
     };
     let src = parent.open_dir_nofollow(from)?;
     let dst = dest_parent.open_dir_nofollow(dest_name.as_os_str())?;
@@ -1362,21 +1384,82 @@ impl Drop for UnlinkOnDrop<'_> {
     }
 }
 
+/// Where an entry lands. Only an explicit Replace may overwrite; every
+/// other landing is no-replace and picks a new keep-both name if the slot
+/// was taken after we looked.
+struct DestName {
+    name: std::ffi::OsString,
+    replace: bool,
+}
+
 fn resolve_dest_name(
     dest_parent: &DirFd,
     to: &std::ffi::OsStr,
     incoming: &rustix::fs::Stat,
     opts: &mut CopyOpts<'_>,
-) -> Result<Option<std::ffi::OsString>> {
+) -> Result<Option<DestName>> {
     if !exists(dest_parent, to)? {
-        return Ok(Some(to.to_os_string()));
+        return Ok(Some(DestName {
+            name: to.to_os_string(),
+            replace: false,
+        }));
     }
     let action = settle_conflict_stat(dest_parent, to, incoming, opts)?;
     match action {
         Conflict::Skip => Ok(None),
-        Conflict::Replace => Ok(Some(to.to_os_string())),
-        Conflict::Rename => fresh_name(dest_parent, to).map(Some),
+        Conflict::Replace => Ok(Some(DestName {
+            name: to.to_os_string(),
+            replace: true,
+        })),
+        Conflict::Rename => Ok(Some(DestName {
+            name: fresh_name(dest_parent, to)?,
+            replace: false,
+        })),
     }
+}
+
+/// Retries when the chosen name appears between choosing it and landing.
+const KEEP_BOTH_TRIES: usize = 16;
+
+#[cfg(test)]
+type LandingHook = Box<dyn FnMut(&DirFd, &std::ffi::OsStr)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs right before each final no-replace landing, to simulate
+    /// another program creating the target in that window.
+    pub(crate) static BEFORE_LANDING: std::cell::RefCell<Option<LandingHook>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Land an entry under `first` in `dest_parent` with `op`, which must fail
+/// with EEXIST rather than replace. On EEXIST pick the next keep-both name
+/// for `base` and try again, a bounded number of times.
+fn land_keep_both(
+    dest_parent: &DirFd,
+    base: &std::ffi::OsStr,
+    first: std::ffi::OsString,
+    mut op: impl FnMut(&std::ffi::CString) -> std::result::Result<(), Errno>,
+) -> Result<std::ffi::OsString> {
+    let mut name = first;
+    for _ in 0..KEEP_BOTH_TRIES {
+        #[cfg(test)]
+        BEFORE_LANDING.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook(dest_parent, &name);
+            }
+        });
+        let c = component(name.as_os_str())?;
+        match op(&c) {
+            Ok(()) => return Ok(name),
+            Err(Errno::EXIST) => name = fresh_name(dest_parent, base)?,
+            Err(err) => return Err(Error::from_errno(&name, err)),
+        }
+    }
+    Err(Error::Message(format!(
+        "{} kept being taken; nothing was replaced",
+        base.to_string_lossy()
+    )))
 }
 
 fn settle_conflict(
@@ -1437,11 +1520,10 @@ fn replace_or_rename(
             Ok(CopyOutcome::Copied)
         }
         Conflict::Rename => {
-            let name = fresh_name(dest_parent, to)?;
             let from_c = component(from)?;
-            let to_c = component(name.as_os_str())?;
-            rename_noreplace(parent.as_fd(), &from_c, dest_parent.as_fd(), &to_c)
-                .map_err(|e| Error::from_errno(&name, e))?;
+            land_keep_both(dest_parent, to, fresh_name(dest_parent, to)?, |c| {
+                rename_noreplace(parent.as_fd(), &from_c, dest_parent.as_fd(), c)
+            })?;
             Ok(CopyOutcome::Copied)
         }
     }
@@ -1929,6 +2011,130 @@ mod tests {
         )
         .unwrap_err();
         assert!(blocked.to_string().contains("dest"), "{blocked}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn rename_ask(prompt: &ConflictPrompt) -> Result<ConflictChoice> {
+        let _ = prompt;
+        Ok(ConflictChoice {
+            action: Conflict::Rename,
+            apply_all: false,
+        })
+    }
+
+    /// Before each landing, plant `marker` under the chosen name the first
+    /// `times` times, like another program racing us.
+    fn race_landing(times: usize) {
+        let mut left = times;
+        BEFORE_LANDING.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |dir: &DirFd, name: &std::ffi::OsStr| {
+                if left > 0 {
+                    left -= 1;
+                    let path = dir_path(dir).join(name);
+                    std::fs::write(path, b"racer").unwrap();
+                }
+            }));
+        });
+    }
+
+    fn dir_path(dir: &DirFd) -> std::path::PathBuf {
+        std::fs::read_link(format!(
+            "/proc/self/fd/{}",
+            std::os::fd::AsRawFd::as_raw_fd(&dir.as_fd())
+        ))
+        .unwrap()
+    }
+
+    fn racy_move(
+        root: &Path,
+        from: &str,
+        ask: fn(&ConflictPrompt) -> Result<ConflictChoice>,
+    ) -> Result<CopyOutcome> {
+        let dir = DirFd::open(root).unwrap();
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = ask;
+        let out = move_child(
+            &dir,
+            std::ffi::OsStr::new(from),
+            &dir,
+            std::ffi::OsStr::new("dest"),
+            &mut MoveOpts {
+                force_copy: true,
+                fail_before_unlink: false,
+                copy: opts(&cancel, &mut policy, &mut ask),
+                report: TransferReport::default(),
+                check_removable: true,
+                keep_source: false,
+            },
+        );
+        BEFORE_LANDING.with(|h| *h.borrow_mut() = None);
+        out
+    }
+
+    fn racers(root: &Path) -> usize {
+        std::fs::read_dir(root)
+            .unwrap()
+            .filter(|e| std::fs::read(e.as_ref().unwrap().path()).ok().as_deref() == Some(b"racer"))
+            .count()
+    }
+
+    #[test]
+    fn keep_both_never_overwrites_a_name_taken_before_landing() {
+        // Plain file, fresh destination name.
+        let root = scratch("race-file");
+        std::fs::write(root.join("src"), b"mine").unwrap();
+        race_landing(1);
+        racy_move(&root, "src", rename_ask).unwrap();
+        assert_eq!(racers(&root), 1, "the racer's file survives");
+        assert_eq!(std::fs::read(root.join("dest (2)")).unwrap(), b"mine");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Keep-both chosen on a real conflict, and the new name is taken too.
+        let root = scratch("race-keep");
+        std::fs::write(root.join("src"), b"mine").unwrap();
+        std::fs::write(root.join("dest"), b"old").unwrap();
+        race_landing(2);
+        racy_move(&root, "src", rename_ask).unwrap();
+        assert_eq!(std::fs::read(root.join("dest")).unwrap(), b"old");
+        assert_eq!(racers(&root), 2);
+        assert!(std::fs::read_dir(&root)
+            .unwrap()
+            .any(|e| std::fs::read(e.unwrap().path()).unwrap() == b"mine"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Symlink move.
+        let root = scratch("race-link");
+        std::os::unix::fs::symlink("target", root.join("src")).unwrap();
+        race_landing(1);
+        racy_move(&root, "src", rename_ask).unwrap();
+        assert_eq!(std::fs::read(root.join("dest")).unwrap(), b"racer");
+        assert_eq!(
+            std::fs::read_link(root.join("dest (2)")).unwrap(),
+            Path::new("target")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Folder: never merges into one that appeared meanwhile.
+        let root = scratch("race-dir");
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/f"), b"mine").unwrap();
+        race_landing(1);
+        racy_move(&root, "src", rename_ask).unwrap();
+        assert_eq!(std::fs::read(root.join("dest")).unwrap(), b"racer");
+        assert_eq!(std::fs::read(root.join("dest (2)/f")).unwrap(), b"mine");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn keep_both_gives_up_without_overwriting() {
+        let root = scratch("race-giveup");
+        std::fs::write(root.join("src"), b"mine").unwrap();
+        race_landing(usize::MAX);
+        let err = racy_move(&root, "src", rename_ask).unwrap_err();
+        assert!(err.to_string().contains("nothing was replaced"), "{err}");
+        assert_eq!(std::fs::read(root.join("src")).unwrap(), b"mine");
+        assert_eq!(racers(&root), KEEP_BOTH_TRIES);
         let _ = std::fs::remove_dir_all(&root);
     }
 
