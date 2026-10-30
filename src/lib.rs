@@ -8,6 +8,7 @@ pub mod delegate;
 pub mod error;
 pub mod fixture;
 pub mod fsops;
+pub mod instance;
 pub mod model;
 pub mod mounts;
 pub mod safety;

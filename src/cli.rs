@@ -20,6 +20,7 @@ where
             Ok(0)
         }
         Some("--demo") => demo(iter),
+        Some("--select") => select_file(iter),
         Some("--render") => render(iter),
         Some(other) => Err(Error::Message(format!(
             "unknown argument {other}. Try `robin --help`."
@@ -59,6 +60,15 @@ fn demo<'a>(mut iter: impl Iterator<Item = &'a std::ffi::OsString>) -> Result<i3
     }
     fixture::materialize(&out)?;
     println!("{}", out.display());
+    Ok(0)
+}
+
+fn select_file<'a>(mut iter: impl Iterator<Item = &'a std::ffi::OsString>) -> Result<i32> {
+    let file = iter
+        .next()
+        .ok_or_else(|| Error::Message("--select needs a file".into()))?;
+    let sock = crate::instance::runtime_socket();
+    crate::instance::send_select(&sock, std::path::Path::new(file))?;
     Ok(0)
 }
 
