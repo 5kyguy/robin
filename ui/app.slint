@@ -16,7 +16,9 @@ export global Columns {
     out property <bool> narrow: row-w < 640px;
     out property <bool> tight: row-w < 480px;
     // Narrow lists drop the Type column before any name is cut.
-    out property <bool> no-type: row-w < 680px;
+    // Set from the window width: Type goes when the window is under
+    // 720px, the same cut that folds the sidebar to the rail.
+    in-out property <bool> no-type: false;
     out property <length> size-w: tight ? 64px : narrow ? 72px : 88px;
     out property <length> type-w: no-type ? 0px : 120px;
     // Never below what "MODIFIED" and its sort arrow need.

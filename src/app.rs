@@ -218,10 +218,19 @@ pub fn fit_columns(width: f32, tile: f32) -> usize {
     (n.max(1.0) as usize).min(MAX_COLUMNS)
 }
 
+/// Below this window width the sidebar folds to the rail and the list
+/// drops its Type column (`rail-on` and `Columns.no-type` in app.slint).
+pub const NARROW_WINDOW: f32 = 720.0;
+
+/// Whether a window `width` logical px wide hides the Type column.
+pub fn drops_type(width: f32) -> bool {
+    width > 0.0 && width < NARROW_WINDOW
+}
+
 /// How many characters the list's Name column holds at `width`,
 /// mirroring `Columns` in app.slint (monospace, ~7.3px a glyph at 12px).
-pub fn name_chars(width: f32) -> usize {
-    // Mirrors `Columns` in app.slint: Type goes below 680px.
+pub fn name_chars(width: f32, no_type: bool) -> usize {
+    // Mirrors `Columns` in app.slint.
     let (size, modified) = if width < 480.0 {
         (64.0, 92.0)
     } else if width < 640.0 {
@@ -229,7 +238,7 @@ pub fn name_chars(width: f32) -> usize {
     } else {
         (88.0, 140.0)
     };
-    let kind = if width < 680.0 { 0.0 } else { 120.0 + 16.0 };
+    let kind = if no_type { 0.0 } else { 120.0 + 16.0 };
     let name_w = width - 12.0 - modified - 2.0 * 16.0 - kind - size - 40.0;
     ((name_w / 7.3).floor().max(6.0)) as usize
 }
@@ -2053,9 +2062,12 @@ fn redraw(ui: &AppWindow, s: &State) {
     ctl.fit(content_w);
     ui.set_grid_columns(ctl.columns.get() as i32);
     ui.global::<Columns>().set_row_w(content_w);
+    let window = ui.window();
+    let no_type = drops_type(window.size().to_logical(window.scale_factor()).width);
+    ui.global::<Columns>().set_no_type(no_type);
     // Before the first layout the width is 0; show full names then.
     let budget = if content_w > 0.0 {
-        name_chars(content_w)
+        name_chars(content_w, no_type)
     } else {
         usize::MAX
     };
@@ -2853,9 +2865,15 @@ mod tests {
 
     #[test]
     fn narrow_lists_give_names_the_type_columns_width() {
-        // At 667px (a 720px window with the rail) Type is gone, so a
-        // name gets more room than it had with Type at 680px.
-        assert!(name_chars(667.0) > name_chars(680.0));
+        assert!(name_chars(667.0, true) > name_chars(667.0, false));
+    }
+
+    #[test]
+    fn type_shows_at_800px_and_goes_below_720px() {
+        assert!(!drops_type(800.0));
+        assert!(!drops_type(720.0));
+        assert!(drops_type(719.0));
+        assert!(drops_type(640.0));
     }
 
     #[test]
@@ -2901,7 +2919,7 @@ mod tests {
             "dune-sun…0412.jpg"
         );
         assert_eq!(elide_middle("short.jpg", 17), "short.jpg");
-        assert!(name_chars(567.0) > name_chars(500.0));
+        assert!(name_chars(567.0, false) > name_chars(500.0, false));
     }
 
     #[test]
