@@ -131,7 +131,10 @@ impl<F: FnOnce()> Drop for SideGuard<F> {
 /// A timed-out thread is left to finish on its own rather than pruned:
 /// a thread blocked in the kernel can't be cancelled, and the `busy`
 /// flag already caps it at one per path. When it does return, its answer
-/// becomes the cached `last`.
+/// becomes the cached `last`. Cache entries for paths that went away are
+/// kept too: there is one small entry per mount or pinned folder ever
+/// seen, and dropping one while its thread still runs would let the next
+/// job start a second thread on the same dead path.
 pub struct SpaceProbe {
     timeout: Duration,
     cache: Mutex<HashMap<(Kind, PathBuf), Probe>>,
@@ -226,6 +229,9 @@ impl SpaceProbe {
     /// with no `dev`). The outer `None` means the probe timed out with no
     /// earlier answer, so whether it is a folder is unknown.
     pub fn folder(self: &Arc<Self>, path: &Path, dev: Option<u64>) -> Option<Option<FolderInfo>> {
+        // With no known device there is nothing to check a pinned folder
+        // against, but the trash is always counted; callers that need the
+        // same-device rule compare `FolderInfo::dev` themselves.
         let p = path.to_path_buf();
         match self.timed((Kind::Folder, path.to_path_buf()), move || {
             Some(Answer::Folder(folder_info(&p, dev)))
@@ -233,6 +239,15 @@ impl SpaceProbe {
             Some(Answer::Folder(f)) => Some(f),
             _ => None,
         }
+    }
+}
+
+/// A pinned folder's count, only when it is on Home's known device.
+fn pinned_count(f: FolderInfo, home_dev: Option<u64>) -> String {
+    if home_dev == Some(f.dev) {
+        f.count
+    } else {
+        String::new()
     }
 }
 
@@ -295,9 +310,13 @@ impl SideJob {
                 continue;
             }
             // Only a real folder; a hung probe keeps the row, uncounted.
+            // The count is shown only when the folder is on Home's own
+            // device. If Home's probe timed out its device is unknown, so
+            // no pinned folder is counted rather than one being read on
+            // another drive.
             let count = match self.probe.folder(&path, dev) {
                 Some(None) => continue,
-                Some(Some(f)) => f.count,
+                Some(Some(f)) => pinned_count(f, dev),
                 None => String::new(),
             };
             let name = path
@@ -793,6 +812,17 @@ mod tests {
             "another drive"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pinned_counts_need_homes_device() {
+        let f = |dev| FolderInfo {
+            dev,
+            count: "4".into(),
+        };
+        assert_eq!(pinned_count(f(7), Some(7)), "4");
+        assert_eq!(pinned_count(f(8), Some(7)), "", "another drive");
+        assert_eq!(pinned_count(f(7), None), "", "home timed out: unknown");
     }
 
     #[test]
