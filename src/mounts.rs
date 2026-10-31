@@ -155,6 +155,23 @@ pub trait MountSource: Send + Sync {
     fn removable(&self, volume: &Volume) -> bool;
 }
 
+/// The desktop automount a path sits on, as (mount point, label), read
+/// from the path alone: `/media/$USER/X` or `/run/media/$USER/X`. Lets
+/// the breadcrumb start at the device before the mount table is read.
+pub fn automount_of(path: &Path, user: Option<&str>) -> Option<(PathBuf, String)> {
+    let user = user.filter(|u| !u.is_empty() && !u.contains('/'))?;
+    [
+        Path::new("/media").join(user),
+        Path::new("/run/media").join(user),
+    ]
+    .into_iter()
+    .find_map(|base| {
+        let name = path.strip_prefix(&base).ok()?.components().next()?;
+        let name = name.as_os_str();
+        Some((base.join(name), name.to_string_lossy().into_owned()))
+    })
+}
+
 /// True when the kernel marks the block device (or the disk a partition
 /// belongs to) removable, or the desktop automounted it under
 /// `/media/$USER` or `/run/media/$USER`.
@@ -339,6 +356,17 @@ mod tests {
             root: "/".into(),
         };
         assert!(system_removable(&v("/media/sky/STICK"), Some("sky")));
+        assert_eq!(
+            automount_of(Path::new("/run/media/sky/CARD/DCIM"), Some("sky")),
+            Some((PathBuf::from("/run/media/sky/CARD"), "CARD".into()))
+        );
+        assert_eq!(
+            automount_of(Path::new("/media/sky/STICK"), Some("sky")),
+            Some((PathBuf::from("/media/sky/STICK"), "STICK".into()))
+        );
+        assert_eq!(automount_of(Path::new("/run/media/sky"), Some("sky")), None);
+        assert_eq!(automount_of(Path::new("/media/ann/X"), Some("sky")), None);
+        assert_eq!(automount_of(Path::new("/media/sky/X"), None), None);
         assert!(system_removable(&v("/run/media/sky/CARD"), Some("sky")));
         assert!(!system_removable(&v("/srv/media/disk"), Some("sky")));
         assert!(!system_removable(&v("/media/other/STICK"), Some("sky")));

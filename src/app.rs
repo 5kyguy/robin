@@ -1092,20 +1092,49 @@ fn side_abandoned(_ui: &AppWindow, st: &Shared, gen: u64) {
 
 /// The breadcrumb, rooted at a device's label when the folder is on one.
 fn draw_crumbs(ui: &AppWindow, s: &State) -> Vec<String> {
+    let user = std::env::var("USER").ok();
     let home = s.ctl.env.home.as_deref();
-    let devices: Vec<(PathBuf, String)> = s
-        .side
-        .devices
-        .iter()
-        .filter(|d| d.removable && !home.is_some_and(|h| h.starts_with(&d.path)))
-        .map(|d| (d.path.clone(), d.name.clone()))
-        .collect();
-    let crumbs: Vec<String> = crate::model::breadcrumbs_on(s.ctl.crumb_dir(), home, &devices)
+    let crumbs: Vec<String> = crumbs_for(s.ctl.crumb_dir(), home, &s.side.devices, user.as_deref())
         .iter()
         .map(|c| c.label.clone())
         .collect();
     ui.set_crumbs(crumbs.join("  ›  ").into());
     crumbs
+}
+
+/// The breadcrumb parts. Removable devices come from the side job, but a
+/// desktop automount is known from its path alone, so its crumb starts at
+/// the device name from the first frame instead of `/ › run › media`.
+fn crumbs_for(
+    dir: &Path,
+    home: Option<&Path>,
+    side: &[crate::sidebar::SideEntry],
+    user: Option<&str>,
+) -> Vec<crate::model::Crumb> {
+    let mut devices: Vec<(PathBuf, String)> = side
+        .iter()
+        .filter(|d| d.removable && !home.is_some_and(|h| h.starts_with(&d.path)))
+        .map(|d| (d.path.clone(), d.name.clone()))
+        .collect();
+    if let Some(auto) = crate::mounts::automount_of(dir, user) {
+        if !devices.iter().any(|(p, _)| *p == auto.0) {
+            devices.push(auto);
+        }
+    }
+    crate::model::breadcrumbs_on(dir, home, &devices)
+}
+
+/// A folder's name for a message, rebuilt from its crumbs: the root as
+/// shown (`/`, `~`, a device), then the rest joined with `/`.
+fn crumb_name(crumbs: &[String]) -> String {
+    let Some((root, rest)) = crumbs.split_first() else {
+        return String::new();
+    };
+    if rest.is_empty() {
+        return root.clone();
+    }
+    let sep = if root.ends_with('/') { "" } else { "/" };
+    format!("{root}{sep}{}", rest.join("/"))
 }
 
 fn side_landed(ui: &AppWindow, st: &Shared, gen: u64, data: crate::sidebar::SideData) {
@@ -1636,7 +1665,7 @@ fn redraw(ui: &AppWindow, s: &State) {
     ui.set_nav_busy(ctl.nav_pending());
     draw_side(ui, s);
     if let Some(denied) = ctl.unreadable {
-        let name = crumbs.join("/").replacen("//", "/", 1);
+        let name = crumb_name(&crumbs);
         ui.set_state_title(
             if denied {
                 format!("No permission to open {name}")
@@ -2200,6 +2229,40 @@ pub fn start_dir(arg: Option<&Path>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_automount_crumb_starts_at_the_device_before_the_side_job() {
+        let dir = Path::new("/run/media/sky/CARD/DCIM");
+        let labels = |side: &[crate::sidebar::SideEntry]| -> Vec<String> {
+            super::crumbs_for(dir, Some(Path::new("/home/sky")), side, Some("sky"))
+                .into_iter()
+                .map(|c| c.label)
+                .collect()
+        };
+        assert_eq!(labels(&[]), ["CARD", "DCIM"], "first frame, no devices yet");
+        let named = crate::sidebar::SideEntry {
+            glyph: "",
+            name: "Camera card".into(),
+            path: "/run/media/sky/CARD".into(),
+            count: String::new(),
+            usage: None,
+            removable: true,
+        };
+        assert_eq!(
+            labels(&[named]),
+            ["Camera card", "DCIM"],
+            "the side job's label wins"
+        );
+    }
+
+    #[test]
+    fn a_crumb_name_is_built_from_its_parts() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(super::crumb_name(&v(&["/", "srv", "x"])), "/srv/x");
+        assert_eq!(super::crumb_name(&v(&["~", "Documents"])), "~/Documents");
+        assert_eq!(super::crumb_name(&v(&["CARD", "a//b"])), "CARD/a//b");
+        assert_eq!(super::crumb_name(&v(&["/"])), "/");
+    }
+
     use super::*;
     use std::fs;
 
