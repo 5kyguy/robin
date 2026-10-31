@@ -221,15 +221,22 @@ pub fn fit_columns(width: f32, tile: f32) -> usize {
 /// How many characters the list's Name column holds at `width`,
 /// mirroring `Columns` in app.slint (monospace, ~7.3px a glyph at 12px).
 pub fn name_chars(width: f32) -> usize {
-    let (size, kind, modified) = if width < 480.0 {
-        (64.0, 72.0, 56.0)
+    // Mirrors `Columns` in app.slint: Type goes below 680px.
+    let (size, modified) = if width < 480.0 {
+        (64.0, 92.0)
     } else if width < 640.0 {
-        (72.0, 96.0, 104.0)
+        (72.0, 104.0)
     } else {
-        (88.0, 120.0, 140.0)
+        (88.0, 140.0)
     };
-    let name_w = width - 12.0 - modified - 3.0 * 16.0 - kind - size - 40.0;
+    let kind = if width < 680.0 { 0.0 } else { 120.0 + 16.0 };
+    let name_w = width - 12.0 - modified - 2.0 * 16.0 - kind - size - 40.0;
     ((name_w / 7.3).floor().max(6.0)) as usize
+}
+
+/// "812 GB free of 1.8 TB" as "812 GB free", for narrow windows.
+pub fn short_free(space: &str) -> String {
+    space.split(" of ").next().unwrap_or_default().to_string()
 }
 
 /// Cut `name` in the middle so its ending stays visible:
@@ -1478,6 +1485,7 @@ fn draw_side(ui: &AppWindow, s: &State) {
     ui.set_device_places(rows(1, &side.devices));
     ui.set_trash_places(rows(2, &side.trash));
     ui.set_status_right(side.space.clone().into());
+    ui.set_status_free_short(short_free(&side.space).into());
 }
 
 /// Start a navigation to `target` at `t0` and hold its read, then move the
@@ -2835,6 +2843,19 @@ mod tests {
         assert!(c.columns.get() > wide);
         assert!(c.fit(tile + 40.0));
         assert_eq!(c.columns.get(), 1);
+    }
+
+    #[test]
+    fn narrow_free_space_drops_the_drive_size() {
+        assert_eq!(short_free("812 GB free of 1.8 TB"), "812 GB free");
+        assert_eq!(short_free(""), "");
+    }
+
+    #[test]
+    fn narrow_lists_give_names_the_type_columns_width() {
+        // At 667px (a 720px window with the rail) Type is gone, so a
+        // name gets more room than it had with Type at 680px.
+        assert!(name_chars(667.0) > name_chars(680.0));
     }
 
     #[test]
