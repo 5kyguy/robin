@@ -298,6 +298,29 @@ fn ctrl_letter(text: &str, letter: char) -> bool {
 }
 
 impl Controller {
+    /// The item, selection and clipboard summary. Blank when the folder
+    /// can't be read: "0 items" would claim it is empty.
+    pub fn status_left(&self) -> String {
+        if self.unreadable.is_some() {
+            return String::new();
+        }
+        let n = self.listing.view().len();
+        let sel = self.listing.selection().len();
+        let mut left = ops::count(n);
+        if sel > 0 {
+            left = format!("{left} · {sel} selected");
+        }
+        if let Some(clip) = self.clip.clip() {
+            let verb = if clip.mode == ops::ClipMode::Cut {
+                "cut"
+            } else {
+                "copied"
+            };
+            left = format!("{left} · {} {verb}", ops::count(clip.names.len()));
+        }
+        left
+    }
+
     pub fn new(dir: PathBuf, env: Env) -> Self {
         Self {
             dir,
@@ -1485,21 +1508,8 @@ fn redraw(ui: &AppWindow, s: &State) {
         );
         ui.set_state_note("".into());
     }
+    ui.set_status_left(ctl.status_left().into());
     let n = ctl.listing.view().len();
-    let sel = ctl.listing.selection().len();
-    let mut left = ops::count(n);
-    if sel > 0 {
-        left = format!("{left} · {sel} selected");
-    }
-    if let Some(clip) = ctl.clip.clip() {
-        let verb = if clip.mode == ops::ClipMode::Cut {
-            "cut"
-        } else {
-            "copied"
-        };
-        left = format!("{left} · {} {verb}", ops::count(clip.names.len()));
-    }
-    ui.set_status_left(left.into());
     ui.set_state(
         if !ctl.loaded {
             "loading"
@@ -2942,6 +2952,11 @@ mod tests {
         assert!(c.toasts_failure(ReadKind::Refresh));
         c.unreadable = Some(true);
         assert!(!c.toasts_failure(ReadKind::Refresh), "the state says it");
+        assert_eq!(
+            c.status_left(),
+            "",
+            "no item count for a folder it can't read"
+        );
         assert!(
             c.toasts_failure(ReadKind::Navigate),
             "a failed navigation still toasts"
