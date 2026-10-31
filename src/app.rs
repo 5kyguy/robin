@@ -1001,6 +1001,8 @@ struct State {
     /// The open folder as the drop handler sees it; `None` while a
     /// navigation is in flight.
     drop_dest: Rc<RefCell<Option<PathBuf>>>,
+    /// The sidebar rows and status-right, as the last side job read them.
+    side: crate::sidebar::SideData,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -1011,6 +1013,7 @@ thread_local! {
     /// script lands them, instead of running on a worker thread.
     static SCRIPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PENDING_READS: RefCell<VecDeque<ReadTicket>> = const { RefCell::new(VecDeque::new()) };
+    static PENDING_SIDE: RefCell<VecDeque<crate::sidebar::SideJob>> = const { RefCell::new(VecDeque::new()) };
 }
 
 /// `build` for the render harness: the same window and callbacks, with
@@ -1024,10 +1027,70 @@ pub fn build_scripted(launch: Launch) -> Result<AppWindow> {
 /// Perform and land every held read in the order it was started,
 /// including rereads they queue.
 pub fn land_reads() {
-    while let Some(ticket) = PENDING_READS.with(|p| p.borrow_mut().pop_front()) {
-        let read = ticket.perform();
-        with_state(|ui, st| landed(&ui, st, read));
+    loop {
+        if let Some(ticket) = PENDING_READS.with(|p| p.borrow_mut().pop_front()) {
+            let read = ticket.perform();
+            with_state(|ui, st| landed(&ui, st, read));
+        } else if let Some(job) = PENDING_SIDE.with(|p| p.borrow_mut().pop_front()) {
+            let data = job.perform();
+            with_state(|ui, st| side_landed(&ui, st, data));
+        } else {
+            break;
+        }
     }
+}
+
+/// Reread the sidebar and the open folder's free space on a worker:
+/// item counts and statvfs can block on a slow or dead mount.
+fn start_side(s: &State) {
+    let job = crate::sidebar::SideJob {
+        env: s.ctl.env.clone(),
+        mounts: s.ctl.mounts.clone(),
+        dir: s.ctl.dir.clone(),
+    };
+    if SCRIPTED.with(|s| s.get()) {
+        PENDING_SIDE.with(|p| p.borrow_mut().push_back(job));
+        return;
+    }
+    std::thread::spawn(move || {
+        let data = job.perform();
+        let _ = slint::invoke_from_event_loop(move || {
+            with_state(|ui, st| side_landed(&ui, st, data));
+        });
+    });
+}
+
+fn side_landed(ui: &AppWindow, st: &Shared, data: crate::sidebar::SideData) {
+    let mut s = st.borrow_mut();
+    s.side = data;
+    draw_side(ui, &s);
+}
+
+/// The sidebar sections and status-right from the last side job, with
+/// the open folder's row lit.
+fn draw_side(ui: &AppWindow, s: &State) {
+    let side = &s.side;
+    let lit = crate::sidebar::picked(side, &s.ctl.dir);
+    let rows = |section: usize, entries: &[crate::sidebar::SideEntry]| {
+        let places: Vec<crate::Place> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| crate::Place {
+                glyph: e.glyph.into(),
+                name: e.name.clone().into(),
+                count: e.count.clone().into(),
+                selected: lit == Some((section, i)),
+                usage: e.usage.unwrap_or(-1.0),
+                level: e.usage.map(crate::sidebar::level).unwrap_or(0),
+                section: section as i32,
+            })
+            .collect();
+        ModelRc::new(Rc::new(VecModel::from(places)))
+    };
+    ui.set_pinned_places(rows(0, &side.pinned));
+    ui.set_device_places(rows(1, &side.devices));
+    ui.set_trash_places(rows(2, &side.trash));
+    ui.set_status_right(side.space.clone().into());
 }
 
 /// Start a navigation to `target` at `t0` and hold its read, then move the
@@ -1122,10 +1185,12 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         read_error: None,
         dropped: Rc::default(),
         drop_dest: Rc::default(),
+        side: Default::default(),
     }));
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
     redraw(&ui, &state.borrow());
     start_read(startup);
+    start_side(&state.borrow());
     {
         // Inbound drops from other apps. winit reports one DroppedFile per
         // path (X11 only in winit 0.30) and no pointer position, so they
@@ -1178,6 +1243,22 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
                 .pointer(index.max(0) as usize, kind, dy, far, Mods { ctrl, shift });
         if let Some(ui) = w.upgrade() {
             apply(&ui, &st, action);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_place_open(move |section, index| {
+        let target = {
+            let s = st.borrow();
+            let rows = match section {
+                0 => &s.side.pinned,
+                1 => &s.side.devices,
+                _ => &s.side.trash,
+            };
+            rows.get(index.max(0) as usize).map(|e| e.path.clone())
+        };
+        if let (Some(ui), Some(t)) = (w.upgrade(), target) {
+            apply(&ui, &st, Action::Navigate(t));
         }
     });
     let w = ui.as_weak();
@@ -1395,6 +1476,7 @@ fn landed(ui: &AppWindow, st: &Shared, read: ReadResult) {
         Landed::Stale | Landed::Unchanged => {}
         Landed::Shown { moved } => {
             s.read_error = None;
+            start_side(&s);
             let (list_y, grid_y) = (ui.get_list_scroll(), ui.get_grid_scroll());
             redraw(ui, &s);
             if moved {
@@ -1497,6 +1579,7 @@ fn redraw(ui: &AppWindow, s: &State) {
     ui.set_crumbs(crumbs.join("  ›  ").into());
     ui.set_path_text(ctl.crumb_dir().display().to_string().into());
     ui.set_nav_busy(ctl.nav_pending());
+    draw_side(ui, s);
     if let Some(denied) = ctl.unreadable {
         let name = crumbs.join("/");
         ui.set_state_title(
