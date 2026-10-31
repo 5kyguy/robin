@@ -986,9 +986,13 @@ export component AppWindow inherits Window {
                                 width: empty-label.preferred-width + 32px;
                                 height: 32px;
                                 border-radius: 6px;
-                                background: danger;
-                                empty-label := Text { text: "Empty Trash"; font-size: 12px; color: on-danger; horizontal-alignment: center; vertical-alignment: center; }
-                                TouchArea { clicked => { root.trash-empty(); } }
+                                // Outline only: solid danger is kept for the
+                                // confirm dialog's "Delete permanently".
+                                border-width: 1px;
+                                border-color: danger;
+                                background: empty-touch.has-hover ? danger.with-alpha(0.12) : transparent;
+                                empty-label := Text { text: "Empty Trash"; font-size: 12px; color: danger; horizontal-alignment: center; vertical-alignment: center; }
+                                empty-touch := TouchArea { clicked => { root.trash-empty(); } }
                             }
                         }
                     }
