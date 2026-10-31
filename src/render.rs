@@ -154,7 +154,7 @@ fn paint_in(
     let mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(root))?;
     let mut env = crate::ops::Env::for_home(home);
     if view == "trash-empty" {
-        env.home_trash = root.join("empty-trash");
+        env.home_trash = crate::fixture::empty_trash(root);
     }
     let ui = app::build_scripted(Launch {
         dir: start,

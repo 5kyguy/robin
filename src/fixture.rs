@@ -93,6 +93,11 @@ pub fn materialize(root: &Path) -> Result<()> {
 pub const MARKER: &str = ".robin-fixture";
 pub const MARKER_TEXT: &[u8] = b"robin render fixture v1\n";
 
+/// A second, empty home trash on the same mount as the real one.
+pub fn empty_trash(root: &Path) -> std::path::PathBuf {
+    root.join("home/.empty-trash")
+}
+
 /// The fixture user's home: `{root}/home/sky`.
 pub fn home(root: &Path) -> std::path::PathBuf {
     root.join("home/sky")
@@ -165,8 +170,9 @@ fn seed_home(top: &Path, root: &Path) -> Result<()> {
             info.as_bytes(),
         )?;
     }
-    // An empty trash for the Trash view's empty state.
-    let empty = top.join("empty-trash/files");
+    // An empty trash for the Trash view's empty state. It sits on the
+    // home mount like the real trash, so status-right reads the same disk.
+    let empty = empty_trash(top).join("files");
     fs::create_dir_all(&empty).map_err(|e| Error::io(&empty, e))?;
     let t = top.display();
     let mountinfo = format!(

@@ -662,6 +662,22 @@ mod tests {
     }
 
     #[test]
+    fn every_fixture_trash_is_on_the_home_mount() {
+        let top = std::env::temp_dir().join(format!("robin-trashmount-{}", std::process::id()));
+        let _ = crate::fixture::remove(&top);
+        crate::fixture::materialize(&top).unwrap();
+        let mounts = FixtureMounts::load(&crate::fixture::mounts_dir(&top)).unwrap();
+        let volumes = mounts.volumes().unwrap();
+        let home = crate::fixture::home(&top);
+        let on = |p: &Path| mount_of(p, &volumes).map(str::to_string);
+        let want = on(&home);
+        assert!(want.is_some());
+        assert_eq!(on(&Env::for_home(&home).home_trash.join("files")), want);
+        assert_eq!(on(&crate::fixture::empty_trash(&top).join("files")), want);
+        crate::fixture::remove(&top).unwrap();
+    }
+
+    #[test]
     fn the_fixture_sidebar_is_read_from_disk() {
         let root = std::env::temp_dir().join(format!("robin-side-{}", std::process::id()));
         let _ = crate::fixture::remove(&root);
