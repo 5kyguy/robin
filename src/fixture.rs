@@ -104,6 +104,11 @@ fn seed_home(root: &Path) -> Result<()> {
     write(root, ".local/share/Trash/files/old-draft.txt", b"draft\n")?;
     write(
         root,
+        ".config/user-dirs.dirs",
+        b"XDG_DESKTOP_DIR=\"$HOME/Desktop\"\nXDG_DOCUMENTS_DIR=\"$HOME/Documents\"\nXDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\nXDG_MUSIC_DIR=\"$HOME/Music\"\nXDG_PICTURES_DIR=\"$HOME/Pictures\"\nXDG_VIDEOS_DIR=\"$HOME/Videos\"\nXDG_TEMPLATES_DIR=\"$HOME/Templates\"\n",
+    )?;
+    write(
+        root,
         ".local/share/Trash/info/old-draft.txt.trashinfo",
         b"[Trash Info]\nPath=/demo/Documents/old-draft.txt\nDeletionDate=2026-10-29T10:00:00\n",
     )?;
