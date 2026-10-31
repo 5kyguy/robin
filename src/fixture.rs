@@ -31,6 +31,12 @@ pub fn materialize(root: &Path) -> Result<()> {
         }
         write(root, MARKER, MARKER_TEXT)?;
     }
+    // The user's home sits below the fixture root, so mounts and the
+    // marker live outside HOME the way they do on a real system.
+    let top = root;
+    let home = home(top);
+    let root = home.as_path();
+    fs::create_dir_all(root).map_err(|e| Error::io(root, e))?;
     let dirs = [
         "Desktop",
         "Documents/empty",
@@ -63,7 +69,7 @@ pub fn materialize(root: &Path) -> Result<()> {
     write(root, "Pictures/tatooine-trip/mos-espa-01.jpg", PIXEL_PNG)?;
     write(root, "Pictures/tatooine-trip/mos-espa-02.jpg", PIXEL_PNG)?;
     write(root, "Videos/speeder-run.mp4", b"not a real video\n")?;
-    seed_home(root)?;
+    seed_home(top, root)?;
     let link = root.join("Pictures/latest");
     if link.symlink_metadata().is_err() {
         symlink("dune-sunset-0412.jpg", &link).map_err(|e| Error::io(&link, e))?;
@@ -74,6 +80,11 @@ pub fn materialize(root: &Path) -> Result<()> {
 /// The marker file every fixture carries, and its exact contents.
 pub const MARKER: &str = ".robin-fixture";
 pub const MARKER_TEXT: &[u8] = b"robin render fixture v1\n";
+
+/// The fixture user's home: `{root}/home/sky`.
+pub fn home(root: &Path) -> std::path::PathBuf {
+    root.join("home/sky")
+}
 
 /// Where the fake mount table lives inside a fixture.
 pub fn mounts_dir(root: &Path) -> std::path::PathBuf {
@@ -91,42 +102,44 @@ pub fn is_marked(root: &Path) -> bool {
 
 /// The XDG dirs, one trashed file, a folder nobody may read, and a mount
 /// table that puts the fixture on a home disk and a fake SANDISK stick.
-fn seed_home(root: &Path) -> Result<()> {
-    for dir in [
-        ".config",
-        ".cache",
-        ".local/share/Trash/files",
-        "media/SANDISK",
-    ] {
+fn seed_home(top: &Path, root: &Path) -> Result<()> {
+    for dir in [".config", ".cache", ".local/share/Trash/files"] {
         let path = root.join(dir);
         fs::create_dir_all(&path).map_err(|e| Error::io(&path, e))?;
     }
+    let stick = top.join("media/sky/SANDISK");
+    fs::create_dir_all(&stick).map_err(|e| Error::io(&stick, e))?;
     write(root, ".local/share/Trash/files/old-draft.txt", b"draft\n")?;
     write(
         root,
         ".config/user-dirs.dirs",
         b"XDG_DESKTOP_DIR=\"$HOME/Desktop\"\nXDG_DOCUMENTS_DIR=\"$HOME/Documents\"\nXDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\nXDG_MUSIC_DIR=\"$HOME/Music\"\nXDG_PICTURES_DIR=\"$HOME/Pictures\"\nXDG_VIDEOS_DIR=\"$HOME/Videos\"\nXDG_TEMPLATES_DIR=\"$HOME/Templates\"\n",
     )?;
+    let info = format!(
+        "[Trash Info]\nPath={}/Documents/old-draft.txt\nDeletionDate=2026-10-29T10:00:00\n",
+        root.display()
+    );
     write(
         root,
         ".local/share/Trash/info/old-draft.txt.trashinfo",
-        b"[Trash Info]\nPath=/demo/Documents/old-draft.txt\nDeletionDate=2026-10-29T10:00:00\n",
+        info.as_bytes(),
     )?;
-    let r = root.display();
+    let t = top.display();
     let mountinfo = format!(
         "22 1 259:2 / / rw - ext4 /dev/nvme0n1p2 rw\n\
-         40 22 259:3 / {r} rw - ext4 /dev/nvme0n1p3 rw\n\
-         41 40 8:1 / {r}/media/SANDISK rw - exfat /dev/sda1 rw\n"
+         40 22 259:3 / {t}/home rw - ext4 /dev/nvme0n1p3 rw\n\
+         41 22 8:1 / {t}/media/sky/SANDISK rw - exfat /dev/sda1 rw\n"
     );
     let space = format!(
         "/ 512000000000 128000000000\n\
-         {r} 1800000000000 812000000000\n\
-         {r}/media/SANDISK 64000000000 6000000000\n"
+         {t}/home 1800000000000 812000000000\n\
+         {t}/media/sky/SANDISK 64000000000 6000000000\n"
     );
-    let m = mounts_dir(root);
+    let m = mounts_dir(top);
     fs::create_dir_all(&m).map_err(|e| Error::io(&m, e))?;
     write(&m, "mountinfo", mountinfo.as_bytes())?;
     write(&m, "space", space.as_bytes())?;
+    write(&m, "removable", b"/dev/sda1\n")?;
     let secret = root.join("secret");
     fs::create_dir_all(&secret).map_err(|e| Error::io(&secret, e))?;
     // chmod follows links: lock only a real folder, never a link's target.
@@ -186,7 +199,7 @@ pub fn freeze_times(root: &Path, secs: i64) -> Result<()> {
 
 /// Delete a fixture, reopening its unreadable folder first.
 pub fn remove(root: &Path) -> Result<()> {
-    let secret = root.join("secret");
+    let secret = home(root).join("secret");
     // Only a real folder: chmod follows links, and a link could point out.
     if secret.symlink_metadata().is_ok_and(|m| m.is_dir()) {
         set_mode(&secret, 0o755)?;
@@ -216,6 +229,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("robin-fixture-{}", std::process::id()));
         let _ = remove(&root);
         materialize(&root).unwrap();
+        let top = root.clone();
+        let root = home(&top);
         assert!(root
             .join(".local/share/Trash/info/old-draft.txt.trashinfo")
             .is_file());
@@ -237,7 +252,7 @@ mod tests {
             (n("Pictures/raw-exports"), n("Pictures/tatooine-trip")),
             (3, 2)
         );
-        freeze_times(&root, 1_000_000).unwrap();
+        freeze_times(&top, 1_000_000).unwrap();
         let m = std::fs::metadata(root.join("Pictures/palette.toml")).unwrap();
         let secs = m
             .modified()
@@ -245,8 +260,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap();
         assert_eq!(secs.as_secs(), 1_000_000);
-        remove(&root).unwrap();
-        assert!(!root.exists());
+        remove(&top).unwrap();
+        assert!(!top.exists());
     }
 
     #[test]
@@ -273,11 +288,11 @@ mod tests {
         let outside = std::env::temp_dir().join(format!("robin-outside-{}", std::process::id()));
         let _ = remove(&root);
         fs::create_dir_all(&outside).unwrap();
-        fs::create_dir_all(&root).unwrap();
-        symlink(&outside, root.join("secret")).unwrap();
+        fs::create_dir_all(home(&root)).unwrap();
+        symlink(&outside, home(&root).join("secret")).unwrap();
         assert!(materialize(&root).is_err());
         assert!(fs::read_dir(&outside).is_ok(), "target untouched");
-        fs::remove_file(root.join("secret")).unwrap();
+        fs::remove_file(home(&root).join("secret")).unwrap();
         remove(&root).unwrap();
         fs::remove_dir_all(&outside).unwrap();
     }

@@ -138,11 +138,13 @@ fn paint_in(
     home: &Path,
     out: &Path,
 ) -> Result<()> {
+    let root = home;
+    let home = &crate::fixture::home(root);
     let start = match view {
         "start-denied" => home.join("secret"),
         _ => home.join("Pictures"),
     };
-    let mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(home))?;
+    let mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(root))?;
     let ui = app::build_scripted(Launch {
         dir: start,
         env: crate::ops::Env::for_home(home),
