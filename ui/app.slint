@@ -176,7 +176,9 @@ component Tile inherits Rectangle {
     in property <color> selected-bg;
     in property <color> hover-bg;
     in property <bool> faded;
-    callback pointer(int, bool, bool);
+    // kind (0 down, 1 move, 2 up), tiles across and lines down from the
+    // pressed tile, past the drag threshold, ctrl, shift.
+    callback pointer(int, int, int, bool, bool, bool);
     callback open();
     property <bool> still: name == "dune-sunset-0412.jpg" || name == "dune-sunset-0413.jpg" || name == "speeder-run.mp4" || name == "cantina-band.heic" || name == "droid-manual.pdf" || name == "lars homestead family portrait final.jpg";
     property <string> label: name == "dune-sunset-0412.jpg" ? "dune-sunset-\n0412.jpg" : name == "dune-sunset-0413.jpg" ? "dune-sunset-\n0413.jpg" : name == "speeder-run.mp4" ? "speeder-\nrun.mp4" : name == "cantina-band.heic" ? "cantina-\nband.heic" : name == "droid-manual.pdf" ? "droid-\nmanual.pdf" : name == "holo-backup.tar.zst" ? "holo-backup.\ntar.zst" : name == "binary-sunset.flac" ? "binary-\nsunset.flac" : name == "lars homestead family portrait final.jpg" ? "lars homestead\nfamily portrait final.jpg" : name;
@@ -187,8 +189,14 @@ component Tile inherits Rectangle {
     background: picked ? selected-bg : hot || tile-touch.has-hover ? hover-bg : transparent;
     tile-touch := TouchArea {
         pointer-event(e) => {
-            if e.button == PointerEventButton.left && e.kind != PointerEventKind.move {
-                root.pointer(e.kind == PointerEventKind.down ? 0 : 2, e.modifiers.control, e.modifiers.shift);
+            if e.button == PointerEventButton.left || e.kind == PointerEventKind.move {
+                root.pointer(
+                    e.kind == PointerEventKind.down ? 0 : e.kind == PointerEventKind.up ? 2 : 1,
+                    floor(self.mouse-x / (tile + 8px)),
+                    floor(self.mouse-y / (tile + 60px)),
+                    self.pressed && (abs(self.mouse-x - self.pressed-x) > 6px || abs(self.mouse-y - self.pressed-y) > 6px),
+                    e.modifiers.control,
+                    e.modifiers.shift);
             }
         }
         double-clicked => { root.open(); }
@@ -1228,37 +1236,37 @@ export component AppWindow inherits Window {
                         height: tile + 60px;
                         if line.n > 0: Tile {
                             glyph: line.g0; name: line.n0; role: line.r0; badge: line.b0; picked: line.s0; hot: line.h0; faded: line.f0;
-                            pointer(kind, ctrl, shift) => { root.row-pointer(line.first + 0, kind, 0, false, ctrl, shift); }
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 0, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
                             open => { root.row-open(line.first + 0); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 1: Tile {
                             glyph: line.g1; name: line.n1; role: line.r1; badge: line.b1; picked: line.s1; hot: line.h1; faded: line.f1;
-                            pointer(kind, ctrl, shift) => { root.row-pointer(line.first + 1, kind, 0, false, ctrl, shift); }
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 1, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
                             open => { root.row-open(line.first + 1); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 2: Tile {
                             glyph: line.g2; name: line.n2; role: line.r2; badge: line.b2; picked: line.s2; hot: line.h2; faded: line.f2;
-                            pointer(kind, ctrl, shift) => { root.row-pointer(line.first + 2, kind, 0, false, ctrl, shift); }
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 2, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
                             open => { root.row-open(line.first + 2); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 3: Tile {
                             glyph: line.g3; name: line.n3; role: line.r3; badge: line.b3; picked: line.s3; hot: line.h3; faded: line.f3;
-                            pointer(kind, ctrl, shift) => { root.row-pointer(line.first + 3, kind, 0, false, ctrl, shift); }
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 3, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
                             open => { root.row-open(line.first + 3); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 4: Tile {
                             glyph: line.g4; name: line.n4; role: line.r4; badge: line.b4; picked: line.s4; hot: line.h4; faded: line.f4;
-                            pointer(kind, ctrl, shift) => { root.row-pointer(line.first + 4, kind, 0, false, ctrl, shift); }
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 4, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
                             open => { root.row-open(line.first + 4); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 5: Tile {
                             glyph: line.g5; name: line.n5; role: line.r5; badge: line.b5; picked: line.s5; hot: line.h5; faded: line.f5;
-                            pointer(kind, ctrl, shift) => { root.row-pointer(line.first + 5, kind, 0, false, ctrl, shift); }
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 5, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
                             open => { root.row-open(line.first + 5); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }

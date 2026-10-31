@@ -929,7 +929,8 @@ impl Controller {
     }
 
     /// Pointer on row `index`: `kind` 0 down, 1 move, 2 up. `dy` is how many
-    /// rows the pointer is from the pressed row.
+    /// items the pointer is from the pressed one (rows in the list, row
+    /// offset times columns plus tiles across in the grid).
     pub fn pointer(&mut self, index: usize, kind: i32, dy: i32, far: bool, mods: Mods) -> Action {
         match kind {
             0 => {
@@ -2764,6 +2765,21 @@ mod tests {
         );
         c.key(keys::UP, false, true);
         assert_eq!(c.names(), vec![OsString::from("a.jpg")]);
+    }
+
+    #[test]
+    fn dragging_a_tile_onto_a_folder_targets_it() {
+        let mut c = setup("tile-drag");
+        c.set_grid(true);
+        c.columns.set(3);
+        let none = Mods {
+            ctrl: false,
+            shift: false,
+        };
+        c.pointer(1, 0, 0, false, none);
+        // One tile to the left of a.jpg is raw-exports.
+        assert_eq!(c.pointer(1, 1, -1, true, none), Action::Redraw);
+        assert_eq!(c.drag.as_ref().and_then(|d| d.target), Some(0));
     }
 
     #[test]
