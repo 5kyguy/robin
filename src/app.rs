@@ -2787,6 +2787,57 @@ mod tests {
     }
 
     #[test]
+    fn grid_arrows_move_by_the_column_count() {
+        let mut c = setup("grid-arrows");
+        for n in ["c.jpg", "d.jpg", "e.jpg"] {
+            fs::write(c.dir.join(n), b"x").unwrap();
+        }
+        c.reload().unwrap();
+        c.set_grid(true);
+        c.columns.set(3);
+        c.key(keys::HOME, false, false);
+        c.key(keys::DOWN, false, false);
+        assert_eq!(c.listing.cursor(), Some(&OsString::from("c.jpg")));
+        c.key(keys::RIGHT, false, false);
+        assert_eq!(c.listing.cursor(), Some(&OsString::from("d.jpg")));
+        c.key(keys::UP, false, false);
+        assert_eq!(c.listing.cursor(), Some(&OsString::from("a.jpg")));
+        // The list moves one row at a time and ignores left/right.
+        c.set_grid(false);
+        c.key(keys::DOWN, false, false);
+        assert_eq!(c.listing.cursor(), Some(&OsString::from("b.jpg")));
+        assert_eq!(c.key(keys::RIGHT, false, false), Action::None);
+    }
+
+    #[test]
+    fn ctrl_1_ctrl_2_and_ctrl_plus_minus_drive_the_view() {
+        let mut c = setup("ctrl-keys");
+        c.key("2", true, false);
+        assert!(c.grid);
+        let start = c.tile_step;
+        assert_eq!(c.key("=", true, false), Action::Redraw);
+        assert_eq!(c.tile_step, (start + 1).min(2));
+        c.key("-", true, false);
+        c.key("-", true, false);
+        assert_eq!(c.tile_step, start.saturating_sub(1));
+        c.key("1", true, false);
+        assert!(!c.grid);
+    }
+
+    #[test]
+    fn a_resize_refits_the_columns() {
+        let c = setup("refit");
+        let tile = c.tile();
+        assert!(c.fit(tile * 3.0 + 60.0));
+        let wide = c.columns.get();
+        assert!(!c.fit(tile * 3.0 + 60.0), "same width keeps the lines");
+        assert!(c.fit(tile * 6.0 + 120.0));
+        assert!(c.columns.get() > wide);
+        assert!(c.fit(tile + 40.0));
+        assert_eq!(c.columns.get(), 1);
+    }
+
+    #[test]
     fn a_search_narrows_what_operations_act_on() {
         let mut c = setup("search-ops");
         c.listing.move_cursor(Nav::Home, false, 1);
