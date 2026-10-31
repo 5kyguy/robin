@@ -194,6 +194,15 @@ impl Listing {
         }
     }
 
+    /// How many entries a search looks through: hidden ones only when
+    /// they are shown.
+    pub fn searchable_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| self.show_hidden || !entry.is_hidden())
+            .count()
+    }
+
     pub fn hidden_count(&self) -> usize {
         self.entries
             .iter()
@@ -431,6 +440,32 @@ pub fn fuzzy_match(name: &str, query: &str) -> bool {
     true
 }
 
+/// The part of `name` a search for `query` matched, as char indices
+/// `start..end`: the first contiguous case-insensitive hit, else the
+/// span from the first to the last char of the subsequence match.
+pub fn match_span(name: &str, query: &str) -> Option<(usize, usize)> {
+    let low = |c: char| c.to_lowercase().next().unwrap_or(c);
+    let name: Vec<char> = name.chars().map(low).collect();
+    let query: Vec<char> = query.chars().map(low).collect();
+    if query.is_empty() || query.len() > name.len() {
+        return None;
+    }
+    if let Some(i) = name
+        .windows(query.len())
+        .position(|w| w == query.as_slice())
+    {
+        return Some((i, i + query.len()));
+    }
+    let mut at = 0;
+    let mut first = None;
+    for q in &query {
+        let i = at + name[at..].iter().position(|c| c == q)?;
+        first.get_or_insert(i);
+        at = i + 1;
+    }
+    Some((first?, at))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Crumb {
     pub label: String,
@@ -534,6 +569,16 @@ impl Debounce {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn match_span_prefers_a_contiguous_hit_then_the_subsequence() {
+        assert_eq!(match_span("dune-sunset-0412.jpg", "SUN"), Some((5, 8)));
+        assert_eq!(match_span("dune.jpg", "dj"), Some((0, 6)));
+        assert_eq!(match_span("dune.jpg", "zz"), None);
+        assert_eq!(match_span("dune.jpg", ""), None);
+        assert_eq!(match_span("Ärger.txt", "är"), Some((0, 2)));
+    }
+
     use super::*;
     use std::fs;
 

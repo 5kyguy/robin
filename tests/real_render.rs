@@ -26,6 +26,8 @@ fn scripted_views_render_through_the_real_app() {
         "grid-view",
         "grid-hidden",
         "list-density",
+        "search-results",
+        "search-nosearch",
     ] {
         let out = dir.join(format!("{view}.png"));
         let fixture = dir.join(format!("home-{view}"));

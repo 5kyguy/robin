@@ -20,7 +20,7 @@ use crate::fsops::{
 use crate::model::{Listing, Nav, SortDir, SortKey};
 use crate::ops::{self, Clipboard, Env, Job, JobKind, Mods, Op, Outcome, Progress, Trashed};
 use crate::safety::DirFd;
-use crate::{AppWindow, Columns, Error, GridLine, Result, Row};
+use crate::{AppWindow, Columns, Error, GridLine, Mark, Result, Row};
 
 /// What the trash/delete dialog is asking about.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,6 +162,8 @@ fn subfolder_counts(
 }
 
 pub struct Controller {
+    /// The type-to-filter field is open (Ctrl+F or `/`).
+    pub searching: bool,
     pub dir: PathBuf,
     pub listing: Listing,
     pub clip: Clipboard,
@@ -218,10 +220,21 @@ pub fn fit_columns(width: f32, tile: f32) -> usize {
     (n.max(1.0) as usize).min(MAX_COLUMNS)
 }
 
+/// The list drops its Type column under this content width
+/// (`Columns.no-type` in app.slint).
+pub const TYPE_MIN_LIST: f32 = 560.0;
+/// ...or when keeping Type would leave Name narrower than this.
+pub const NAME_MIN_W: f32 = 220.0;
+
 /// How many characters the list's Name column holds at `width`,
 /// mirroring `Columns` in app.slint (monospace, ~7.3px a glyph at 12px).
 pub fn name_chars(width: f32) -> usize {
-    // Mirrors `Columns` in app.slint: Type goes below 680px.
+    ((name_w(width) / 7.3).floor().max(6.0)) as usize
+}
+
+/// The Name column's width in a list `width` px wide, and whether
+/// Type is dropped: mirrors `Columns` in app.slint.
+pub fn columns(width: f32) -> (f32, bool) {
     let (size, modified) = if width < 480.0 {
         (64.0, 92.0)
     } else if width < 640.0 {
@@ -229,9 +242,22 @@ pub fn name_chars(width: f32) -> usize {
     } else {
         (88.0, 140.0)
     };
-    let kind = if width < 680.0 { 0.0 } else { 120.0 + 16.0 };
-    let name_w = width - 12.0 - modified - 2.0 * 16.0 - kind - size - 40.0;
-    ((name_w / 7.3).floor().max(6.0)) as usize
+    let without = width - 12.0 - modified - 16.0 - size - 16.0 - 40.0;
+    let with = without - 120.0 - 16.0;
+    let no_type = width < TYPE_MIN_LIST || with < NAME_MIN_W;
+    (if no_type { without } else { with }, no_type)
+}
+
+fn name_w(width: f32) -> f32 {
+    columns(width).0
+}
+
+/// One printable character, as typed into a search: not a key name
+/// like Escape or an arrow, which arrive as control or private-use chars.
+fn is_typed(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!((chars.next(), chars.next()), (Some(c), None)
+        if !c.is_control() && !('\u{f700}'..='\u{f8ff}').contains(&c))
 }
 
 /// "812 GB free of 1.8 TB" as "812 GB free", for narrow windows.
@@ -378,9 +404,14 @@ impl Controller {
         }
         let n = self.listing.view().len();
         let sel = self.listing.selection().len();
-        let mut left = ops::count(n);
+        let searching = !self.listing.query().is_empty();
+        let mut left = if searching {
+            format!("{n} of {}", ops::count(self.listing.searchable_count()))
+        } else {
+            ops::count(n)
+        };
         let hidden = self.listing.hidden_count();
-        if !self.listing.show_hidden() && hidden > 0 {
+        if !searching && !self.listing.show_hidden() && hidden > 0 {
             left = format!("{left} · {hidden} hidden");
         }
         if sel > 0 {
@@ -420,6 +451,7 @@ impl Controller {
             refresh_due: false,
             trash: TrashInfo::new(),
             grid: false,
+            searching: false,
             tile_step: 1,
             compact: false,
             columns: std::cell::Cell::new(1),
@@ -614,6 +646,8 @@ impl Controller {
                 let (key, order) = self.listing.sort();
                 let hidden = self.listing.show_hidden();
                 self.dir = dir;
+                // A new folder starts unfiltered.
+                self.searching = false;
                 self.listing = Listing::default();
                 self.listing.set_sort(key, order);
                 self.listing.set_show_hidden(hidden);
@@ -791,6 +825,9 @@ impl Controller {
         if self.dialog.is_some() {
             return self.dialog_key(text, shift);
         }
+        if let Some(action) = self.search_key(text, ctrl) {
+            return action;
+        }
         if ctrl {
             if ctrl_letter(text, 'x') {
                 self.clip.cut(&self.dir, self.names());
@@ -851,6 +888,80 @@ impl Controller {
                 None => Action::None,
             },
             _ => Action::None,
+        }
+    }
+
+    /// Search keys, or None to fall through to the normal ones. Arrows,
+    /// Return and Ctrl shortcuts keep working while searching.
+    fn search_key(&mut self, text: &str, ctrl: bool) -> Option<Action> {
+        let opens = (ctrl && ctrl_letter(text, 'f')) || (!ctrl && text == "/");
+        if !self.searching {
+            if opens {
+                self.searching = true;
+                return Some(Action::Redraw);
+            }
+            return None;
+        }
+        if ctrl {
+            return ctrl_letter(text, 'f').then_some(Action::None);
+        }
+        match text {
+            keys::ESCAPE => {
+                self.close_search();
+            }
+            keys::BACKSPACE => {
+                let mut q = self.listing.query().to_string();
+                if q.pop().is_none() {
+                    return Some(self.close_search());
+                }
+                self.listing.set_query(&q);
+            }
+            _ if is_typed(text) => {
+                let q = format!("{}{text}", self.listing.query());
+                self.listing.set_query(&q);
+            }
+            _ => return None,
+        }
+        Some(Action::Redraw)
+    }
+
+    fn close_search(&mut self) -> Action {
+        self.searching = false;
+        self.listing.set_query("");
+        Action::Redraw
+    }
+
+    /// The folder's own name, for the search field's scope label.
+    pub fn dir_name(&self) -> String {
+        self.dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.dir.display().to_string())
+    }
+
+    /// Opens the search, as the toolbar button does.
+    pub fn open_search(&mut self) -> Action {
+        self.searching = true;
+        Action::Redraw
+    }
+
+    /// The field's clear button: empty the query, keep the field open.
+    pub fn clear_search(&mut self) -> Action {
+        self.listing.set_query("");
+        Action::Redraw
+    }
+
+    /// "~/Pictures" for a folder under home, the full path otherwise.
+    pub fn short_dir(&self) -> String {
+        match self
+            .env
+            .home
+            .as_deref()
+            .and_then(|h| self.dir.strip_prefix(h).ok())
+        {
+            Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+            Some(rest) => format!("~/{}", rest.display()),
+            None => self.dir.display().to_string(),
         }
     }
 
@@ -1644,6 +1755,22 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     });
     let w = ui.as_weak();
     let st = state.clone();
+    ui.on_search_open(move || {
+        let action = st.borrow_mut().ctl.open_search();
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_search_clear(move || {
+        let action = st.borrow_mut().ctl.clear_search();
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
     ui.on_toggle_hidden(move || {
         st.borrow_mut().ctl.toggle_hidden();
         if let Some(ui) = w.upgrade() {
@@ -2071,13 +2198,36 @@ fn redraw(ui: &AppWindow, s: &State) {
             }
         })
         .collect();
+    // The matched part of each name, painted in the accent colour.
+    // Elided names keep plain text: their chars no longer line up.
+    let query = ctl.listing.query();
+    let marks: Vec<Mark> = rows
+        .iter()
+        .zip(&labels)
+        .map(
+            |(r, label)| match crate::model::match_span(&r.name, query) {
+                Some((a, b)) if label.is_empty() => {
+                    let chars: Vec<char> = r.name.chars().collect();
+                    let part = |x: usize, y: usize| chars[x..y].iter().collect::<String>().into();
+                    Mark {
+                        pre: part(0, a),
+                        hit: part(a, b),
+                        post: part(b, chars.len()),
+                    }
+                }
+                _ => Mark::default(),
+            },
+        )
+        .collect();
     // Only the visible mode gets a model; the other stays empty.
     if ctl.grid {
         ui.set_files(ModelRc::default());
         ui.set_labels(ModelRc::default());
+        ui.set_marks(ModelRc::default());
         ui.set_grid_rows(ModelRc::new(Rc::new(VecModel::from(ctl.grid_lines(&rows)))));
     } else {
         ui.set_labels(ModelRc::new(Rc::new(VecModel::from(labels))));
+        ui.set_marks(ModelRc::new(Rc::new(VecModel::from(marks))));
         ui.set_files(ModelRc::new(Rc::new(VecModel::from(rows))));
         ui.set_grid_rows(ModelRc::default());
     }
@@ -2105,11 +2255,36 @@ fn redraw(ui: &AppWindow, s: &State) {
     ui.set_trash_can_restore(matches!(ctl.restore_selected(), Action::Run(_)));
     ui.set_trash_note(ctl.trash_note().into());
     let n = ctl.listing.view().len();
+    ui.set_search_query(ctl.listing.query().into());
+    ui.set_search_scope(format!("in {}", ctl.dir_name()).into());
+    ui.set_search_count(if ctl.listing.query().is_empty() {
+        SharedString::new()
+    } else {
+        n.to_string().into()
+    });
+    if n == 0 && !ctl.listing.query().is_empty() {
+        ui.set_state_title(format!("Nothing matches \"{}\"", ctl.listing.query()).into());
+        ui.set_state_note(
+            format!(
+                "Searched {} in {}{}",
+                ops::count(ctl.listing.searchable_count()),
+                ctl.short_dir(),
+                if !ctl.listing.show_hidden() && ctl.listing.hidden_count() > 0 {
+                    " (hidden files excluded)"
+                } else {
+                    ""
+                }
+            )
+            .into(),
+        );
+    }
     ui.set_state(
         if !ctl.loaded {
             "loading"
         } else if ctl.unreadable.is_some() {
             "denied"
+        } else if n == 0 && !ctl.listing.query().is_empty() {
+            "nosearch"
         } else if n == 0 && ctl.in_trash() {
             "trash-empty"
         } else if n == 0 {
@@ -2146,6 +2321,7 @@ fn redraw(ui: &AppWindow, s: &State) {
                 Dialog::Conflict { ask, apply_all } => conflict_props(ui, ask, *apply_all),
             }
         }
+        None if ctl.searching => ui.set_overlay("search".into()),
         None => ui.set_overlay(SharedString::new()),
     }
 }
@@ -2853,9 +3029,24 @@ mod tests {
 
     #[test]
     fn narrow_lists_give_names_the_type_columns_width() {
-        // At 667px (a 720px window with the rail) Type is gone, so a
-        // name gets more room than it had with Type at 680px.
-        assert!(name_chars(667.0) > name_chars(680.0));
+        // Just under the cut Type is gone and Name gets its 136px.
+        let (above, below) = (columns(668.0), columns(667.0));
+        assert!(!above.1 && below.1);
+        assert!(below.0 > above.0);
+    }
+
+    #[test]
+    fn type_hides_before_name_drops_below_220px() {
+        for w in 300..1400 {
+            let (name, no_type) = columns(w as f32);
+            if !no_type {
+                assert!(name >= NAME_MIN_W, "{w}px keeps Type with a {name}px Name");
+                assert!(w as f32 >= TYPE_MIN_LIST);
+            }
+        }
+        // 913px window with the full sidebar: Type shows.
+        assert!(!columns(913.0 - 232.0).1);
+        assert!(columns(500.0).1);
     }
 
     #[test]
@@ -2880,6 +3071,102 @@ mod tests {
         c.toggle_hidden();
         assert!(c.rows().iter().all(|r| r.name != ".secret"));
         assert!(c.listing.selection().is_empty());
+    }
+
+    fn typed(c: &mut Controller, text: &str) {
+        for ch in text.chars() {
+            c.key(&ch.to_string(), false, false);
+        }
+    }
+
+    #[test]
+    fn slash_opens_search_and_typing_filters() {
+        let mut c = setup("search-type");
+        assert_eq!(c.key("/", false, false), Action::Redraw);
+        assert!(c.searching);
+        typed(&mut c, "b.j");
+        assert_eq!(c.listing.query(), "b.j");
+        let names: Vec<String> = c.rows().iter().map(|r| r.name.to_string()).collect();
+        assert_eq!(names, ["b.jpg"]);
+        // Arrows still move through the matches.
+        c.key(keys::DOWN, false, false);
+        assert_eq!(c.listing.cursor(), Some(&OsString::from("b.jpg")));
+    }
+
+    #[test]
+    fn backspace_pops_then_closes_and_escape_clears() {
+        let mut c = setup("search-keys");
+        c.key("f", true, false);
+        assert!(c.searching);
+        typed(&mut c, "ab");
+        c.key(keys::BACKSPACE, false, false);
+        assert_eq!(c.listing.query(), "a");
+        c.key(keys::BACKSPACE, false, false);
+        assert_eq!(c.listing.query(), "");
+        assert!(c.searching, "an empty field stays open");
+        c.key(keys::BACKSPACE, false, false);
+        assert!(!c.searching);
+        c.key("/", false, false);
+        typed(&mut c, "zz");
+        c.key(keys::ESCAPE, false, false);
+        assert!(!c.searching);
+        assert_eq!(c.listing.query(), "");
+        assert_eq!(c.rows().len(), 3);
+    }
+
+    #[test]
+    fn typing_drops_selected_names_the_search_hides() {
+        let mut c = setup("search-drop");
+        select(&mut c, "a.jpg");
+        c.key("/", false, false);
+        typed(&mut c, "b.jpg");
+        assert!(c.listing.selection().is_empty());
+        assert!(c.names().is_empty());
+    }
+
+    #[test]
+    fn the_status_bar_counts_matches_of_searchable_items() {
+        let mut c = setup("search-status");
+        c.key("/", false, false);
+        typed(&mut c, "b.j");
+        let total = c.listing.searchable_count();
+        assert_eq!(c.status_left(), format!("1 of {}", ops::count(total)));
+        c.listing.set_show_hidden(true);
+        assert_eq!(
+            c.listing.searchable_count(),
+            total + c.listing.hidden_count()
+        );
+    }
+
+    #[test]
+    fn the_clear_button_keeps_the_field_open() {
+        let mut c = setup("search-clear");
+        c.open_search();
+        typed(&mut c, "dune");
+        c.clear_search();
+        assert!(c.searching);
+        assert_eq!(c.listing.query(), "");
+        assert_eq!(c.dir_name(), "Pictures");
+    }
+
+    #[test]
+    fn navigating_clears_the_search() {
+        let mut c = setup("search-nav");
+        c.key("/", false, false);
+        typed(&mut c, "raw");
+        let ticket = c.begin_navigate(c.dir.join("raw-exports"));
+        c.land(ticket.perform());
+        assert!(!c.searching);
+        assert_eq!(c.listing.query(), "");
+    }
+
+    #[test]
+    fn a_search_with_no_matches_says_where_it_looked() {
+        let c = setup("search-where");
+        assert_eq!(c.short_dir(), "~/Pictures");
+        assert!(!is_typed(keys::UP));
+        assert!(!is_typed(keys::ESCAPE));
+        assert!(is_typed("k"));
     }
 
     #[test]

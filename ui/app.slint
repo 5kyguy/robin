@@ -16,7 +16,10 @@ export global Columns {
     out property <bool> narrow: row-w < 640px;
     out property <bool> tight: row-w < 480px;
     // Narrow lists drop the Type column before any name is cut.
-    out property <bool> no-type: row-w < 680px;
+    // Type goes when the list is under 560px, or when keeping it would
+    // leave Name under 220px. Mirrored by `name_chars` in app.rs.
+    out property <length> typed-name-w: row-w - pad - mod-w - gutter - 120px - gutter - size-w - gutter - name-x;
+    out property <bool> no-type: row-w < 560px || typed-name-w < 220px;
     out property <length> size-w: tight ? 64px : narrow ? 72px : 88px;
     out property <length> type-w: no-type ? 0px : 120px;
     // Never below what "MODIFIED" and its sort arrow need.
@@ -50,6 +53,13 @@ export struct Place {
     usage: float,
     level: int,
     section: int,
+}
+
+// A searched name split around the part that matched.
+export struct Mark {
+    pre: string,
+    hit: string,
+    post: string,
 }
 
 export struct Row {
@@ -582,6 +592,7 @@ export component AppWindow inherits Window {
     in property <int> grid-columns: 3;
     // Middle-elided list names, by row; empty falls back to the name.
     in property <[string]> labels;
+    in property <[Mark]> marks;
     in property <string> state: "files";
     /// The line under "Reading…" while a folder loads.
     in property <string> state-note: "";
@@ -602,6 +613,9 @@ export component AppWindow inherits Window {
     in property <string> path-text: "/home/sky/Pictures";
     in property <string> search-query: "";
     in property <string> search-count: "";
+    in property <string> search-scope: "";
+    callback search-open();
+    callback search-clear();
     in property <string> dialog-title: "";
     in property <string> dialog-body: "";
     in property <[Place]> places;
@@ -940,25 +954,27 @@ export component AppWindow inherits Window {
                         horizontal-alignment: left;
                         overflow: elide;
                     }
-                    if overlay == "search": Text {
+                    if overlay == "search": HorizontalLayout {
                         x: 8px;
-                        width: parent.width - 48px;
+                        width: parent.width - 16px;
                         height: parent.height;
-                        text: search-query;
-                        font-size: 12px;
-                        color: text;
-                        vertical-alignment: center;
-                        horizontal-alignment: left;
-                    }
-                    if overlay == "search": Text {
-                        x: parent.width - 40px;
-                        width: 32px;
-                        height: parent.height;
-                        text: search-count;
-                        font-size: 11px;
-                        color: muted;
-                        vertical-alignment: center;
-                        horizontal-alignment: right;
+                        spacing: 6px;
+                        Text { text: "󰍉"; font-size: 13px; color: muted; vertical-alignment: center; }
+                        Text { text: search-query; font-size: 12px; color: text; vertical-alignment: center; }
+                        Text {
+                            text: search-scope;
+                            font-size: 11px;
+                            color: muted;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                        Text { text: search-count; font-size: 11px; color: muted; vertical-alignment: center; }
+                        Rectangle {
+                            width: 18px;
+                            Text { text: "×"; font-size: 14px; color: muted; horizontal-alignment: center; vertical-alignment: center; }
+                            TouchArea { clicked => { root.search-clear(); } }
+                        }
                     }
                     if overlay == "path-edit" || overlay == "path-invalid" || overlay == "path-complete": Text {
                         x: 8px;
@@ -978,7 +994,9 @@ export component AppWindow inherits Window {
                     width: icon-box;
                     height: icon-box;
                     border-radius: 3px;
-                    Text { text: "󰍉"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                    background: overlay == "search" ? accent : transparent;
+                    Text { text: "󰍉"; font-size: 16px; color: overlay == "search" ? surface : text; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.search-open(); } }
                 }
                 Rectangle {
                     x: right-x + icon-box + 6px;
@@ -1175,7 +1193,16 @@ export component AppWindow inherits Window {
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
-                            Text {
+                            if marks[i].hit != "": HorizontalLayout {
+                                x: Columns.name-x;
+                                width: Columns.name-w(parent.width);
+                                height: parent.height;
+                                opacity: row.hidden ? 0.6 : 1;
+                                Text { text: marks[i].pre; font-size: 12px; font-weight: row.selected ? 700 : 400; color: text; vertical-alignment: center; }
+                                Text { text: marks[i].hit; font-size: 12px; font-weight: row.selected ? 700 : 400; color: accent; vertical-alignment: center; }
+                                Text { text: marks[i].post; font-size: 12px; font-weight: row.selected ? 700 : 400; color: text; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                            }
+                            if marks[i].hit == "": Text {
                                 text: labels[i] != "" ? labels[i] : row.name;
                                 x: Columns.name-x;
                                 y: 0px;
@@ -1292,7 +1319,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 12px; }
                     Text {
-                        text: state == "empty" ? "This folder is empty" : state == "trash-empty" ? "Trash is empty" : state == "denied" ? state-title : state == "unmounted" ? "SANDISK is not mounted" : state == "ejected" ? "SANDISK was removed" : state == "nosearch" ? "Nothing matches \"kotlin\"" : "Reading…";
+                        text: state == "empty" ? "This folder is empty" : state == "trash-empty" ? "Trash is empty" : state == "denied" ? state-title : state == "unmounted" ? "SANDISK is not mounted" : state == "ejected" ? "SANDISK was removed" : state == "nosearch" ? state-title : "Reading…";
                         font-size: 18px;
                         font-weight: 700;
                         color: text;
@@ -1301,7 +1328,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 6px; }
                     Text {
-                        text: state == "empty" ? "Drop files here or press Ctrl+N" : state == "trash-empty" ? "Files you move to the trash wait here until you empty it." : state == "denied" ? state-note : state == "nosearch" ? "Searched 4 812 items in ~/Projects" : state == "loading" ? state-note : "";
+                        text: state == "empty" ? "Drop files here or press Ctrl+N" : state == "trash-empty" ? "Files you move to the trash wait here until you empty it." : state == "denied" ? state-note : state == "nosearch" ? state-note : state == "loading" ? state-note : "";
                         font-size: 11px;
                         color: muted;
                         horizontal-alignment: center;

@@ -184,6 +184,10 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         }
         .into(),
     );
+    if view == "search-no-results" {
+        ui.set_state_title("Nothing matches \"kotlin\"".into());
+        ui.set_state_note("Searched 4 812 items in ~/Projects".into());
+    }
     if view == "permission-denied" {
         ui.set_state_title("No permission to open ~/secret".into());
         ui.set_state_note("Owned by root (drwx------)".into());
