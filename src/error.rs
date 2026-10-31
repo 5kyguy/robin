@@ -45,6 +45,17 @@ impl Error {
         }
     }
 
+    /// Permission was refused (EACCES/EPERM).
+    pub fn is_denied(&self) -> bool {
+        match self {
+            Self::Io { source, .. } => matches!(
+                source.raw_os_error(),
+                Some(e) if e == libc::EACCES || e == libc::EPERM
+            ),
+            _ => false,
+        }
+    }
+
     pub fn from_errno(path: impl Into<PathBuf>, err: rustix::io::Errno) -> Self {
         Self::io(path, std::io::Error::from(err))
     }

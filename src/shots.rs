@@ -83,6 +83,8 @@ pub fn known(view: &str) -> bool {
             | "list-name-natural"
             | "list-name-desc"
             | "watch-fallback"
+            | "nav-pending"
+            | "start-denied"
     )
 }
 
@@ -216,6 +218,13 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         }
         .into(),
     );
+    if view == "permission-denied" {
+        ui.set_state_title("No permission to open ~/secret".into());
+        ui.set_state_note("Owned by root (drwx------)".into());
+    }
+    if view == "loading-large-dir" {
+        ui.set_state_note("18 240 items".into());
+    }
     let kept = |path: &str, reason| crate::fsops::KeptEntry {
         path: path.into(),
         reason,
@@ -450,8 +459,29 @@ fn skipped_report() -> crate::fsops::TransferReport {
     }
 }
 
+/// The folder a view shows as open.
+fn open_folder(view: &str) -> &'static str {
+    match view {
+        "empty-folder" => "~/Pictures/empty",
+        "start-denied" => "~/secret",
+        _ => "~/Pictures",
+    }
+}
+
+/// The pinned sidebar entry that is the open folder itself, if any. A
+/// folder inside an entry (or outside all of them) highlights nothing.
+pub fn sidebar_entry(open: &str, pinned: &[&'static str]) -> Option<&'static str> {
+    pinned.iter().copied().find(|name| {
+        let path = if *name == "Home" {
+            "~".to_string()
+        } else {
+            format!("~/{name}")
+        };
+        path == open
+    })
+}
+
 fn places(view: &str) -> Vec<Place> {
-    let pictures = view != "empty-folder";
     let mut rows = vec![
         place(PlaceSpec {
             glyph: "󰋜",
@@ -494,7 +524,7 @@ fn places(view: &str) -> Vec<Place> {
             name: "Pictures",
             count: "1 204",
             section: 0,
-            selected: pictures,
+            selected: false,
             usage: -1.0,
             level: 0,
         }),
@@ -549,6 +579,19 @@ fn places(view: &str) -> Vec<Place> {
             disk.count = "—".into();
             disk.usage = 0.0;
         }
+    }
+    let pinned: Vec<&'static str> = [
+        "Home",
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Pictures",
+        "Videos",
+    ]
+    .to_vec();
+    let pick = sidebar_entry(open_folder(view), &pinned);
+    for r in rows.iter_mut().filter(|r| r.section == 0) {
+        r.selected = pick == Some(r.name.as_str());
     }
     rows
 }
@@ -949,7 +992,11 @@ fn menu() -> Vec<slint::SharedString> {
 /// The views of the wired file operations: cut rows, a drag over a folder,
 /// a running job, the keyboard-focused confirms, and the undo toast.
 fn fileops_scene(ui: &AppWindow, view: &str) {
-    if view.starts_with("list-") || view == "watch-fallback" {
+    if view.starts_with("list-")
+        || view == "watch-fallback"
+        || view == "nav-pending"
+        || view == "start-denied"
+    {
         return list_scene(ui, view);
     }
     let mut rows = files(false);
@@ -1090,9 +1137,7 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
             ui.set_toast_tone("".into());
             ui.set_toast_text("Moved 3 items to trash".into());
             ui.set_toast_action("Undo".into());
-            ui.set_toast_details(ModelRc::new(Rc::new(VecModel::from(Vec::<
-                slint::SharedString,
-            >::new()))));
+            crate::app::set_toast_rows(ui, &crate::app::detail_rows(&[], false, false));
         }
         _ => return,
     }
@@ -1156,6 +1201,35 @@ fn list_scene(ui: &AppWindow, view: &str) {
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
     ui.set_status_left(crate::ops::count(ctl.listing.view().len()).into());
+    if view == "start-denied" {
+        // The app started in a folder it can't read: the denied state, which
+        // replaces the error toast, as `landed` shows it.
+        ctl.unreadable = Some(true);
+        ctl.listing.set_entries(Vec::new());
+        ui.set_files(ModelRc::new(Rc::new(VecModel::from(ctl.rows()))));
+        ui.set_crumbs("~  ›  secret".into());
+        ui.set_status_left(crate::ops::count(0).into());
+        ui.set_state("denied".into());
+        ui.set_state_title("No permission to open ~/secret".into());
+        ui.set_state_note("".into());
+    }
+    if view == "nav-pending" {
+        // A slow navigation into raw-exports: the crumb names the target,
+        // the old listing stays, and the bar runs under the toolbar.
+        let t0 = std::time::Instant::now();
+        let gen = ctl
+            .begin_navigate_at("/demo/Pictures/raw-exports".into(), t0)
+            .gen();
+        ctl.tick_nav(gen, t0 + crate::app::NAV_PENDING_AFTER);
+        let crumbs: Vec<String> =
+            crate::model::breadcrumbs(ctl.crumb_dir(), Some(Path::new("/demo")))
+                .iter()
+                .map(|c| c.label.clone())
+                .collect();
+        ui.set_crumbs(crumbs.join("  ›  ").into());
+        ui.set_nav_busy(ctl.nav_pending());
+        ui.set_nav_phase(0.45);
+    }
     // The two neutral notices, with the same text the app shows.
     let notice = match view {
         "watch-fallback" => Some(crate::app::watch_fallback_notice(Path::new(
@@ -1176,6 +1250,21 @@ fn list_scene(ui: &AppWindow, view: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_sidebar_highlights_only_the_open_entry() {
+        let pinned = ["Home", "Pictures"];
+        assert_eq!(
+            super::sidebar_entry("~/Pictures", &pinned),
+            Some("Pictures")
+        );
+        assert_eq!(super::sidebar_entry("~", &pinned), Some("Home"));
+        assert_eq!(super::sidebar_entry("~/secret", &pinned), None);
+        assert_eq!(super::sidebar_entry("~/Pictures/raw", &pinned), None);
+        let picked = |view| super::places(view).iter().filter(|p| p.selected).count();
+        assert_eq!(picked("start-denied"), 0, "nothing lit in ~/secret");
+        assert_eq!(picked("browser-list"), 1);
+    }
+
     use super::*;
 
     #[test]

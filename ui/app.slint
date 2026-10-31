@@ -513,6 +513,14 @@ export component AppWindow inherits Window {
     in property <bool> collapsed: false;
     in property <length> tile: 152px;
     in property <string> state: "files";
+    /// The line under "Reading…" while a folder loads.
+    in property <string> state-note: "";
+    /// The headline of the denied state.
+    in property <string> state-title: "";
+    /// A navigation read is slow: a thin progress bar under the toolbar.
+    in property <bool> nav-busy: false;
+    /// Renders pin the bar's position (0..1); negative animates it.
+    in property <float> nav-phase: -1;
     in property <string> overlay: "";
     in property <string> viewer: "";
     in property <string> stats-mode: "";
@@ -542,6 +550,13 @@ export component AppWindow inherits Window {
     in property <[string]> menu-labels;
     in property <string> toast-text: "";
     in property <[string]> toast-details;
+    /// Whether the toast has details or a pinned line under its headline;
+    /// set with them by `set_toast_rows`.
+    in property <bool> toast-has-details: true;
+    /// The hairline under an open toast's headline; only when it has
+    /// details to separate.
+    out property <bool> toast-divider: (overlay == "skipped-details" || overlay == "toast-details" || toast-open)
+        && toast-has-details;
     in property <string> toast-pin: "";
     in property <int> toast-more: 0;
     in property <bool> toast-expanded: false;
@@ -784,6 +799,17 @@ export component AppWindow inherits Window {
                 property <length> right-w: icon-box * 4 + 18px;
                 property <length> crumb-x: 8px + nav-w + 12px;
                 property <length> right-x: self.width - 8px - right-w;
+                if nav-busy: Rectangle {
+                    y: parent.height - 2px;
+                    height: 2px;
+                    clip: true;
+                    property <float> t: nav-phase >= 0 ? nav-phase : Math.mod(animation-tick() / 1ms, 1400) / 1400;
+                    Rectangle {
+                        width: parent.width * 0.3;
+                        x: (parent.width * 1.3) * t - self.width;
+                        background: accent;
+                    }
+                }
                 Rectangle {
                     x: 8px;
                     y: iy;
@@ -908,6 +934,7 @@ export component AppWindow inherits Window {
                 vertical-stretch: 1;
                 background: bg;
                 if state == "files" && !grid: VerticalLayout {
+                    opacity: nav-busy ? 0.6 : 1;
                     Rectangle {
                         height: 26px;
                         HeaderCell {
@@ -1054,6 +1081,7 @@ export component AppWindow inherits Window {
                     }
                 }
                 if state == "files" && grid: ListView {
+                    opacity: nav-busy ? 0.6 : 1;
                     vertical-stretch: 1;
                     viewport-y <=> root.grid-scroll;
                     for line in grid-rows: HorizontalLayout {
@@ -1101,7 +1129,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 12px; }
                     Text {
-                        text: state == "empty" ? "This folder is empty" : state == "denied" ? "No permission to open ~/secret" : state == "unmounted" ? "SANDISK is not mounted" : state == "ejected" ? "SANDISK was removed" : state == "nosearch" ? "Nothing matches \"kotlin\"" : "Reading…";
+                        text: state == "empty" ? "This folder is empty" : state == "denied" ? state-title : state == "unmounted" ? "SANDISK is not mounted" : state == "ejected" ? "SANDISK was removed" : state == "nosearch" ? "Nothing matches \"kotlin\"" : "Reading…";
                         font-size: 18px;
                         font-weight: 700;
                         color: text;
@@ -1110,7 +1138,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 6px; }
                     Text {
-                        text: state == "empty" ? "Drop files here or press Ctrl+N" : state == "denied" ? "Owned by root (drwx------)" : state == "nosearch" ? "Searched 4 812 items in ~/Projects" : state == "loading" ? "18 240 items" : "";
+                        text: state == "empty" ? "Drop files here or press Ctrl+N" : state == "denied" ? state-note : state == "nosearch" ? "Searched 4 812 items in ~/Projects" : state == "loading" ? state-note : "";
                         font-size: 11px;
                         color: muted;
                         horizontal-alignment: center;
@@ -1280,7 +1308,7 @@ export component AppWindow inherits Window {
                 clicked => { root.toast-link(); }
             }
         }
-        if open: Rectangle {
+        if toast-divider: Rectangle {
             x: 16px;
             y: 52px;
             width: parent.width - 32px;
