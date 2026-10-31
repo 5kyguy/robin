@@ -38,20 +38,42 @@ pub struct Options<'a> {
 
 /// Where a render seeds its home when `--fixture` isn't given: private to
 /// this user, under `$XDG_RUNTIME_DIR` or `/tmp/robin-render-$UID`.
-pub fn default_home() -> PathBuf {
+pub fn default_home() -> Result<PathBuf> {
     match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
-        Some(run) => PathBuf::from(run).join("robin-render"),
-        None => std::env::temp_dir().join(format!(
-            "robin-render-{}",
-            rustix::process::getuid().as_raw()
-        )),
+        Some(run) => Ok(PathBuf::from(run).join("robin-render")),
+        None => {
+            let uid = rustix::process::getuid().as_raw();
+            let dir = std::env::temp_dir().join(format!("robin-render-{uid}"));
+            check_owned(&dir, uid)?;
+            Ok(dir)
+        }
+    }
+}
+
+/// /tmp is shared: a name there could be another user's folder or a link
+/// planted to redirect the render. Accept only a missing path or a real
+/// folder this user owns.
+pub fn check_owned(dir: &Path, uid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    match dir.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::io(dir, e)),
+        Ok(m) if m.file_type().is_symlink() => Err(Error::Message(format!(
+            "{} is a symlink; refusing to render there",
+            dir.display()
+        ))),
+        Ok(m) if !m.is_dir() || m.uid() != uid => Err(Error::Message(format!(
+            "{} is not a folder owned by this user; refusing to render there",
+            dir.display()
+        ))),
+        Ok(_) => Ok(()),
     }
 }
 
 /// Refuse to seed a folder that has things in it and isn't a fixture, so
 /// `--fixture ~/Pictures` can never write into a real folder.
 pub fn check_fixture(root: &Path) -> Result<()> {
-    let marked = crate::fixture::mounts_dir(root).is_dir();
+    let marked = crate::fixture::is_marked(root);
     let empty = match std::fs::read_dir(root) {
         Ok(mut entries) => entries.next().is_none(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
@@ -85,7 +107,10 @@ pub fn paint(opts: Options<'_>) -> Result<()> {
     let _ = slint::set_xdg_app_id("dev.skyguy.robin");
     // A home this render made is removed after; a given --fixture is kept.
     let made = opts.fixture.is_none();
-    let home = opts.fixture.unwrap_or_else(default_home);
+    let home = match opts.fixture {
+        Some(dir) => dir,
+        None => default_home()?,
+    };
     let result = seed(&home).and_then(|()| {
         paint_in(
             opts.view,
@@ -180,12 +205,38 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("robin-marked-{}", std::process::id()));
         let _ = crate::fixture::remove(&dir);
         seed(&dir).unwrap();
-        assert!(
-            crate::fixture::mounts_dir(&dir).is_dir(),
-            "seeding writes the marker"
-        );
+        assert!(crate::fixture::is_marked(&dir), "seeding writes the marker");
         seed(&dir).unwrap();
         crate::fixture::remove(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_tmp_fallback_must_be_a_real_folder_we_own() {
+        let uid = rustix::process::getuid().as_raw();
+        let base = std::env::temp_dir().join(format!("robin-owned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let missing = base.join("missing");
+        assert!(check_owned(&missing, uid).is_ok());
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert!(check_owned(&link, uid).is_err(), "symlink");
+        assert!(check_owned(&base, uid).is_ok());
+        assert!(
+            check_owned(&base, uid.wrapping_add(1)).is_err(),
+            "other owner"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_marker_folder_does_not_unlock_seeding() {
+        let dir = std::env::temp_dir().join(format!("robin-fakemark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(crate::fixture::MARKER)).unwrap();
+        std::fs::write(dir.join("taxes.txt"), b"real").unwrap();
+        assert!(seed(&dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn listing(dir: &Path) -> Vec<std::ffi::OsString> {

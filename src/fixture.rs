@@ -21,6 +21,16 @@ const PIXEL_PNG: &[u8] = &[
 /// Write the demo tree into `root`, which is created.
 pub fn materialize(root: &Path) -> Result<()> {
     fs::create_dir_all(root).map_err(|e| Error::io(root, e))?;
+    if !is_marked(root) {
+        let marker = root.join(MARKER);
+        if marker.symlink_metadata().is_ok() {
+            return Err(Error::Message(format!(
+                "{} exists and is not a fixture marker",
+                marker.display()
+            )));
+        }
+        write(root, MARKER, MARKER_TEXT)?;
+    }
     let dirs = [
         "Desktop",
         "Documents/empty",
@@ -61,9 +71,22 @@ pub fn materialize(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The marker file every fixture carries, and its exact contents.
+pub const MARKER: &str = ".robin-fixture";
+pub const MARKER_TEXT: &[u8] = b"robin render fixture v1\n";
+
 /// Where the fake mount table lives inside a fixture.
 pub fn mounts_dir(root: &Path) -> std::path::PathBuf {
-    root.join(".robin-fixture")
+    root.join(".robin-mounts")
+}
+
+/// True only when `root` holds a regular marker file with the known text.
+/// A folder or a symlink by that name does not count.
+pub fn is_marked(root: &Path) -> bool {
+    let path = root.join(MARKER);
+    path.symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_file())
+        && fs::read(&path).is_ok_and(|b| b == MARKER_TEXT)
 }
 
 /// The XDG dirs, one trashed file, a folder nobody may read, and a mount
@@ -101,6 +124,13 @@ fn seed_home(root: &Path) -> Result<()> {
     write(&m, "space", space.as_bytes())?;
     let secret = root.join("secret");
     fs::create_dir_all(&secret).map_err(|e| Error::io(&secret, e))?;
+    // chmod follows links: lock only a real folder, never a link's target.
+    if !secret.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+        return Err(Error::Message(format!(
+            "{} is not a real folder",
+            secret.display()
+        )));
+    }
     set_mode(&secret, 0o000)
 }
 
@@ -212,5 +242,38 @@ mod tests {
         assert_eq!(secs.as_secs(), 1_000_000);
         remove(&root).unwrap();
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_folder_or_link_named_like_the_marker_is_not_a_marker() {
+        let root = std::env::temp_dir().join(format!("robin-marker-{}", std::process::id()));
+        let _ = remove(&root);
+        fs::create_dir_all(root.join(MARKER)).unwrap();
+        assert!(!is_marked(&root), "folder");
+        fs::remove_dir(root.join(MARKER)).unwrap();
+        fs::write(root.join("real"), MARKER_TEXT).unwrap();
+        symlink("real", root.join(MARKER)).unwrap();
+        assert!(!is_marked(&root), "symlink");
+        fs::remove_file(root.join(MARKER)).unwrap();
+        fs::write(root.join(MARKER), b"something else").unwrap();
+        assert!(!is_marked(&root), "wrong text");
+        fs::write(root.join(MARKER), MARKER_TEXT).unwrap();
+        assert!(is_marked(&root));
+        remove(&root).unwrap();
+    }
+
+    #[test]
+    fn a_secret_link_is_never_chmodded() {
+        let root = std::env::temp_dir().join(format!("robin-secretlink-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("robin-outside-{}", std::process::id()));
+        let _ = remove(&root);
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        symlink(&outside, root.join("secret")).unwrap();
+        assert!(materialize(&root).is_err());
+        assert!(fs::read_dir(&outside).is_ok(), "target untouched");
+        fs::remove_file(root.join("secret")).unwrap();
+        remove(&root).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
     }
 }
