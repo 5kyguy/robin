@@ -697,6 +697,23 @@ impl Controller {
         }
     }
 
+    /// The view settings worth remembering.
+    pub fn prefs(&self) -> crate::prefs::ViewPrefs {
+        crate::prefs::ViewPrefs {
+            grid: self.grid,
+            tile_step: self.tile_step,
+            compact: self.compact,
+            show_hidden: self.listing.show_hidden(),
+        }
+    }
+
+    pub fn apply_prefs(&mut self, p: crate::prefs::ViewPrefs) {
+        self.grid = p.grid;
+        self.tile_step = p.tile_step.min(2);
+        self.compact = p.compact;
+        self.listing.set_show_hidden(p.show_hidden);
+    }
+
     pub fn set_grid(&mut self, grid: bool) -> Action {
         if self.grid == grid {
             return Action::None;
@@ -1280,6 +1297,9 @@ struct State {
     side_gate: crate::sidebar::SideGate,
     /// statvfs with a timeout, shared by every side job.
     probe: Arc<crate::sidebar::SpaceProbe>,
+    /// Where view settings are remembered, and what was last written.
+    prefs_path: Option<PathBuf>,
+    prefs_saved: std::cell::Cell<crate::prefs::ViewPrefs>,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -1482,14 +1502,19 @@ pub struct Launch {
     pub compact: bool,
     pub clock: Option<(i64, i64)>,
     pub mounts: std::sync::Arc<dyn crate::mounts::MountSource>,
+    /// Where the view settings are remembered; None never reads or
+    /// writes them (renders, tests).
+    pub prefs: Option<PathBuf>,
 }
 
 impl Launch {
     /// The interactive app: the system's home and trash, cyan, comfortable.
     pub fn system(dir: PathBuf) -> Self {
+        let env = Env::from_system();
         Self {
+            prefs: crate::prefs::ViewPrefs::path(env.config_dir()),
             dir,
-            env: Env::from_system(),
+            env,
             theme: crate::theme::Theme::cyan(),
             compact: false,
             clock: None,
@@ -1529,6 +1554,11 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     ui.set_compact(launch.compact);
     let mut ctl = Controller::new(launch.dir, launch.env);
     ctl.compact = launch.compact;
+    let saved = launch.prefs.as_deref().map(crate::prefs::ViewPrefs::load);
+    if let Some(p) = saved {
+        ctl.apply_prefs(p);
+        ui.set_compact(p.compact);
+    }
     ctl.clock = launch.clock;
     ctl.mounts = launch.mounts;
     ctl.loaded = false;
@@ -1554,6 +1584,8 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         side: Default::default(),
         side_gate: Default::default(),
         probe: crate::sidebar::SpaceProbe::new(std::time::Duration::from_millis(400)),
+        prefs_saved: std::cell::Cell::new(saved.unwrap_or_else(crate::prefs::ViewPrefs::fresh)),
+        prefs_path: launch.prefs,
     }));
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
     redraw(&ui, &state.borrow());
@@ -1986,9 +2018,21 @@ fn sync_drop_dest(s: &State) {
     }
 }
 
+/// Write the view settings when one changed. A failed write only
+/// means they aren't remembered next launch.
+fn remember_prefs(s: &State) {
+    let Some(path) = &s.prefs_path else { return };
+    let now = s.ctl.prefs();
+    if now != s.prefs_saved.get() {
+        let _ = now.save(path);
+        s.prefs_saved.set(now);
+    }
+}
+
 fn redraw(ui: &AppWindow, s: &State) {
     let ctl = &s.ctl;
     sync_drop_dest(s);
+    remember_prefs(s);
     ui.set_files(ModelRc::new(Rc::new(VecModel::from(ctl.rows()))));
     ui.set_grid(ctl.grid);
     ui.set_compact(ctl.compact);
@@ -2738,6 +2782,21 @@ mod tests {
         assert_eq!(c.key("=", true, false), Action::None);
         c.set_grid(true);
         assert_eq!(c.key("=", true, false), Action::Redraw);
+    }
+
+    #[test]
+    fn remembered_settings_restore_the_whole_view() {
+        let mut c = setup("prefs-restore");
+        let p = crate::prefs::ViewPrefs {
+            grid: true,
+            tile_step: 2,
+            compact: true,
+            show_hidden: true,
+        };
+        c.apply_prefs(p);
+        assert_eq!(c.prefs(), p);
+        c.set_grid(false);
+        assert!(!c.prefs().grid);
     }
 
     fn select(c: &mut Controller, name: &str) {

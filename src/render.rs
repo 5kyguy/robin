@@ -168,6 +168,7 @@ fn paint_in(
         compact,
         clock: Some((FROZEN_NOW, FROZEN_OFFSET)),
         mounts: Arc::new(mounts),
+        prefs: None,
     })?;
     app::land_reads();
     if view == "nav-pending" {
