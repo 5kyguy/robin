@@ -10,9 +10,17 @@ export global Columns {
     out property <length> icon-w: 20px;
     out property <length> name-x: 40px;
     out property <length> gutter: 16px;
-    out property <length> size-w: 88px;
-    out property <length> type-w: 120px;
-    out property <length> mod-w: 140px;
+    // The list's width. Narrow lists shrink the fixed columns so the
+    // Name column gets the spare width first.
+    in-out property <length> row-w: 800px;
+    out property <bool> narrow: row-w < 640px;
+    out property <bool> tight: row-w < 480px;
+    // Narrow lists drop the Type column before any name is cut.
+    out property <bool> no-type: row-w < 680px;
+    out property <length> size-w: tight ? 64px : narrow ? 72px : 88px;
+    out property <length> type-w: no-type ? 0px : 120px;
+    // Never below what "MODIFIED" and its sort arrow need.
+    out property <length> mod-w: tight ? 92px : narrow ? 104px : 140px;
     public pure function mod-x(row-w: length) -> length {
         row-w - pad - mod-w
     }
@@ -20,7 +28,7 @@ export global Columns {
         mod-x(row-w) - gutter - type-w
     }
     public pure function size-x(row-w: length) -> length {
-        type-x(row-w) - gutter - size-w
+        (no-type ? mod-x(row-w) : type-x(row-w)) - gutter - size-w
     }
     public pure function name-w(row-w: length) -> length {
         size-x(row-w) - gutter - name-x
@@ -65,12 +73,14 @@ export struct Row {
 
 export struct GridLine {
     n: int,
-    g0: string, n0: string, r0: int, b0: string, s0: bool, h0: bool,
-    g1: string, n1: string, r1: int, b1: string, s1: bool, h1: bool,
-    g2: string, n2: string, r2: int, b2: string, s2: bool, h2: bool,
-    g3: string, n3: string, r3: int, b3: string, s3: bool, h3: bool,
-    g4: string, n4: string, r4: int, b4: string, s4: bool, h4: bool,
-    g5: string, n5: string, r5: int, b5: string, s5: bool, h5: bool,
+    // The view index of the line's first tile.
+    first: int,
+    g0: string, n0: string, r0: int, b0: string, s0: bool, h0: bool, f0: bool,
+    g1: string, n1: string, r1: int, b1: string, s1: bool, h1: bool, f1: bool,
+    g2: string, n2: string, r2: int, b2: string, s2: bool, h2: bool, f2: bool,
+    g3: string, n3: string, r3: int, b3: string, s3: bool, h3: bool, f3: bool,
+    g4: string, n4: string, r4: int, b4: string, s4: bool, h4: bool, f4: bool,
+    g5: string, n5: string, r5: int, b5: string, s5: bool, h5: bool, f5: bool,
 }
 
 export struct MapCell {
@@ -137,6 +147,21 @@ component SideRow inherits Rectangle {
     }
 }
 
+// A thumbnail inset like the icons, scaled to fit whole (never
+// cropped), with its own corners rounded.
+component Thumb inherits Rectangle {
+    in property <image> source;
+    in property <length> box;
+    property <float> sw: max(1, source.width);
+    property <float> sh: max(1, source.height);
+    property <float> k: min(1 / sw, 1 / sh);
+    width: box * sw * k;
+    height: box * sh * k;
+    border-radius: 4px;
+    clip: true;
+    Image { source: root.source; width: parent.width; height: parent.height; image-fit: fill; }
+}
+
 component Tile inherits Rectangle {
     in property <string> glyph;
     in property <string> name;
@@ -153,12 +178,32 @@ component Tile inherits Rectangle {
     in property <color> surface;
     in property <color> selected-bg;
     in property <color> hover-bg;
+    in property <bool> faded;
+    // kind (0 down, 1 move, 2 up), tiles across and lines down from the
+    // pressed tile, past the drag threshold, ctrl, shift.
+    callback pointer(int, int, int, bool, bool, bool);
+    callback open();
     property <bool> still: name == "dune-sunset-0412.jpg" || name == "dune-sunset-0413.jpg" || name == "speeder-run.mp4" || name == "cantina-band.heic" || name == "droid-manual.pdf" || name == "lars homestead family portrait final.jpg";
     property <string> label: name == "dune-sunset-0412.jpg" ? "dune-sunset-\n0412.jpg" : name == "dune-sunset-0413.jpg" ? "dune-sunset-\n0413.jpg" : name == "speeder-run.mp4" ? "speeder-\nrun.mp4" : name == "cantina-band.heic" ? "cantina-\nband.heic" : name == "droid-manual.pdf" ? "droid-\nmanual.pdf" : name == "holo-backup.tar.zst" ? "holo-backup.\ntar.zst" : name == "binary-sunset.flac" ? "binary-\nsunset.flac" : name == "lars homestead family portrait final.jpg" ? "lars homestead\nfamily portrait final.jpg" : name;
     width: tile;
     height: tile + 44px;
     border-radius: 6px;
-    background: picked ? selected-bg : hot ? hover-bg : transparent;
+    opacity: faded ? 0.6 : 1;
+    background: picked ? selected-bg : hot || tile-touch.has-hover ? hover-bg : transparent;
+    tile-touch := TouchArea {
+        pointer-event(e) => {
+            if e.button == PointerEventButton.left || e.kind == PointerEventKind.move {
+                root.pointer(
+                    e.kind == PointerEventKind.down ? 0 : e.kind == PointerEventKind.up ? 2 : 1,
+                    floor(self.mouse-x / (tile + 8px)),
+                    floor(self.mouse-y / (tile + 60px)),
+                    self.pressed && (abs(self.mouse-x - self.pressed-x) > 6px || abs(self.mouse-y - self.pressed-y) > 6px),
+                    e.modifiers.control,
+                    e.modifiers.shift);
+            }
+        }
+        double-clicked => { root.open(); }
+    }
     VerticalLayout {
         padding: 6px;
         alignment: center;
@@ -167,14 +212,18 @@ component Tile inherits Rectangle {
             height: tile - 12px;
             border-radius: 4px;
             background: surface;
-            if name == "dune-sunset-0412.jpg": Image { source: @image-url("../assets/thumbs/dune-sunset-0412.jpg"); width: parent.width; height: parent.height; image-fit: cover; }
-            if name == "dune-sunset-0413.jpg": Image { source: @image-url("../assets/thumbs/dune-sunset-0413.jpg"); width: parent.width; height: parent.height; image-fit: cover; }
-            if name == "speeder-run.mp4": Image { source: @image-url("../assets/thumbs/speeder-frame.png"); width: parent.width; height: parent.height; image-fit: cover; }
-            if name == "cantina-band.heic": Image { source: @image-url("../assets/thumbs/cantina-band.png"); width: parent.width; height: parent.height; image-fit: cover; }
-            if name == "droid-manual.pdf": Image { source: @image-url("../assets/thumbs/droid-manual.png"); width: parent.width; height: parent.height; image-fit: cover; }
-            if name == "lars homestead family portrait final.jpg": Image { source: @image-url("../assets/thumbs/lars-homestead.jpg"); width: parent.width; height: parent.height; image-fit: cover; }
+            if name == "dune-sunset-0412.jpg": Thumb { box: parent.width - 16px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; source: @image-url("../assets/thumbs/dune-sunset-0412.jpg"); }
+            if name == "dune-sunset-0413.jpg": Thumb { box: parent.width - 16px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; source: @image-url("../assets/thumbs/dune-sunset-0413.jpg"); }
+            if name == "speeder-run.mp4": Thumb { box: parent.width - 16px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; source: @image-url("../assets/thumbs/speeder-frame.png"); }
+            if name == "cantina-band.heic": Thumb { box: parent.width - 16px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; source: @image-url("../assets/thumbs/cantina-band.png"); }
+            if name == "droid-manual.pdf": Thumb { box: parent.width - 16px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; source: @image-url("../assets/thumbs/droid-manual.png"); }
+            if name == "lars homestead family portrait final.jpg": Thumb { box: parent.width - 16px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; source: @image-url("../assets/thumbs/lars-homestead.jpg"); }
             if !still: Text {
                 text: glyph;
+                width: parent.width;
+                height: parent.height;
+                wrap: no-wrap;
+                overflow: clip;
                 font-size: tile * 0.32;
                 color: role == 2 ? danger : role == 3 ? warning : role == 1 ? accent : role == 4 ? muted : ink;
                 horizontal-alignment: center;
@@ -512,6 +561,13 @@ export component AppWindow inherits Window {
     in property <string> label: "Robin";
     in property <bool> compact: false;
     in property <bool> grid: false;
+    callback set-grid(bool);
+    callback toggle-hidden();
+    callback toggle-density();
+    // The content area's width; the grid's column count follows it.
+    out property <length> content-w: root.width - side-w - 1px;
+    callback content-resized();
+    changed content-w => { root.content-resized(); }
     // The open folder is the Trash: Name, Original location, Deleted.
     in property <bool> trash-view: false;
     in property <bool> trash-can-restore: false;
@@ -520,7 +576,12 @@ export component AppWindow inherits Window {
     callback trash-restore();
     callback trash-empty();
     in property <bool> collapsed: false;
+    // The status bar's free space without the drive size, for narrow windows.
+    in property <string> status-free-short;
     in property <length> tile: 152px;
+    in property <int> grid-columns: 3;
+    // Middle-elided list names, by row; empty falls back to the name.
+    in property <[string]> labels;
     in property <string> state: "files";
     /// The line under "Reading…" while a folder loads.
     in property <string> state-note: "";
@@ -644,7 +705,9 @@ export component AppWindow inherits Window {
     property <length> toolbar-h: compact ? 40px : 46px;
     property <length> icon-box: compact ? 28px : 34px;
     property <length> status-h: compact ? 22px : 26px;
-    property <length> side-w: collapsed ? 52px : 232px;
+    // Below 720px the sidebar folds to its icon rail on its own.
+    property <bool> rail-on: collapsed || root.width < 720px;
+    property <length> side-w: rail-on ? 52px : 232px;
     property <color> hairline: text.with-alpha(0.12);
     property <color> hover: text.with-alpha(0.06);
     property <color> selected: accent.with-alpha(0.18);
@@ -689,7 +752,7 @@ export component AppWindow inherits Window {
                 padding-top: 8px;
                 padding-bottom: 8px;
                 spacing: 0px;
-                if !collapsed && pinned-places.length > 0: HorizontalLayout {
+                if !rail-on && pinned-places.length > 0: HorizontalLayout {
                     Rectangle { width: 12px; }
                     Text {
                         text: "PINNED";
@@ -707,7 +770,7 @@ export component AppWindow inherits Window {
                     name: place.name;
                     count: place.count;
                     picked: place.selected;
-                    rail: root.collapsed;
+                    rail: root.rail-on;
                     side-row: root.side-row;
                     ink: root.text;
                     muted: root.muted;
@@ -715,7 +778,7 @@ export component AppWindow inherits Window {
                     selected-bg: root.selected;
                 }
                 Rectangle { height: 8px; }
-                if !collapsed && device-places.length > 0: HorizontalLayout {
+                if !rail-on && device-places.length > 0: HorizontalLayout {
                     Rectangle { width: 12px; }
                     Text {
                         text: "DEVICES";
@@ -735,7 +798,7 @@ export component AppWindow inherits Window {
                     border-color: root.accent;
                     TouchArea { clicked => { root.place-open(1, i); } }
                     VerticalLayout {
-                    padding-bottom: !root.collapsed && place.usage >= 0 ? 4px : 0px;
+                    padding-bottom: !root.rail-on && place.usage >= 0 ? 4px : 0px;
                     spacing: 1px;
                     SideRow {
                         clicked => { root.place-open(1, i); }
@@ -743,14 +806,14 @@ export component AppWindow inherits Window {
                         name: place.name;
                         count: place.count;
                         picked: false;
-                        rail: root.collapsed;
+                        rail: root.rail-on;
                         side-row: root.side-row;
                         ink: root.text;
                         muted: root.muted;
                         accent: root.accent;
                         selected-bg: root.selected;
                     }
-                    if !root.collapsed && place.usage >= 0: Rectangle {
+                    if !root.rail-on && place.usage >= 0: Rectangle {
                         height: 4px;
                         Rectangle {
                             x: 38px;
@@ -772,7 +835,7 @@ export component AppWindow inherits Window {
                 }
                     }
                 Rectangle { height: 8px; }
-                if !collapsed && trash-places.length > 0: HorizontalLayout {
+                if !rail-on && trash-places.length > 0: HorizontalLayout {
                     Rectangle { width: 12px; }
                     Text {
                         text: "TRASH";
@@ -790,7 +853,7 @@ export component AppWindow inherits Window {
                     name: place.name;
                     count: place.count;
                     picked: place.selected;
-                    rail: root.collapsed;
+                    rail: root.rail-on;
                     side-row: root.side-row;
                     ink: root.text;
                     muted: root.muted;
@@ -803,7 +866,7 @@ export component AppWindow inherits Window {
                     name: "Statistics";
                     count: "";
                     picked: root.stats-mode != "";
-                    rail: root.collapsed;
+                    rail: root.rail-on;
                     side-row: root.side-row;
                     ink: root.text;
                     muted: root.muted;
@@ -932,6 +995,7 @@ export component AppWindow inherits Window {
                     border-radius: 3px;
                     background: !grid ? selected : transparent;
                     Text { text: "󰈚"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.set-grid(false); } }
                 }
                 Rectangle {
                     x: right-x + icon-box * 2 + 16px;
@@ -941,6 +1005,7 @@ export component AppWindow inherits Window {
                     border-radius: 3px;
                     background: grid ? selected : transparent;
                     Text { text: "󰕰"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.set-grid(true); } }
                 }
                 Rectangle {
                     x: right-x + icon-box * 3 + 18px;
@@ -1045,7 +1110,7 @@ export component AppWindow inherits Window {
                             muted: muted;
                             clicked => { root.sort-by(1); }
                         }
-                        HeaderCell {
+                        if trash-view || !Columns.no-type: HeaderCell {
                             label: trash-view ? "ORIGINAL LOCATION" : "TYPE";
                             column: 2;
                             sorted: !trash-view && root.sort-column == 2;
@@ -1111,7 +1176,7 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                             }
                             Text {
-                                text: row.name;
+                                text: labels[i] != "" ? labels[i] : row.name;
                                 x: Columns.name-x;
                                 y: 0px;
                                 width: Columns.name-w(parent.width);
@@ -1138,6 +1203,7 @@ export component AppWindow inherits Window {
                             }
                             Text {
                                 text: row.kind;
+                                visible: trash-view || !Columns.no-type;
                                 x: trash-view ? Columns.size-x(parent.width) : Columns.type-x(parent.width);
                                 y: 0px;
                                 width: trash-view ? Columns.mod-x(parent.width) - Columns.size-x(parent.width) - 8px : Columns.type-w;
@@ -1168,34 +1234,48 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
                     viewport-y <=> root.grid-scroll;
                     for line in grid-rows: HorizontalLayout {
-                        padding-left: 16px;
-                        padding-right: 16px;
+                        // Centre the columns so the spare width splits evenly.
+                        padding-left: max(16px, (root.content-w - root.grid-columns * root.tile - (root.grid-columns - 1) * 8px) / 2);
+                        padding-right: 0px;
+                        alignment: start;
                         padding-top: 8px;
                         padding-bottom: 0px;
                         spacing: 8px;
                         height: tile + 60px;
                         if line.n > 0: Tile {
-                            glyph: line.g0; name: line.n0; role: line.r0; badge: line.b0; picked: line.s0; hot: line.h0;
+                            glyph: line.g0; name: line.n0; role: line.r0; badge: line.b0; picked: line.s0; hot: line.h0; faded: line.f0;
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 0, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
+                            open => { root.row-open(line.first + 0); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 1: Tile {
-                            glyph: line.g1; name: line.n1; role: line.r1; badge: line.b1; picked: line.s1; hot: line.h1;
+                            glyph: line.g1; name: line.n1; role: line.r1; badge: line.b1; picked: line.s1; hot: line.h1; faded: line.f1;
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 1, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
+                            open => { root.row-open(line.first + 1); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 2: Tile {
-                            glyph: line.g2; name: line.n2; role: line.r2; badge: line.b2; picked: line.s2; hot: line.h2;
+                            glyph: line.g2; name: line.n2; role: line.r2; badge: line.b2; picked: line.s2; hot: line.h2; faded: line.f2;
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 2, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
+                            open => { root.row-open(line.first + 2); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 3: Tile {
-                            glyph: line.g3; name: line.n3; role: line.r3; badge: line.b3; picked: line.s3; hot: line.h3;
+                            glyph: line.g3; name: line.n3; role: line.r3; badge: line.b3; picked: line.s3; hot: line.h3; faded: line.f3;
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 3, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
+                            open => { root.row-open(line.first + 3); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 4: Tile {
-                            glyph: line.g4; name: line.n4; role: line.r4; badge: line.b4; picked: line.s4; hot: line.h4;
+                            glyph: line.g4; name: line.n4; role: line.r4; badge: line.b4; picked: line.s4; hot: line.h4; faded: line.f4;
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 4, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
+                            open => { root.row-open(line.first + 4); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 5: Tile {
-                            glyph: line.g5; name: line.n5; role: line.r5; badge: line.b5; picked: line.s5; hot: line.h5;
+                            glyph: line.g5; name: line.n5; role: line.r5; badge: line.b5; picked: line.s5; hot: line.h5; faded: line.f5;
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 5, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
+                            open => { root.row-open(line.first + 5); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                     }
@@ -1297,12 +1377,13 @@ export component AppWindow inherits Window {
             Rectangle {
                 height: status-h;
                 background: bg;
-                property <length> free-w: 188px;
+                property <length> toggles-w: 22px + 17px + density-label.preferred-width + 12px;
+                property <length> free-w: root.width < 720px ? 96px : 188px;
                 Text {
                     text: status-left;
                     x: 12px;
                     y: 0px;
-                    width: parent.width - 24px - free-w;
+                    width: parent.width - 32px - free-w - toggles-w;
                     height: parent.height;
                     font-size: 11px;
                     color: muted;
@@ -1311,8 +1392,45 @@ export component AppWindow inherits Window {
                     overflow: elide;
                 }
                 Text {
-                    text: status-right;
-                    x: parent.width - 12px - free-w;
+                    text: "󰈈";
+                    x: parent.width - 12px - toggles-w;
+                    width: 22px;
+                    height: parent.height;
+                    font-size: 12px;
+                    color: hidden-on ? accent : muted;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    TouchArea { clicked => { root.toggle-hidden(); } }
+                }
+                Rectangle {
+                    x: parent.width - 12px - toggles-w + 22px + 8px;
+                    y: (parent.height - 12px) / 2;
+                    width: 1px;
+                    height: 12px;
+                    background: divider;
+                }
+                Rectangle {
+                    x: parent.width - 12px - density-label.preferred-width - 12px;
+                    y: (parent.height - 18px) / 2;
+                    width: density-label.preferred-width + 12px;
+                    height: 18px;
+                    border-radius: 4px;
+                    border-width: 1px;
+                    border-color: density-touch.has-hover ? accent : hairline;
+                    background: density-touch.pressed ? hover : transparent;
+                    density-label := Text {
+                        text: compact ? "Compact" : "Comfortable";
+                        x: 6px;
+                        height: parent.height;
+                        font-size: 11px;
+                        color: muted;
+                        vertical-alignment: center;
+                    }
+                    density-touch := TouchArea { clicked => { root.toggle-density(); } }
+                }
+                Text {
+                    text: root.width < 720px && status-free-short != "" ? status-free-short : status-right;
+                    x: parent.width - 12px - free-w - toggles-w - 8px;
                     y: 0px;
                     width: free-w;
                     height: parent.height;

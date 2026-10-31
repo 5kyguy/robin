@@ -72,6 +72,7 @@ pub fn materialize(root: &Path) -> Result<()> {
     write(root, "Downloads/readme.txt", b"nothing in here is real\n")?;
     write(root, "Projects/shot-list.md", b"# shot list\n")?;
     write(root, "Pictures/palette.toml", b"accent = \"cyan\"\n")?;
+    write(root, "Pictures/.picasa.ini", b"[Picasa]\n")?;
     write(root, "Pictures/dune-sunset-0412.jpg", PIXEL_PNG)?;
     write(root, "Pictures/dune-sunset-0413.jpg", PIXEL_PNG)?;
     write(root, "Pictures/r2-portrait-001.png", PIXEL_PNG)?;

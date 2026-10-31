@@ -35,6 +35,9 @@ pub fn scripted(view: &str) -> bool {
             | "trash-empty"
             | "trash-noinfo"
             | "trash-restore-recreated"
+            | "grid-view"
+            | "grid-hidden"
+            | "list-density"
     )
 }
 
@@ -165,6 +168,7 @@ fn paint_in(
         compact,
         clock: Some((FROZEN_NOW, FROZEN_OFFSET)),
         mounts: Arc::new(mounts),
+        prefs: None,
     })?;
     app::land_reads();
     if view == "nav-pending" {
@@ -190,6 +194,27 @@ fn paint_in(
     match view {
         // Pick a restorable item, as a click would.
         "trash-view" => select_row(&ui, "q3-budget.ods"),
+        // The grid button, then a tile click.
+        "grid-view" => {
+            ui.invoke_set_grid(true);
+            select_row(&ui, "dune-sunset-0413.jpg");
+            // The grid must not keep the list's model alive (100k-entry
+            // folders): fail the render, and the real_render test, if it does.
+            use slint::Model;
+            let (files, lines) = (ui.get_files().row_count(), ui.get_grid_rows().row_count());
+            if files != 0 || lines == 0 {
+                return Err(crate::Error::Message(format!(
+                    "grid mode: {files} list rows, {lines} grid lines"
+                )));
+            }
+        }
+        // Grid with hidden files shown, from the status bar toggle.
+        "grid-hidden" => {
+            ui.invoke_set_grid(true);
+            ui.invoke_toggle_hidden();
+        }
+        // The density label flips Comfortable to Compact.
+        "list-density" => ui.invoke_toggle_density(),
         "trash-empty-confirm" => ui.invoke_trash_empty(),
         // Select the item with no trashinfo; the banner explains it.
         "trash-noinfo" => select_row(&ui, "mystery.bin"),
@@ -207,9 +232,20 @@ fn paint_in(
 /// Click the row named `name`, as a person would.
 fn select_row(ui: &AppWindow, name: &str) {
     use slint::Model;
+    // The grid leaves the list model empty, so look in its lines too.
     let rows = ui.get_files();
-    let i = (0..rows.row_count())
-        .find(|&i| rows.row_data(i).is_some_and(|r| r.name == name))
+    let in_list = (0..rows.row_count()).find(|&i| rows.row_data(i).is_some_and(|r| r.name == name));
+    let lines = ui.get_grid_rows();
+    let in_grid = || {
+        lines.iter().find_map(|l| {
+            [&l.n0, &l.n1, &l.n2, &l.n3, &l.n4, &l.n5]
+                .iter()
+                .position(|n| n.as_str() == name)
+                .map(|k| l.first as usize + k)
+        })
+    };
+    let i = in_list
+        .or_else(in_grid)
         .unwrap_or_else(|| panic!("no row {name}")) as i32;
     ui.invoke_row_pointer(i, 0, 0, false, false, false);
     ui.invoke_row_pointer(i, 2, 0, false, false, false);

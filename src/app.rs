@@ -20,7 +20,7 @@ use crate::fsops::{
 use crate::model::{Listing, Nav, SortDir, SortKey};
 use crate::ops::{self, Clipboard, Env, Job, JobKind, Mods, Op, Outcome, Progress, Trashed};
 use crate::safety::DirFd;
-use crate::{AppWindow, Error, Result, Row};
+use crate::{AppWindow, Columns, Error, GridLine, Result, Row};
 
 /// What the trash/delete dialog is asking about.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,6 +196,62 @@ pub struct Controller {
     refresh_due: bool,
     /// The Trash view's trashinfo, by stored name; empty elsewhere.
     pub trash: TrashInfo,
+    /// Tiles instead of rows.
+    pub grid: bool,
+    /// Grid tile size: 0 small, 1 medium, 2 large.
+    pub tile_step: usize,
+    /// Compact density: shorter rows, bars and tiles.
+    pub compact: bool,
+    /// Tiles per grid line, refit to the content width on every redraw.
+    pub columns: std::cell::Cell<usize>,
+}
+
+/// Grid tile widths (S/M/L) per density, from the spec's density table.
+const TILES: [[f32; 3]; 2] = [[112.0, 152.0, 208.0], [96.0, 128.0, 176.0]];
+/// The most tiles a grid line holds; `GridLine` has six slots.
+pub const MAX_COLUMNS: usize = 6;
+
+/// How many tiles fit a content area `width` wide: 16 padding each
+/// side and an 8 gap between tiles.
+pub fn fit_columns(width: f32, tile: f32) -> usize {
+    let n = ((width - 32.0 + 8.0) / (tile + 8.0)).floor();
+    (n.max(1.0) as usize).min(MAX_COLUMNS)
+}
+
+/// How many characters the list's Name column holds at `width`,
+/// mirroring `Columns` in app.slint (monospace, ~7.3px a glyph at 12px).
+pub fn name_chars(width: f32) -> usize {
+    // Mirrors `Columns` in app.slint: Type goes below 680px.
+    let (size, modified) = if width < 480.0 {
+        (64.0, 92.0)
+    } else if width < 640.0 {
+        (72.0, 104.0)
+    } else {
+        (88.0, 140.0)
+    };
+    let kind = if width < 680.0 { 0.0 } else { 120.0 + 16.0 };
+    let name_w = width - 12.0 - modified - 2.0 * 16.0 - kind - size - 40.0;
+    ((name_w / 7.3).floor().max(6.0)) as usize
+}
+
+/// "812 GB free of 1.8 TB" as "812 GB free", for narrow windows.
+pub fn short_free(space: &str) -> String {
+    space.split(" of ").next().unwrap_or_default().to_string()
+}
+
+/// Cut `name` in the middle so its ending stays visible:
+/// `dune-sunset-0412.jpg` at 17 becomes `dune-sun…0412.jpg`.
+pub fn elide_middle(name: &str, max: usize) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= max || max < 3 {
+        return name.to_string();
+    }
+    let tail = (max - 1) / 2;
+    let head = max - 1 - tail;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
 }
 
 /// How long a navigation read may take before the breadcrumb jumps to the
@@ -323,6 +379,10 @@ impl Controller {
         let n = self.listing.view().len();
         let sel = self.listing.selection().len();
         let mut left = ops::count(n);
+        let hidden = self.listing.hidden_count();
+        if !self.listing.show_hidden() && hidden > 0 {
+            left = format!("{left} · {hidden} hidden");
+        }
         if sel > 0 {
             left = format!("{left} · {sel} selected");
         }
@@ -359,6 +419,10 @@ impl Controller {
             unreadable: None,
             refresh_due: false,
             trash: TrashInfo::new(),
+            grid: false,
+            tile_step: 1,
+            compact: false,
+            columns: std::cell::Cell::new(1),
         }
     }
 
@@ -548,9 +612,11 @@ impl Controller {
         match read.result {
             Ok((dir, snap)) if dir != self.dir => {
                 let (key, order) = self.listing.sort();
+                let hidden = self.listing.show_hidden();
                 self.dir = dir;
                 self.listing = Listing::default();
                 self.listing.set_sort(key, order);
+                self.listing.set_show_hidden(hidden);
                 self.apply_snapshot(snap);
                 Landed::Shown { moved: true }
             }
@@ -595,8 +661,10 @@ impl Controller {
         Ok(())
     }
 
+    /// What an operation acts on: the selection as far as the view
+    /// shows it, never a name hidden by the filter or the dotfile toggle.
     fn names(&self) -> Vec<OsString> {
-        self.listing.selection().iter().cloned().collect()
+        self.listing.visible_selection()
     }
 
     fn row_name(&self, index: usize) -> Option<(OsString, bool)> {
@@ -628,6 +696,97 @@ impl Controller {
         }
     }
 
+    /// Ctrl+H. Hidden items that disappear leave the selection, so a
+    /// later Del can't act on something no longer shown.
+    pub fn toggle_hidden(&mut self) {
+        let show = !self.listing.show_hidden();
+        self.listing.set_show_hidden(show);
+        if !show {
+            self.listing.drop_unseen();
+        }
+    }
+
+    /// The view settings worth remembering.
+    pub fn prefs(&self) -> crate::prefs::ViewPrefs {
+        crate::prefs::ViewPrefs {
+            grid: self.grid,
+            tile_step: self.tile_step,
+            compact: self.compact,
+            show_hidden: self.listing.show_hidden(),
+        }
+    }
+
+    pub fn apply_prefs(&mut self, p: crate::prefs::ViewPrefs) {
+        self.grid = p.grid;
+        self.tile_step = p.tile_step.min(2);
+        self.compact = p.compact;
+        self.listing.set_show_hidden(p.show_hidden);
+    }
+
+    pub fn set_grid(&mut self, grid: bool) -> Action {
+        if self.grid == grid {
+            return Action::None;
+        }
+        self.grid = grid;
+        Action::Redraw
+    }
+
+    /// Ctrl+= and Ctrl+- move between S, M and L, stopping at either end.
+    pub fn step_tile(&mut self, by: i32) -> Action {
+        let next = (self.tile_step as i32 + by).clamp(0, 2) as usize;
+        if next == self.tile_step {
+            return Action::None;
+        }
+        self.tile_step = next;
+        Action::Redraw
+    }
+
+    pub fn tile(&self) -> f32 {
+        TILES[usize::from(self.compact)][self.tile_step]
+    }
+
+    /// Fit the grid to a content area `width` wide. True when the
+    /// column count changed and the lines must be rebuilt.
+    pub fn fit(&self, width: f32) -> bool {
+        let columns = fit_columns(width, self.tile());
+        self.columns.replace(columns) != columns
+    }
+
+    /// The grid as lines of up to `columns` tiles.
+    pub fn grid_lines(&self, rows: &[Row]) -> Vec<GridLine> {
+        let columns = self.columns.get().max(1);
+        rows.chunks(columns)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let mut line = crate::shots::empty_line();
+                line.n = chunk.len() as i32;
+                line.first = (i * columns) as i32;
+                for (k, row) in chunk.iter().enumerate() {
+                    crate::shots::set_cell(
+                        &mut line,
+                        k,
+                        &row.glyph,
+                        &row.name,
+                        row.role,
+                        &row.badge,
+                        row.selected || row.drop,
+                        false,
+                    );
+                    let faded = row.hidden || row.cut;
+                    match k {
+                        0 => line.f0 = faded,
+                        1 => line.f1 = faded,
+                        2 => line.f2 = faded,
+                        3 => line.f3 = faded,
+                        4 => line.f4 = faded,
+                        _ => line.f5 = faded,
+                    }
+                }
+                line
+            })
+            .collect()
+    }
+
     pub fn key(&mut self, text: &str, ctrl: bool, shift: bool) -> Action {
         if self.dialog.is_some() {
             return self.dialog_key(text, shift);
@@ -647,16 +806,31 @@ impl Controller {
                 }
                 return self.clip.paste(&self.dir).map_or(Action::None, Action::Run);
             }
+            if ctrl_letter(text, 'h') {
+                self.toggle_hidden();
+                return Action::Redraw;
+            }
+            match text {
+                // Tile size only means something in the grid.
+                "=" | "+" if self.grid => return self.step_tile(1),
+                "-" | "_" if self.grid => return self.step_tile(-1),
+                "1" => return self.set_grid(false),
+                "2" => return self.set_grid(true),
+                _ => {}
+            }
         }
+        let columns = if self.grid { self.columns.get() } else { 1 };
         let nav = match text {
             keys::UP => Some(Nav::Up),
             keys::DOWN => Some(Nav::Down),
+            keys::LEFT if self.grid => Some(Nav::Left),
+            keys::RIGHT if self.grid => Some(Nav::Right),
             keys::HOME => Some(Nav::Home),
             keys::END => Some(Nav::End),
             _ => None,
         };
         if let Some(nav) = nav {
-            self.listing.move_cursor(nav, shift, 1);
+            self.listing.move_cursor(nav, shift, columns);
             return Action::Redraw;
         }
         match text {
@@ -761,7 +935,8 @@ impl Controller {
     }
 
     /// Pointer on row `index`: `kind` 0 down, 1 move, 2 up. `dy` is how many
-    /// rows the pointer is from the pressed row.
+    /// items the pointer is from the pressed one (rows in the list, row
+    /// offset times columns plus tiles across in the grid).
     pub fn pointer(&mut self, index: usize, kind: i32, dy: i32, far: bool, mods: Mods) -> Action {
         match kind {
             0 => {
@@ -1131,6 +1306,9 @@ struct State {
     side_gate: crate::sidebar::SideGate,
     /// statvfs with a timeout, shared by every side job.
     probe: Arc<crate::sidebar::SpaceProbe>,
+    /// Where view settings are remembered, and what was last written.
+    prefs_path: Option<PathBuf>,
+    prefs_saved: std::cell::Cell<crate::prefs::ViewPrefs>,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -1307,6 +1485,7 @@ fn draw_side(ui: &AppWindow, s: &State) {
     ui.set_device_places(rows(1, &side.devices));
     ui.set_trash_places(rows(2, &side.trash));
     ui.set_status_right(side.space.clone().into());
+    ui.set_status_free_short(short_free(&side.space).into());
 }
 
 /// Start a navigation to `target` at `t0` and hold its read, then move the
@@ -1333,14 +1512,19 @@ pub struct Launch {
     pub compact: bool,
     pub clock: Option<(i64, i64)>,
     pub mounts: std::sync::Arc<dyn crate::mounts::MountSource>,
+    /// Where the view settings are remembered; None never reads or
+    /// writes them (renders, tests).
+    pub prefs: Option<PathBuf>,
 }
 
 impl Launch {
     /// The interactive app: the system's home and trash, cyan, comfortable.
     pub fn system(dir: PathBuf) -> Self {
+        let env = Env::from_system();
         Self {
+            prefs: crate::prefs::ViewPrefs::path(env.config_dir()),
             dir,
-            env: Env::from_system(),
+            env,
             theme: crate::theme::Theme::cyan(),
             compact: false,
             clock: None,
@@ -1379,6 +1563,12 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     ui.set_harness(false);
     ui.set_compact(launch.compact);
     let mut ctl = Controller::new(launch.dir, launch.env);
+    ctl.compact = launch.compact;
+    let saved = launch.prefs.as_deref().map(crate::prefs::ViewPrefs::load);
+    if let Some(p) = saved {
+        ctl.apply_prefs(p);
+        ui.set_compact(p.compact);
+    }
     ctl.clock = launch.clock;
     ctl.mounts = launch.mounts;
     ctl.loaded = false;
@@ -1404,6 +1594,8 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         side: Default::default(),
         side_gate: Default::default(),
         probe: crate::sidebar::SpaceProbe::new(std::time::Duration::from_millis(400)),
+        prefs_saved: std::cell::Cell::new(saved.unwrap_or_else(crate::prefs::ViewPrefs::fresh)),
+        prefs_path: launch.prefs,
     }));
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
     redraw(&ui, &state.borrow());
@@ -1442,6 +1634,44 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         },
     );
 
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_set_grid(move |grid| {
+        let action = st.borrow_mut().ctl.set_grid(grid);
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_toggle_hidden(move || {
+        st.borrow_mut().ctl.toggle_hidden();
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, Action::Redraw);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_toggle_density(move || {
+        {
+            let mut s = st.borrow_mut();
+            s.ctl.compact = !s.ctl.compact;
+        }
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, Action::Redraw);
+        }
+    });
+    // A resize can change how many tiles fit a grid line.
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_content_resized(move || {
+        let Some(ui) = w.upgrade() else { return };
+        let Ok(s) = st.try_borrow() else { return };
+        // Grid columns and the list's middle-cut names both follow width.
+        if !s.ctl.grid || s.ctl.fit(ui.get_content_w()) {
+            redraw(&ui, &s);
+        }
+    });
     let w = ui.as_weak();
     let st = state.clone();
     ui.on_key(move |text, ctrl, shift, _alt| {
@@ -1798,10 +2028,59 @@ fn sync_drop_dest(s: &State) {
     }
 }
 
+/// Write the view settings when one changed. A failed write only
+/// means they aren't remembered next launch.
+fn remember_prefs(s: &State) {
+    let Some(path) = &s.prefs_path else { return };
+    let now = s.ctl.prefs();
+    if now != s.prefs_saved.get() {
+        let _ = now.save(path);
+        s.prefs_saved.set(now);
+    }
+}
+
 fn redraw(ui: &AppWindow, s: &State) {
     let ctl = &s.ctl;
     sync_drop_dest(s);
-    ui.set_files(ModelRc::new(Rc::new(VecModel::from(ctl.rows()))));
+    remember_prefs(s);
+    // Built once per redraw: in a 100k-entry folder each pass is costly.
+    let rows = ctl.rows();
+    ui.set_grid(ctl.grid);
+    ui.set_compact(ctl.compact);
+    ui.set_hidden_on(ctl.listing.show_hidden());
+    ui.set_tile(ctl.tile());
+    let content_w = ui.get_content_w();
+    ctl.fit(content_w);
+    ui.set_grid_columns(ctl.columns.get() as i32);
+    ui.global::<Columns>().set_row_w(content_w);
+    // Before the first layout the width is 0; show full names then.
+    let budget = if content_w > 0.0 {
+        name_chars(content_w)
+    } else {
+        usize::MAX
+    };
+    let labels: Vec<SharedString> = rows
+        .iter()
+        .take(if ctl.grid { 0 } else { usize::MAX })
+        .map(|r| {
+            let cut = elide_middle(&r.name, budget);
+            if cut == r.name.as_str() {
+                SharedString::new()
+            } else {
+                cut.into()
+            }
+        })
+        .collect();
+    // Only the visible mode gets a model; the other stays empty.
+    if ctl.grid {
+        ui.set_files(ModelRc::default());
+        ui.set_labels(ModelRc::default());
+        ui.set_grid_rows(ModelRc::new(Rc::new(VecModel::from(ctl.grid_lines(&rows)))));
+    } else {
+        ui.set_labels(ModelRc::new(Rc::new(VecModel::from(labels))));
+        ui.set_files(ModelRc::new(Rc::new(VecModel::from(rows))));
+        ui.set_grid_rows(ModelRc::default());
+    }
     let (column, desc) = ctl.sort_header();
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
@@ -2114,7 +2393,8 @@ pub fn file_icon(is_dir: bool, ext: &str) -> (&'static str, i32) {
         "mp3" | "flac" | "ogg" | "opus" | "wav" | "m4a" => ("󰎆", 1),
         "pdf" => ("󰈦", 2),
         "zip" | "tar" | "gz" | "zst" | "xz" | "bz2" | "7z" | "rar" => ("󰗄", 3),
-        "toml" | "json" | "yaml" | "yml" | "ini" | "conf" => ("\u{e6b2}", 1),
+        "toml" | "json" | "yaml" | "yml" => ("\u{e6b2}", 1),
+        "ini" | "conf" | "cfg" => ("\u{f0493}", 0), // 󰒓 settings
         "md" | "txt" => ("\u{f0354}", 0),
         _ => ("󰈔", 4),
     }
@@ -2442,6 +2722,209 @@ mod tests {
         let mut c = Controller::new(dir, env);
         c.reload().unwrap();
         c
+    }
+
+    #[test]
+    fn grid_columns_fit_the_width_within_one_to_six() {
+        assert_eq!(fit_columns(100.0, 152.0), 1);
+        assert_eq!(fit_columns(32.0 + 152.0 * 3.0 + 16.0, 152.0), 3);
+        assert_eq!(fit_columns(5000.0, 96.0), MAX_COLUMNS);
+    }
+
+    #[test]
+    fn tile_size_steps_stop_at_either_end_and_follow_density() {
+        let mut c = setup("tiles");
+        assert_eq!(c.tile(), 152.0);
+        assert_eq!(c.step_tile(1), Action::Redraw);
+        assert_eq!(c.step_tile(1), Action::None);
+        assert_eq!(c.tile(), 208.0);
+        c.compact = true;
+        assert_eq!(c.tile(), 176.0);
+        c.step_tile(-5);
+        assert_eq!(c.tile(), 96.0);
+    }
+
+    #[test]
+    fn grid_lines_chunk_by_the_fitted_columns() {
+        let mut c = setup("lines");
+        assert_eq!(c.set_grid(true), Action::Redraw);
+        assert_eq!(c.set_grid(true), Action::None);
+        assert!(c.fit(32.0 + 152.0 * 2.0 + 8.0));
+        let lines = c.grid_lines(&c.rows());
+        assert_eq!(lines.len(), 2);
+        assert_eq!((lines[0].n, lines[0].first), (2, 0));
+        assert_eq!((lines[1].n, lines[1].first), (1, 2));
+        assert!(!c.fit(32.0 + 152.0 * 2.0 + 8.0), "same width, no rebuild");
+    }
+
+    #[test]
+    fn shift_down_in_the_grid_selects_the_whole_range() {
+        let mut c = setup("shift-range");
+        for n in ["c.jpg", "d.jpg", "e.jpg"] {
+            fs::write(c.dir.join(n), b"x").unwrap();
+        }
+        c.reload().unwrap();
+        c.set_grid(true);
+        c.columns.set(3);
+        c.key(keys::HOME, false, false);
+        c.key(keys::RIGHT, false, false);
+        c.key(keys::DOWN, false, true);
+        // raw-exports a b / c d e: a..d is a, b, c, d.
+        let picked: Vec<_> = c.names();
+        assert_eq!(
+            picked,
+            ["a.jpg", "b.jpg", "c.jpg", "d.jpg"].map(OsString::from)
+        );
+        c.key(keys::UP, false, true);
+        assert_eq!(c.names(), vec![OsString::from("a.jpg")]);
+    }
+
+    #[test]
+    fn dragging_a_tile_onto_a_folder_targets_it() {
+        let mut c = setup("tile-drag");
+        c.set_grid(true);
+        c.columns.set(3);
+        let none = Mods {
+            ctrl: false,
+            shift: false,
+        };
+        c.pointer(1, 0, 0, false, none);
+        // One tile to the left of a.jpg is raw-exports.
+        assert_eq!(c.pointer(1, 1, -1, true, none), Action::Redraw);
+        assert_eq!(c.drag.as_ref().and_then(|d| d.target), Some(0));
+    }
+
+    #[test]
+    fn grid_arrows_move_by_the_column_count() {
+        let mut c = setup("grid-arrows");
+        for n in ["c.jpg", "d.jpg", "e.jpg"] {
+            fs::write(c.dir.join(n), b"x").unwrap();
+        }
+        c.reload().unwrap();
+        c.set_grid(true);
+        c.columns.set(3);
+        c.key(keys::HOME, false, false);
+        c.key(keys::DOWN, false, false);
+        assert_eq!(c.listing.cursor(), Some(&OsString::from("c.jpg")));
+        c.key(keys::RIGHT, false, false);
+        assert_eq!(c.listing.cursor(), Some(&OsString::from("d.jpg")));
+        c.key(keys::UP, false, false);
+        assert_eq!(c.listing.cursor(), Some(&OsString::from("a.jpg")));
+        // The list moves one row at a time and ignores left/right.
+        c.set_grid(false);
+        c.key(keys::DOWN, false, false);
+        assert_eq!(c.listing.cursor(), Some(&OsString::from("b.jpg")));
+        assert_eq!(c.key(keys::RIGHT, false, false), Action::None);
+    }
+
+    #[test]
+    fn ctrl_1_ctrl_2_and_ctrl_plus_minus_drive_the_view() {
+        let mut c = setup("ctrl-keys");
+        c.key("2", true, false);
+        assert!(c.grid);
+        let start = c.tile_step;
+        assert_eq!(c.key("=", true, false), Action::Redraw);
+        assert_eq!(c.tile_step, (start + 1).min(2));
+        c.key("-", true, false);
+        c.key("-", true, false);
+        assert_eq!(c.tile_step, start.saturating_sub(1));
+        c.key("1", true, false);
+        assert!(!c.grid);
+    }
+
+    #[test]
+    fn a_resize_refits_the_columns() {
+        let c = setup("refit");
+        let tile = c.tile();
+        assert!(c.fit(tile * 3.0 + 60.0));
+        let wide = c.columns.get();
+        assert!(!c.fit(tile * 3.0 + 60.0), "same width keeps the lines");
+        assert!(c.fit(tile * 6.0 + 120.0));
+        assert!(c.columns.get() > wide);
+        assert!(c.fit(tile + 40.0));
+        assert_eq!(c.columns.get(), 1);
+    }
+
+    #[test]
+    fn narrow_free_space_drops_the_drive_size() {
+        assert_eq!(short_free("812 GB free of 1.8 TB"), "812 GB free");
+        assert_eq!(short_free(""), "");
+    }
+
+    #[test]
+    fn narrow_lists_give_names_the_type_columns_width() {
+        // At 667px (a 720px window with the rail) Type is gone, so a
+        // name gets more room than it had with Type at 680px.
+        assert!(name_chars(667.0) > name_chars(680.0));
+    }
+
+    #[test]
+    fn a_search_narrows_what_operations_act_on() {
+        let mut c = setup("search-ops");
+        c.listing.move_cursor(Nav::Home, false, 1);
+        c.listing.move_cursor(Nav::Down, true, 1);
+        c.listing.move_cursor(Nav::Down, true, 1);
+        assert_eq!(c.names().len(), 3);
+        c.listing.set_query("a.jpg");
+        assert_eq!(c.names(), vec![OsString::from("a.jpg")]);
+        assert_eq!(c.listing.selection().len(), 1);
+    }
+
+    #[test]
+    fn hiding_dotfiles_drops_them_from_the_selection() {
+        let mut c = setup("hidden");
+        fs::write(c.dir.join(".secret"), b"s").unwrap();
+        c.reload().unwrap();
+        c.toggle_hidden();
+        select(&mut c, ".secret");
+        c.toggle_hidden();
+        assert!(c.rows().iter().all(|r| r.name != ".secret"));
+        assert!(c.listing.selection().is_empty());
+    }
+
+    #[test]
+    fn shown_hidden_files_stay_shown_after_navigating() {
+        let mut c = setup("hidden-nav");
+        c.toggle_hidden();
+        let sub = c.dir.join("raw-exports");
+        fs::write(sub.join(".x"), b"x").unwrap();
+        let ticket = c.begin_navigate(sub);
+        c.land(ticket.perform());
+        assert!(c.listing.show_hidden());
+        assert!(c.rows().iter().any(|r| r.name == ".x"));
+    }
+
+    #[test]
+    fn long_names_lose_their_middle_not_their_ending() {
+        assert_eq!(
+            elide_middle("dune-sunset-0412.jpg", 17),
+            "dune-sun…0412.jpg"
+        );
+        assert_eq!(elide_middle("short.jpg", 17), "short.jpg");
+        assert!(name_chars(567.0) > name_chars(500.0));
+    }
+
+    #[test]
+    fn ctrl_plus_does_nothing_in_the_list() {
+        let mut c = setup("tile-list");
+        assert_eq!(c.key("=", true, false), Action::None);
+        c.set_grid(true);
+        assert_eq!(c.key("=", true, false), Action::Redraw);
+    }
+
+    #[test]
+    fn remembered_settings_restore_the_whole_view() {
+        let mut c = setup("prefs-restore");
+        let p = crate::prefs::ViewPrefs {
+            grid: true,
+            tile_step: 2,
+            compact: true,
+            show_hidden: true,
+        };
+        c.apply_prefs(p);
+        assert_eq!(c.prefs(), p);
+        c.set_grid(false);
+        assert!(!c.prefs().grid);
     }
 
     fn select(c: &mut Controller, name: &str) {

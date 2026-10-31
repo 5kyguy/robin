@@ -79,6 +79,8 @@ pub struct Listing {
     query: String,
     selection: BTreeSet<OsString>,
     cursor: Option<OsString>,
+    /// Where a Shift range starts: the last item picked without Shift.
+    anchor: Option<OsString>,
 }
 
 impl Default for Listing {
@@ -92,6 +94,7 @@ impl Default for Listing {
             query: String::new(),
             selection: BTreeSet::new(),
             cursor: None,
+            anchor: None,
         }
     }
 }
@@ -150,8 +153,20 @@ impl Listing {
         self.show_hidden
     }
 
+    /// Filter by `query`. Selected names it hides stop being selected,
+    /// so nothing acts on files the user can't see.
     pub fn set_query(&mut self, query: &str) {
         self.query = query.to_string();
+        self.drop_unseen();
+    }
+
+    /// The selection the view still shows, in view order.
+    pub fn visible_selection(&self) -> Vec<OsString> {
+        self.view()
+            .iter()
+            .filter(|e| self.selection.contains(&e.name))
+            .map(|e| e.name.clone())
+            .collect()
     }
 
     pub fn query(&self) -> &str {
@@ -168,6 +183,15 @@ impl Listing {
             .collect();
         rows.sort_by(|a, b| cmp_entries(a, b, self.sort_key, self.sort_dir, self.folders_first));
         rows
+    }
+
+    /// Drop selected names the view no longer shows.
+    pub fn drop_unseen(&mut self) {
+        let seen: BTreeSet<OsString> = self.view().iter().map(|e| e.name.clone()).collect();
+        self.selection.retain(|n| seen.contains(n));
+        if self.cursor.as_ref().is_some_and(|c| !seen.contains(c)) {
+            self.cursor = None;
+        }
     }
 
     pub fn hidden_count(&self) -> usize {
@@ -193,12 +217,14 @@ impl Listing {
     pub fn select_only(&mut self, name: OsString) {
         self.selection.clear();
         self.selection.insert(name.clone());
+        self.anchor = Some(name.clone());
         self.cursor = Some(name);
     }
 
     pub fn clear_selection(&mut self) {
         self.selection.clear();
         self.cursor = None;
+        self.anchor = None;
     }
 
     /// Move the keyboard cursor. `columns` is 1 in the list and the tile
@@ -224,11 +250,23 @@ impl Listing {
             Nav::Down => (current + columns).min(names.len() - 1),
         };
         let name = names[next].clone();
-        if extend {
-            self.selection.insert(name.clone());
-        } else {
-            self.selection.clear();
-            self.selection.insert(name.clone());
+        let anchor = self
+            .anchor
+            .as_ref()
+            .and_then(|a| names.iter().position(|n| n == a));
+        match anchor.filter(|_| extend) {
+            // Shift: everything between the anchor and the new cursor.
+            Some(from) => {
+                let (lo, hi) = (from.min(next), from.max(next));
+                self.selection = names[lo..=hi].iter().cloned().collect();
+            }
+            None => {
+                if !extend {
+                    self.selection.clear();
+                }
+                self.selection.insert(name.clone());
+                self.anchor = Some(name.clone());
+            }
         }
         self.cursor = Some(name);
     }
