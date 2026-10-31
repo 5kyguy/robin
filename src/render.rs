@@ -39,6 +39,7 @@ pub fn scripted(view: &str) -> bool {
             | "grid-hidden"
             | "list-density"
             | "search-results"
+            | "search-letters"
             | "search-nosearch"
     )
 }
@@ -220,6 +221,8 @@ fn paint_in(
         // Slash opens the search; typed keys narrow the listing.
         "search-results" => type_keys(&ui, "/dune"),
         "search-nosearch" => type_keys(&ui, "/kotlin"),
+        // Not contiguous anywhere: only the d and the j light up.
+        "search-letters" => type_keys(&ui, "/dj"),
         "trash-empty-confirm" => ui.invoke_trash_empty(),
         // Select the item with no trashinfo; the banner explains it.
         "trash-noinfo" => select_row(&ui, "mystery.bin"),

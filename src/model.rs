@@ -81,6 +81,10 @@ pub struct Listing {
     cursor: Option<OsString>,
     /// Where a Shift range starts: the last item picked without Shift.
     anchor: Option<OsString>,
+    /// `view()` as indices into `entries`, filtered and sorted once and
+    /// reused until something it depends on changes: a search redraws
+    /// per keystroke and a 100k-entry sort is not free.
+    order: std::sync::OnceLock<Vec<usize>>,
 }
 
 impl Default for Listing {
@@ -95,6 +99,7 @@ impl Default for Listing {
             selection: BTreeSet::new(),
             cursor: None,
             anchor: None,
+            order: std::sync::OnceLock::new(),
         }
     }
 }
@@ -123,11 +128,24 @@ impl Listing {
             self.cursor = None;
         }
         self.entries = entries;
+        self.stale();
+    }
+
+    /// Forget the cached view order; the next `view()` rebuilds it.
+    fn stale(&mut self) {
+        self.order = std::sync::OnceLock::new();
+    }
+
+    /// Whether the view order is built and cached; tests check this.
+    #[cfg(test)]
+    pub fn order_cached(&self) -> bool {
+        self.order.get().is_some()
     }
 
     pub fn set_sort(&mut self, key: SortKey, dir: SortDir) {
         self.sort_key = key;
         self.sort_dir = dir;
+        self.stale();
     }
 
     pub fn sort(&self) -> (SortKey, SortDir) {
@@ -143,10 +161,12 @@ impl Listing {
             SortDir::Asc
         };
         self.sort_key = key;
+        self.stale();
     }
 
     pub fn set_show_hidden(&mut self, show: bool) {
         self.show_hidden = show;
+        self.stale();
     }
 
     pub fn show_hidden(&self) -> bool {
@@ -157,6 +177,7 @@ impl Listing {
     /// so nothing acts on files the user can't see.
     pub fn set_query(&mut self, query: &str) {
         self.query = query.to_string();
+        self.stale();
         self.drop_unseen();
     }
 
@@ -175,14 +196,24 @@ impl Listing {
 
     /// Names in the order the window should paint them.
     pub fn view(&self) -> Vec<&Entry> {
-        let mut rows: Vec<&Entry> = self
-            .entries
-            .iter()
-            .filter(|entry| self.show_hidden || !entry.is_hidden())
-            .filter(|entry| fuzzy_match(&entry.name.to_string_lossy(), &self.query))
-            .collect();
-        rows.sort_by(|a, b| cmp_entries(a, b, self.sort_key, self.sort_dir, self.folders_first));
-        rows
+        let order = self.order.get_or_init(|| {
+            let query = fold(&self.query);
+            let mut rows: Vec<usize> = (0..self.entries.len())
+                .filter(|&i| self.show_hidden || !self.entries[i].is_hidden())
+                .filter(|&i| folded_match(&fold(&self.entries[i].name.to_string_lossy()), &query))
+                .collect();
+            rows.sort_by(|&a, &b| {
+                cmp_entries(
+                    &self.entries[a],
+                    &self.entries[b],
+                    self.sort_key,
+                    self.sort_dir,
+                    self.folders_first,
+                )
+            });
+            rows
+        });
+        order.iter().map(|&i| &self.entries[i]).collect()
     }
 
     /// Drop selected names the view no longer shows.
@@ -228,6 +259,34 @@ impl Listing {
         self.selection.insert(name.clone());
         self.anchor = Some(name.clone());
         self.cursor = Some(name);
+    }
+
+    /// Ctrl+click: add or remove one name; it becomes the anchor.
+    pub fn toggle(&mut self, name: OsString) {
+        if !self.selection.remove(&name) {
+            self.selection.insert(name.clone());
+        }
+        self.anchor = Some(name.clone());
+        self.cursor = Some(name);
+    }
+
+    /// Shift+click: everything from the anchor to `name` in view order.
+    /// With no anchor it picks just `name`.
+    pub fn select_range_to(&mut self, name: OsString) {
+        let names: Vec<OsString> = self.view().iter().map(|e| e.name.clone()).collect();
+        let to = names.iter().position(|n| *n == name);
+        let from = self
+            .anchor
+            .as_ref()
+            .and_then(|a| names.iter().position(|n| n == a));
+        match (from, to) {
+            (Some(a), Some(b)) => {
+                let (lo, hi) = (a.min(b), a.max(b));
+                self.selection = names[lo..=hi].iter().cloned().collect();
+                self.cursor = Some(name);
+            }
+            _ => self.select_only(name),
+        }
     }
 
     pub fn clear_selection(&mut self) {
@@ -295,10 +354,12 @@ impl Listing {
         } else {
             self.entries.push(entry);
         }
+        self.stale();
     }
 
     pub fn remove_name(&mut self, name: &OsString) {
         self.entries.retain(|entry| &entry.name != name);
+        self.stale();
         self.selection.remove(name);
         if self.cursor.as_ref() == Some(name) {
             self.cursor = None;
@@ -424,46 +485,72 @@ pub fn local_offset(t: i64) -> i64 {
     tm.tm_gmtoff
 }
 
-/// Subsequence match, case-insensitive. An empty query matches everything.
-pub fn fuzzy_match(name: &str, query: &str) -> bool {
-    if query.is_empty() {
-        return true;
-    }
-    let name = name.to_lowercase();
-    let mut rest = name.as_str();
-    for ch in query.to_lowercase().chars() {
-        let Some(index) = rest.find(ch) else {
-            return false;
-        };
-        rest = &rest[index + ch.len_utf8()..];
-    }
-    true
+/// Text as a search compares it: NFC, so a precomposed "é" and
+/// "e" + combining acute are the same, then lowercased.
+pub fn fold(text: &str) -> Vec<char> {
+    use unicode_normalization::UnicodeNormalization;
+    text.nfc().flat_map(char::to_lowercase).collect()
 }
 
-/// The part of `name` a search for `query` matched, as char indices
-/// `start..end`: the first contiguous case-insensitive hit, else the
-/// span from the first to the last char of the subsequence match.
-pub fn match_span(name: &str, query: &str) -> Option<(usize, usize)> {
-    let low = |c: char| c.to_lowercase().next().unwrap_or(c);
-    let name: Vec<char> = name.chars().map(low).collect();
-    let query: Vec<char> = query.chars().map(low).collect();
-    if query.is_empty() || query.len() > name.len() {
+/// Subsequence match, case-insensitive. An empty query matches everything.
+pub fn fuzzy_match(name: &str, query: &str) -> bool {
+    folded_match(&fold(name), &fold(query))
+}
+
+fn folded_match(name: &[char], query: &[char]) -> bool {
+    let mut rest = name.iter();
+    query.iter().all(|q| rest.any(|c| c == q))
+}
+
+/// `name` as runs of (text, matched) for a search for `query`: the
+/// first contiguous hit if there is one, else only the letters the
+/// subsequence match used ("dj" lights the d and the j of "dune.jpg",
+/// not what lies between). Runs split on grapheme boundaries, so an
+/// accent always takes its letter's colour. The text is the NFC name.
+pub fn match_runs(name: &str, query: &str) -> Option<Vec<(String, bool)>> {
+    use unicode_normalization::UnicodeNormalization;
+    use unicode_segmentation::UnicodeSegmentation;
+    let shown: String = name.nfc().collect();
+    let chars: Vec<char> = shown.chars().collect();
+    let query = fold(query);
+    // Lowercasing can grow a char (İ); only a 1:1 fold lines up with `chars`.
+    let low: Vec<char> = chars
+        .iter()
+        .map(|c| {
+            let mut l = c.to_lowercase();
+            match (l.next(), l.next()) {
+                (Some(x), None) => x,
+                _ => *c,
+            }
+        })
+        .collect();
+    if query.is_empty() || query.len() > low.len() {
         return None;
     }
-    if let Some(i) = name
-        .windows(query.len())
-        .position(|w| w == query.as_slice())
-    {
-        return Some((i, i + query.len()));
+    let mut hit = vec![false; chars.len()];
+    match low.windows(query.len()).position(|w| w == query.as_slice()) {
+        Some(i) => hit[i..i + query.len()].iter_mut().for_each(|h| *h = true),
+        None => {
+            let mut at = 0;
+            for q in &query {
+                let i = at + low[at..].iter().position(|c| c == q)?;
+                hit[i] = true;
+                at = i + 1;
+            }
+        }
     }
+    let mut runs: Vec<(String, bool)> = Vec::new();
     let mut at = 0;
-    let mut first = None;
-    for q in &query {
-        let i = at + name[at..].iter().position(|c| c == q)?;
-        first.get_or_insert(i);
-        at = i + 1;
+    for g in shown.graphemes(true) {
+        let n = g.chars().count();
+        let on = hit[at..at + n].iter().any(|h| *h);
+        at += n;
+        match runs.last_mut() {
+            Some((text, was)) if *was == on => text.push_str(g),
+            _ => runs.push((g.to_string(), on)),
+        }
     }
-    Some((first?, at))
+    Some(runs)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -571,12 +658,44 @@ impl Debounce {
 mod tests {
 
     #[test]
-    fn match_span_prefers_a_contiguous_hit_then_the_subsequence() {
-        assert_eq!(match_span("dune-sunset-0412.jpg", "SUN"), Some((5, 8)));
-        assert_eq!(match_span("dune.jpg", "dj"), Some((0, 6)));
-        assert_eq!(match_span("dune.jpg", "zz"), None);
-        assert_eq!(match_span("dune.jpg", ""), None);
-        assert_eq!(match_span("Ärger.txt", "är"), Some((0, 2)));
+    fn match_runs_light_only_the_matched_letters() {
+        let r = |v: &[(&str, bool)]| Some(v.iter().map(|(t, h)| (t.to_string(), *h)).collect());
+        assert_eq!(
+            match_runs("dune-sunset-0412.jpg", "SUN"),
+            r(&[("dune-", false), ("sun", true), ("set-0412.jpg", false)])
+        );
+        // Not contiguous: only d and j, never "une.".
+        assert_eq!(
+            match_runs("dune.jpg", "dj"),
+            r(&[("d", true), ("une.", false), ("j", true), ("pg", false)])
+        );
+        assert_eq!(match_runs("dune.jpg", "zz"), None);
+        assert_eq!(match_runs("dune.jpg", ""), None);
+        assert_eq!(
+            match_runs("Ärger.txt", "är"),
+            r(&[("Är", true), ("ger.txt", false)])
+        );
+    }
+
+    #[test]
+    fn an_accent_takes_its_letters_colour() {
+        // Flag emoji and a combining mark that NFC can't fold away (q̃).
+        let runs = match_runs("q\u{303}x", "q").unwrap();
+        assert_eq!(runs[0], ("q\u{303}".to_string(), true));
+        assert_eq!(runs[1], ("x".to_string(), false));
+    }
+
+    #[test]
+    fn search_matches_ignore_case_and_unicode_form() {
+        // Precomposed é (U+00E9) against e + combining acute (U+0301).
+        assert!(fuzzy_match("Café.txt", "cafe\u{301}"));
+        assert!(fuzzy_match("cafe\u{301}.txt", "CAFÉ"));
+        assert!(fuzzy_match("ÄRGER", "ärger"));
+        assert!(fuzzy_match("写真.jpg", "写"));
+        assert!(!fuzzy_match("dune", "dunes"));
+        assert!(fuzzy_match("anything", ""));
+        let runs = match_runs("cafe\u{301}", "É").unwrap();
+        assert_eq!(runs.last().unwrap(), &("é".to_string(), true));
     }
 
     use super::*;
@@ -591,6 +710,22 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
             mode: if is_dir { 0o040755 } else { 0o100644 },
         }
+    }
+
+    #[test]
+    fn the_view_is_cached_until_something_it_depends_on_changes() {
+        let mut listing = Listing::default();
+        listing.set_entries(vec![entry("b", false, 1, 1), entry("a", false, 1, 1)]);
+        assert!(!listing.order_cached());
+        assert_eq!(names(&listing), ["a", "b"]);
+        assert!(listing.order_cached());
+        listing.set_query("b");
+        assert_eq!(names(&listing), ["b"], "a query rebuilds the order");
+        listing.set_sort(SortKey::Name, SortDir::Desc);
+        assert!(!listing.order_cached(), "a sort drops the cache");
+        listing.set_show_hidden(true);
+        assert!(!listing.order_cached());
+        assert_eq!(names(&listing), ["b"]);
     }
 
     fn names(listing: &Listing) -> Vec<String> {
