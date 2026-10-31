@@ -41,6 +41,11 @@ pub fn scripted(view: &str) -> bool {
             | "search-results"
             | "search-letters"
             | "search-nosearch"
+            | "view-image"
+            | "view-zoom"
+            | "view-info"
+            | "view-turn"
+            | "view-video"
     )
 }
 
@@ -157,8 +162,15 @@ fn paint_in(
     let home = &crate::fixture::home(root);
     let start = match view {
         "start-denied" => home.join("secret"),
+        "view-video" => home.join("Videos"),
         _ => home.join("Pictures"),
     };
+    if view.starts_with("view-") {
+        // The fixture's stills are 1px placeholders; the viewer needs
+        // real pictures to show.
+        crate::thumbs::write_fixture_stills(&home.join("Pictures"))?;
+        crate::fixture::freeze_times(root, FIXTURE_MTIME)?;
+    }
     let mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(root))?;
     let mut env = crate::ops::Env::for_home(home);
     if view == "trash-empty" {
@@ -173,6 +185,9 @@ fn paint_in(
         mounts: Arc::new(mounts),
         prefs: None,
     })?;
+    // Size the window before any keys: the viewer fits and zooms to it.
+    ui.window()
+        .set_size(slint::PhysicalSize::new(size.0, size.1));
     app::land_reads();
     if view == "nav-pending" {
         // A slow navigation into raw-exports whose read hasn't landed.
@@ -223,6 +238,21 @@ fn paint_in(
         "search-nosearch" => type_keys(&ui, "/kotlin"),
         // Not contiguous anywhere: only the d and the j light up.
         "search-letters" => type_keys(&ui, "/dj"),
+        // Return on a photo opens it; the scene's keys then act in the viewer.
+        "view-image" | "view-zoom" | "view-info" | "view-turn" => {
+            select_row(&ui, "dune-sunset-0412.jpg");
+            type_keys(&ui, "\n");
+            match view {
+                "view-zoom" => type_keys(&ui, "l++++"),
+                "view-info" => type_keys(&ui, "i"),
+                "view-turn" => type_keys(&ui, "r"),
+                _ => {}
+            }
+        }
+        "view-video" => {
+            select_row(&ui, "speeder-run.mp4");
+            type_keys(&ui, "\n");
+        }
         "trash-empty-confirm" => ui.invoke_trash_empty(),
         // Select the item with no trashinfo; the banner explains it.
         "trash-noinfo" => select_row(&ui, "mystery.bin"),

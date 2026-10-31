@@ -23,6 +23,7 @@ pub mod theme;
 pub mod thumbs;
 pub mod trash;
 pub mod video;
+pub mod viewer;
 pub mod watch;
 
 pub use error::{Error, Result};

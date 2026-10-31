@@ -208,6 +208,11 @@ pub struct Controller {
     pub columns: std::cell::Cell<usize>,
     /// The list's middle-cut name budget the rows were last built for.
     pub name_budget: std::cell::Cell<usize>,
+    /// The media viewer, while it is open over the browser.
+    pub viewer: Option<crate::viewer::Viewer>,
+    /// The open image's pixel size and the viewer's canvas size, from the
+    /// last redraw; zoom steps are taken against them.
+    pub view_geom: std::cell::Cell<((f32, f32), (f32, f32))>,
 }
 
 /// Grid tile widths (S/M/L) per density, from the spec's density table.
@@ -431,6 +436,45 @@ fn ctrl_letter(text: &str, letter: char) -> bool {
 }
 
 impl Controller {
+    /// Open the viewer on `name` if it is media, browsing the folder's
+    /// media in view order.
+    pub fn open_viewer(&mut self, name: &OsString) -> Action {
+        let names: Vec<OsString> = self
+            .listing
+            .view()
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| e.name.clone())
+            .collect();
+        match crate::viewer::Viewer::open(&names, name) {
+            Some(v) => {
+                self.viewer = Some(v);
+                Action::Redraw
+            }
+            None => Action::None,
+        }
+    }
+
+    /// Jump to the filmstrip's `tile`th tile.
+    pub fn viewer_go(&mut self, tile: usize) -> Action {
+        match self.viewer.as_mut() {
+            Some(v) => {
+                let index = v.strip_window(STRIP_TILES).start + tile;
+                v.go(index);
+                Action::Redraw
+            }
+            None => Action::None,
+        }
+    }
+
+    /// Close the viewer; the browser's selection lands on the last item
+    /// viewed, so Esc after browsing ten photos leaves you on the tenth.
+    pub fn close_viewer(&mut self) {
+        if let Some(v) = self.viewer.take() {
+            self.listing.select_only(v.current().clone());
+        }
+    }
+
     /// The item, selection and clipboard summary. Blank when the folder
     /// can't be read: "0 items" would claim it is empty.
     pub fn status_left(&self) -> String {
@@ -491,6 +535,8 @@ impl Controller {
             compact: false,
             columns: std::cell::Cell::new(1),
             name_budget: std::cell::Cell::new(0),
+            viewer: None,
+            view_geom: std::cell::Cell::new(((0.0, 0.0), (0.0, 0.0))),
         }
     }
 
@@ -869,6 +915,17 @@ impl Controller {
         if self.dialog.is_some() {
             return self.dialog_key(text, shift);
         }
+        if let Some(v) = self.viewer.as_mut() {
+            let (image, view) = self.view_geom.get();
+            return match v.key(text, image, view) {
+                crate::viewer::Step::Ignored => Action::None,
+                crate::viewer::Step::Close => {
+                    self.close_viewer();
+                    Action::Redraw
+                }
+                _ => Action::Redraw,
+            };
+        }
         if let Some(action) = self.search_key(text, ctrl) {
             return action;
         }
@@ -925,7 +982,8 @@ impl Controller {
                 Some(name) if self.dir.join(&name).is_dir() => {
                     Action::Navigate(self.dir.join(name))
                 }
-                _ => Action::None,
+                Some(name) => self.open_viewer(&name),
+                None => Action::None,
             },
             keys::BACKSPACE => match self.dir.parent() {
                 Some(p) => Action::Navigate(p.to_path_buf()),
@@ -1499,6 +1557,8 @@ struct State {
     /// Where view settings are remembered, and what was last written.
     prefs_path: Option<PathBuf>,
     prefs_saved: std::cell::Cell<crate::prefs::ViewPrefs>,
+    /// Decoded viewer images and filmstrip thumbnails, by path.
+    pics: RefCell<Pics>,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -1786,6 +1846,7 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         probe: crate::sidebar::SpaceProbe::new(std::time::Duration::from_millis(400)),
         prefs_saved: std::cell::Cell::new(saved.unwrap_or_else(crate::prefs::ViewPrefs::fresh)),
         prefs_path: launch.prefs,
+        pics: RefCell::default(),
     }));
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
     redraw(&ui, &state.borrow());
@@ -1888,6 +1949,27 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     });
     let w = ui.as_weak();
     let st = state.clone();
+    let (w_vc, st_vc) = (ui.as_weak(), state.clone());
+    let (w_vg, st_vg) = (ui.as_weak(), state.clone());
+    let (w_vk, st_vk) = (ui.as_weak(), state.clone());
+    ui.on_view_close(move || {
+        st_vc.borrow_mut().ctl.close_viewer();
+        if let Some(ui) = w_vc.upgrade() {
+            apply(&ui, &st_vc, Action::Redraw);
+        }
+    });
+    ui.on_view_go(move |tile| {
+        let action = st_vg.borrow_mut().ctl.viewer_go(tile.max(0) as usize);
+        if let Some(ui) = w_vg.upgrade() {
+            apply(&ui, &st_vg, action);
+        }
+    });
+    ui.on_view_key(move |text| {
+        let action = st_vk.borrow_mut().ctl.key(&text, false, false);
+        if let Some(ui) = w_vk.upgrade() {
+            apply(&ui, &st_vk, action);
+        }
+    });
     ui.on_key(move |text, ctrl, shift, _alt| {
         let action = st.borrow_mut().ctl.key(&text, ctrl, shift);
         let handled = action != Action::None;
@@ -1941,15 +2023,14 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     let w = ui.as_weak();
     let st = state.clone();
     ui.on_row_open(move |index| {
-        let target = {
-            let s = st.borrow();
-            s.ctl
-                .row_name(index.max(0) as usize)
-                .filter(|r| r.1)
-                .map(|r| s.ctl.dir.join(r.0))
+        let row = st.borrow().ctl.row_name(index.max(0) as usize);
+        let action = match row {
+            Some((name, true)) => Action::Navigate(st.borrow().ctl.dir.join(name)),
+            Some((name, false)) => st.borrow_mut().ctl.open_viewer(&name),
+            None => Action::None,
         };
-        if let (Some(ui), Some(t)) = (w.upgrade(), target) {
-            apply(&ui, &st, Action::Navigate(t));
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
         }
     });
     let w = ui.as_weak();
@@ -2268,7 +2349,214 @@ fn remember_prefs(s: &State) {
     }
 }
 
+/// Filmstrip tiles shown at once (DESIGN §5).
+pub const STRIP_TILES: usize = 11;
+
+/// A decoded picture, or why there is none.
+type Decoded = std::result::Result<Rc<image::RgbaImage>, String>;
+
+#[derive(Default)]
+struct Pics {
+    /// The open item, decoded once.
+    full: Option<(PathBuf, Decoded)>,
+    /// It as shown, turned: (path, turns, image).
+    shown: Option<(PathBuf, u8, slint::Image)>,
+    tiles: std::collections::HashMap<PathBuf, slint::Image>,
+}
+
+/// Decode `path` for the viewer, shrunk to `max_side` when given.
+/// Videos and undecodable stills say why there is no picture.
+fn decode(path: &Path, max_side: Option<u32>) -> Decoded {
+    use crate::viewer::{media, Media};
+    if media(path) == Some(Media::Video) {
+        return Err("Video playback needs libmpv".into());
+    }
+    let reader = image::ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| format!("Can't open: {e}"))?;
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_uppercase())
+        .unwrap_or_default();
+    if reader.format().is_none() {
+        return Err(format!("Can't show {ext} images yet"));
+    }
+    let (w, h) = reader
+        .into_dimensions()
+        .map_err(|_| format!("Can't decode this {ext} file"))?;
+    if u64::from(w) * u64::from(h) > crate::viewer::MAX_PIXELS {
+        return Err("Too large to show".into());
+    }
+    let img = image::ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| format!("Can't open: {e}"))?
+        .decode()
+        .map_err(|_| format!("Can't decode this {ext} file"))?;
+    let img = match max_side {
+        Some(m) => img.thumbnail(m, m),
+        None => img,
+    };
+    Ok(Rc::new(img.to_rgba8()))
+}
+
+/// `img` turned `turns` quarter turns clockwise, as a Slint image.
+fn to_slint(img: &image::RgbaImage, turns: u8) -> slint::Image {
+    let turned;
+    let img = match turns % 4 {
+        0 => img,
+        1 => {
+            turned = image::imageops::rotate90(img);
+            &turned
+        }
+        2 => {
+            turned = image::imageops::rotate180(img);
+            &turned
+        }
+        _ => {
+            turned = image::imageops::rotate270(img);
+            &turned
+        }
+    };
+    let (w, h) = img.dimensions();
+    let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(img.as_raw(), w, h);
+    slint::Image::from_rgba8(buf)
+}
+
+/// `path` with the home folder written as `~`.
+pub fn tilde(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// The FILE section of the info panel.
+pub fn file_facts(
+    name: &str,
+    len: u64,
+    dims: Option<(u32, u32)>,
+    modified: String,
+) -> Vec<(String, String)> {
+    let ext = Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut facts = vec![
+        ("Size".into(), human(len)),
+        ("Type".into(), kind_name(&ext)),
+    ];
+    if let Some((w, h)) = dims {
+        facts.push(("Dimensions".into(), format!("{w} × {h}")));
+    }
+    facts.push(("Modified".into(), modified));
+    facts
+}
+
+fn sync_viewer(ui: &AppWindow, s: &State) {
+    let ctl = &s.ctl;
+    let Some(v) = ctl.viewer.as_ref() else {
+        ui.set_view_on(false);
+        *s.pics.borrow_mut() = Pics::default();
+        return;
+    };
+    let path = ctl.dir.join(v.current());
+    let mut pics = s.pics.borrow_mut();
+    if pics.full.as_ref().map(|f| &f.0) != Some(&path) {
+        pics.full = Some((path.clone(), decode(&path, None)));
+    }
+    let pic = pics.full.as_ref().map(|f| f.1.clone()).unwrap();
+    if let Ok(img) = &pic {
+        let key = (path.clone(), v.turns);
+        if pics.shown.as_ref().map(|s| (&s.0, s.1)) != Some((&key.0, key.1)) {
+            pics.shown = Some((key.0, key.1, to_slint(img, v.turns)));
+        }
+    }
+    let size = ui.window().size().to_logical(ui.window().scale_factor());
+    let view_w = size.width - if v.info { 332.0 } else { 0.0 };
+    let view = (view_w.max(1.0), size.height.max(1.0));
+    let name = v.current().to_string_lossy().into_owned();
+    ui.set_view_on(true);
+    ui.set_view_name(name.clone().into());
+    ui.set_view_counter(v.counter().into());
+    ui.set_view_info(v.info);
+    ui.set_view_strip(v.strip);
+    ui.set_view_video(crate::viewer::media(&path) == Some(crate::viewer::Media::Video));
+    let dims = match &pic {
+        Ok(img) => {
+            let (w, h) = img.dimensions();
+            ctl.view_geom.set(((w as f32, h as f32), view));
+            let (dw, dh) = if v.turns % 2 == 1 { (h, w) } else { (w, h) };
+            ui.set_view_image(pics.shown.as_ref().map(|s| s.2.clone()).unwrap_or_default());
+            ui.set_view_px_w(dw as f32);
+            ui.set_view_px_h(dh as f32);
+            // Fit is left to the UI, so it follows window resizes.
+            ui.set_view_scale(match v.zoom {
+                crate::viewer::Zoom::Fit => 0.0,
+                crate::viewer::Zoom::Scale(z) => z,
+            });
+            ui.set_view_note(SharedString::new());
+            ui.set_view_zoom(match v.zoom {
+                crate::viewer::Zoom::Fit => SharedString::new(),
+                crate::viewer::Zoom::Scale(z) => crate::viewer::percent(z).into(),
+            });
+            Some((w, h))
+        }
+        Err(why) => {
+            ctl.view_geom.set(((0.0, 0.0), view));
+            ui.set_view_image(slint::Image::default());
+            ui.set_view_px_w(0.0);
+            ui.set_view_px_h(0.0);
+            ui.set_view_note(why.as_str().into());
+            ui.set_view_zoom(SharedString::new());
+            None
+        }
+    };
+    let window = v.strip_window(STRIP_TILES);
+    let mut tiles = Vec::new();
+    for i in window {
+        let p = ctl.dir.join(&v.items[i]);
+        let shot = pics
+            .tiles
+            .entry(p.clone())
+            .or_insert_with(|| {
+                decode(&p, Some(144)).map_or_else(|_| slint::Image::default(), |i| to_slint(&i, 0))
+            })
+            .clone();
+        tiles.push(crate::ViewTile {
+            shot,
+            current: i == v.index,
+        });
+    }
+    ui.set_view_tiles(Rc::new(VecModel::from(tiles)).into());
+    let entry = ctl
+        .listing
+        .entries()
+        .iter()
+        .find(|e| &e.name == v.current());
+    let now = ctl
+        .clock
+        .map_or_else(|| secs(std::time::SystemTime::now()), |c| c.0);
+    let modified = entry.map_or_else(String::new, |e| {
+        let off = |t| {
+            ctl.clock
+                .map_or_else(|| crate::model::local_offset(t), |c| c.1)
+        };
+        crate::model::format_modified(secs(e.mtime), now, off)
+    });
+    let facts: Vec<crate::Fact> = file_facts(&name, entry.map_or(0, |e| e.len), dims, modified)
+        .into_iter()
+        .map(|(key, value)| crate::Fact {
+            key: key.into(),
+            value: value.into(),
+        })
+        .collect();
+    ui.set_view_facts(Rc::new(VecModel::from(facts)).into());
+    ui.set_view_dir(tilde(ctl.crumb_dir(), ctl.env.home.as_deref()).into());
+}
+
 fn redraw(ui: &AppWindow, s: &State) {
+    sync_viewer(ui, s);
     let ctl = &s.ctl;
     sync_drop_dest(s);
     remember_prefs(s);
@@ -3566,6 +3854,90 @@ mod tests {
         c.pointer(1, 1, 1, true, Mods::default());
         assert!(c.rows().iter().all(|r| !r.drop));
         assert_eq!(c.pointer(1, 2, 1, true, Mods::default()), Action::Redraw);
+    }
+
+    #[test]
+    fn return_on_a_photo_opens_the_viewer_and_esc_lands_on_the_last_one() {
+        let mut c = setup("viewer-open");
+        fs::write(c.dir.join("notes.txt"), b"n").unwrap();
+        c.reload().unwrap();
+        select(&mut c, "notes.txt");
+        assert_eq!(c.key(keys::RETURN, false, false), Action::None, "not media");
+        assert!(c.viewer.is_none());
+        select(&mut c, "a.jpg");
+        assert_eq!(c.key(keys::RETURN, false, false), Action::Redraw);
+        let v = c.viewer.as_ref().unwrap();
+        assert_eq!(v.items, vec![OsString::from("a.jpg"), "b.jpg".into()]);
+        assert_eq!(c.key("l", false, false), Action::Redraw);
+        assert_eq!(
+            c.key(keys::DELETE, false, false),
+            Action::None,
+            "browser keys sleep"
+        );
+        assert_eq!(c.key("q", false, false), Action::Redraw);
+        assert!(c.viewer.is_none());
+        assert_eq!(c.listing.cursor(), Some(&OsString::from("b.jpg")));
+        assert!(c.listing.selection().contains(&OsString::from("b.jpg")));
+    }
+
+    #[test]
+    fn filmstrip_tiles_jump_to_their_item() {
+        let mut c = setup("viewer-strip");
+        select(&mut c, "a.jpg");
+        c.key(keys::RETURN, false, false);
+        assert_eq!(c.viewer_go(1), Action::Redraw);
+        assert_eq!(c.viewer.as_ref().unwrap().current(), "b.jpg");
+        assert_eq!(c.viewer_go(9), Action::Redraw, "past the end clamps");
+        assert_eq!(c.viewer.as_ref().unwrap().current(), "b.jpg");
+    }
+
+    #[test]
+    fn the_info_panel_lists_the_file_facts() {
+        let f = file_facts("a.jpg", 4_600, Some((320, 180)), "15:30".into());
+        let f: Vec<(&str, &str)> = f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            f,
+            [
+                ("Size", "4.6 KB"),
+                ("Type", "JPEG image"),
+                ("Dimensions", "320 × 180"),
+                ("Modified", "15:30")
+            ]
+        );
+        assert_eq!(file_facts("x.mp4", 0, None, String::new()).len(), 3);
+        let home = Path::new("/home/sky");
+        assert_eq!(
+            tilde(Path::new("/home/sky/Pictures"), Some(home)),
+            "~/Pictures"
+        );
+        assert_eq!(tilde(home, Some(home)), "~");
+        assert_eq!(tilde(Path::new("/media/x"), Some(home)), "/media/x");
+    }
+
+    #[test]
+    fn decode_reads_real_stills_and_explains_the_rest() {
+        let dir = std::env::temp_dir().join(format!("robin-decode-{}", std::process::id()));
+        crate::thumbs::write_fixture_stills(&dir).unwrap();
+        let img = decode(&dir.join("dune-sunset-0412.jpg"), None).unwrap();
+        assert_eq!(img.dimensions(), (320, 180));
+        let small = decode(&dir.join("speeder-frame.png"), Some(144)).unwrap();
+        assert_eq!(small.dimensions(), (144, 81));
+        fs::write(dir.join("x.heic"), b"ftypheic").unwrap();
+        assert_eq!(
+            decode(&dir.join("x.heic"), None).unwrap_err(),
+            "Can't show HEIC images yet"
+        );
+        fs::write(dir.join("x.mp4"), b"v").unwrap();
+        assert_eq!(
+            decode(&dir.join("x.mp4"), None).unwrap_err(),
+            "Video playback needs libmpv"
+        );
+        fs::write(dir.join("broken.png"), b"\x89PNG\r\n\x1a\nnope").unwrap();
+        assert_eq!(
+            decode(&dir.join("broken.png"), None).unwrap_err(),
+            "Can't decode this PNG file"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

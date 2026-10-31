@@ -95,6 +95,16 @@ export struct GridLine {
     g5: string, n5: string, r5: int, b5: string, s5: bool, h5: bool, f5: bool,
 }
 
+export struct ViewTile {
+    shot: image,
+    current: bool,
+}
+
+export struct Fact {
+    key: string,
+    value: string,
+}
+
 export struct MapCell {
     x: length,
     y: length,
@@ -618,6 +628,27 @@ export component AppWindow inherits Window {
     in property <float> nav-phase: -1;
     in property <string> overlay: "";
     in property <string> viewer: "";
+    // The real viewer (harness), driven by src/viewer.rs.
+    in property <bool> view-on: false;
+    in property <image> view-image;
+    in property <string> view-name;
+    in property <string> view-counter;
+    in property <string> view-zoom;
+    // The image's pixel size, and the zoom: 0 fits (never above 100%).
+    in property <float> view-px-w;
+    in property <float> view-px-h;
+    in property <float> view-scale: 0;
+    in property <bool> view-info: false;
+    in property <bool> view-strip: true;
+    in property <bool> view-video: false;
+    // Why there is no picture (undecodable, or video without libmpv).
+    in property <string> view-note;
+    in property <string> view-dir;
+    in property <[ViewTile]> view-tiles;
+    in property <[Fact]> view-facts;
+    callback view-close();
+    callback view-go(int);
+    callback view-key(string);
     in property <string> stats-mode: "";
     in property <[MapCell]> map-cells;
     in property <string> status-left: "15 items · 1 hidden";
@@ -2032,6 +2063,124 @@ export component AppWindow inherits Window {
         }
     }
 
+    if !harness && view-on: Rectangle {
+        clip: true;
+        background: #000000;
+        property <length> open-w: view-info ? self.width - 332px : self.width;
+        Rectangle { background: bg.with-alpha(0.30); }
+        TouchArea { }
+        // The pixel size is already turned (src/app.rs turns the pixels).
+        property <float> fit: view-px-w <= 0 || view-px-h <= 0 ? 1 : min(1, (open-w / 1px) / view-px-w, (self.height / 1px) / view-px-h);
+        property <float> drawn: view-scale > 0 ? view-scale : fit;
+        Image {
+            source: view-image;
+            width: view-px-w * drawn * 1px;
+            height: view-px-h * drawn * 1px;
+            x: (open-w - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            image-fit: fill;
+        }
+        if view-note != "": VerticalLayout {
+            x: 0px;
+            width: open-w;
+            alignment: center;
+            spacing: 8px;
+            Text { text: view-video ? "󰕧" : "󰈟"; font-size: 48px; color: muted; horizontal-alignment: center; }
+            Text { text: view-note; font-size: 13px; color: muted; horizontal-alignment: center; }
+        }
+        Rectangle {
+            y: 16px;
+            x: (open-w - self.width) / 2;
+            width: min(560px, open-w - 32px);
+            height: 40px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 12px;
+                Text {
+                    text: "󰁍"; font-size: 16px; color: text; vertical-alignment: center;
+                    TouchArea { clicked => { root.view-close(); } }
+                }
+                Text { text: view-name; font-size: 13px; font-weight: 700; color: text; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                Text { text: view-counter; font-size: 11px; color: muted; vertical-alignment: center; }
+                Text {
+                    text: "󰋽"; font-size: 16px; width: 20px; color: view-info ? accent : text; vertical-alignment: center;
+                    TouchArea { clicked => { root.view-key("i"); } }
+                }
+            }
+        }
+        if view-strip && view-tiles.length > 1: Rectangle {
+            y: parent.height - 16px - 46px - 12px - self.height;
+            x: (open-w - self.width) / 2;
+            width: view-tiles.length * 76px + 8px;
+            height: 60px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            HorizontalLayout {
+                padding: 6px;
+                spacing: 4px;
+                for t[i] in view-tiles: FilmTile {
+                    shot: t.shot; current: t.current; ring: root.accent;
+                    TouchArea { clicked => { root.view-go(i); } }
+                }
+            }
+        }
+        Rectangle {
+            y: parent.height - 16px - 46px;
+            x: (open-w - self.width) / 2;
+            width: 300px;
+            height: 46px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            HorizontalLayout {
+                alignment: center;
+                spacing: 18px;
+                for k in [{g: "󰁍", k: "h"}, {g: "−", k: "-"}, {g: "fit", k: "0"}, {g: "1:1", k: "1"}, {g: "+", k: "+"}, {g: "󰑙", k: "r"}, {g: "󰁔", k: "l"}]: Text {
+                    text: k.g; font-size: 14px; color: text; vertical-alignment: center;
+                    TouchArea { clicked => { root.view-key(k.k); } }
+                }
+            }
+        }
+        if view-zoom != "": Rectangle {
+            x: open-w - 16px - self.width;
+            y: 16px;
+            width: 64px;
+            height: 28px;
+            background: bg.with-alpha(0.86);
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: hairline;
+            Text { text: view-zoom; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        if view-info: Rectangle {
+            x: parent.width - 16px - 300px;
+            y: 16px;
+            width: 300px;
+            height: parent.height - 32px;
+            background: bg.with-alpha(0.92);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 0px;
+                alignment: start;
+                Text { text: view-name; font-size: 13px; font-weight: 700; color: text; height: 20px; overflow: elide; }
+                Text { text: view-dir; font-size: 11px; color: muted; height: 18px; overflow: elide; }
+                Rectangle { height: 12px; }
+                Text { text: "FILE"; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; height: 20px; }
+                for f in view-facts: MetaRow { key: f.key; value: f.value; ink: root.text; muted-ink: root.muted; }
+            }
+        }
+    }
     if !harness && viewer != "": Rectangle {
         clip: true;
         property <length> open-w: viewer == "info" ? parent.width - 328px : parent.width;
