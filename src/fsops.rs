@@ -1629,7 +1629,13 @@ pub fn restore_from_trash(
     let info_dir = trash.open_dir_nofollow(std::ffi::OsStr::new("info"))?;
     let stored_c = component(stored)?;
     let name_c = component(name)?;
-    rename_noreplace(files.as_fd(), &stored_c, dest_parent.as_fd(), &name_c).map_err(|e| {
+    match rename_noreplace(files.as_fd(), &stored_c, dest_parent.as_fd(), &name_c) {
+        Err(e) if e == Errno::XDEV => {
+            return restore_across(&files, &info_dir, stored, dest_parent, name)
+        }
+        other => other,
+    }
+    .map_err(|e| {
         if e == Errno::EXIST {
             Error::Message(format!(
                 "{} already exists, left it in the trash",
@@ -1640,11 +1646,204 @@ pub fn restore_from_trash(
         }
     })?;
     rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(name, e))?;
-    let info = std::ffi::OsString::from(format!("{}.trashinfo", stored.to_string_lossy()));
+    forget_trashinfo(&info_dir, stored)
+}
+
+/// Restore across filesystems without ever holding the only copy in
+/// flight: copy under a hidden name, compare it byte for byte with the
+/// trashed original, fsync, rename into place, and only then remove the
+/// trashed copy and its trashinfo. Any failure before the rename removes
+/// the partial copy and leaves the trash as it was.
+pub fn restore_across(
+    files: &DirFd,
+    info_dir: &DirFd,
+    stored: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    name: &std::ffi::OsStr,
+) -> Result<()> {
+    let tmp = std::ffi::OsString::from(partial_name());
+    let placed = (|| -> Result<()> {
+        let cancel = Cancel::new();
+        let mut policy = ConflictPolicy::new();
+        let mut never = |_: &ConflictPrompt| -> Result<ConflictChoice> { Err(Error::Cancelled) };
+        let mut opts = MoveOpts {
+            force_copy: true,
+            fail_before_unlink: false,
+            copy: CopyOpts {
+                cancel: &cancel,
+                policy: &mut policy,
+                ask: &mut never,
+            },
+            report: TransferReport::default(),
+            check_removable: false,
+            keep_source: true,
+        };
+        if move_child(files, stored, dest_parent, &tmp, &mut opts)? != CopyOutcome::Copied
+            || !opts.report.skipped.is_empty()
+        {
+            return Err(Error::Message(format!(
+                "{} could not be copied whole, left it in the trash",
+                name.to_string_lossy()
+            )));
+        }
+        if !same_tree(files, stored, dest_parent, &tmp)? {
+            return Err(Error::Message(format!(
+                "the copy of {} did not match, left it in the trash",
+                name.to_string_lossy()
+            )));
+        }
+        rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(name, e))?;
+        let tmp_c = component(&tmp)?;
+        let name_c = component(name)?;
+        rename_noreplace(dest_parent.as_fd(), &tmp_c, dest_parent.as_fd(), &name_c).map_err(
+            |e| {
+                if e == Errno::EXIST {
+                    Error::Message(format!(
+                        "{} already exists, left it in the trash",
+                        name.to_string_lossy()
+                    ))
+                } else {
+                    Error::from_errno(name, e)
+                }
+            },
+        )?;
+        rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(name, e))
+    })();
+    if let Err(e) = placed {
+        let _ = remove_child(dest_parent, &tmp, &mut |_| {}, &Cancel::new());
+        return Err(e);
+    }
+    // Both copies exist now; a failure here leaves a duplicate, never a loss.
+    remove_child(files, stored, &mut |_| {}, &Cancel::new()).map_err(|e| {
+        Error::Message(format!(
+            "restored {}, but the trashed copy stayed: {e}",
+            name.to_string_lossy()
+        ))
+    })?;
+    forget_trashinfo(info_dir, stored)
+}
+
+/// Same kinds, sizes, bytes and link targets all the way down.
+fn same_tree(
+    a_dir: &DirFd,
+    a: &std::ffi::OsStr,
+    b_dir: &DirFd,
+    b: &std::ffi::OsStr,
+) -> Result<bool> {
+    let (a_c, b_c) = (component(a)?, component(b)?);
+    let sa = rustix::fs::statat(a_dir.as_fd(), a_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(a, e))?;
+    let sb = rustix::fs::statat(b_dir.as_fd(), b_c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(b, e))?;
+    let ifmt = libc::S_IFMT;
+    if sa.st_mode & ifmt != sb.st_mode & ifmt {
+        return Ok(false);
+    }
+    if is_dir(sa.st_mode) {
+        let (da, db) = (a_dir.open_dir_nofollow(a)?, b_dir.open_dir_nofollow(b)?);
+        let mut na: Vec<_> = da.list()?.into_iter().map(|e| e.name).collect();
+        let mut nb: Vec<_> = db.list()?.into_iter().map(|e| e.name).collect();
+        na.sort();
+        nb.sort();
+        if na != nb {
+            return Ok(false);
+        }
+        for n in &na {
+            if !same_tree(&da, n, &db, n)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    if is_lnk(sa.st_mode) {
+        let la = rustix::fs::readlinkat(a_dir.as_fd(), a_c.as_c_str(), Vec::new())
+            .map_err(|e| Error::from_errno(a, e))?;
+        let lb = rustix::fs::readlinkat(b_dir.as_fd(), b_c.as_c_str(), Vec::new())
+            .map_err(|e| Error::from_errno(b, e))?;
+        return Ok(la == lb);
+    }
+    if sa.st_size != sb.st_size {
+        return Ok(false);
+    }
+    let open = |d: &DirFd, c: &std::ffi::CString, n: &std::ffi::OsStr| -> Result<File> {
+        rustix::fs::openat(
+            d.as_fd(),
+            c.as_c_str(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|e| Error::from_errno(n, e))
+    };
+    let (mut fa, mut fb) = (open(a_dir, &a_c, a)?, open(b_dir, &b_c, b)?);
+    let io = |e: std::io::Error| Error::Message(format!("{}: {e}", a.to_string_lossy()));
+    let (mut ba, mut bb) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    loop {
+        let n = fa.read(&mut ba).map_err(io)?;
+        if n == 0 {
+            return Ok(fb.read(&mut bb[..1]).map_err(io)? == 0);
+        }
+        fb.read_exact(&mut bb[..n]).map_err(io)?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Remove `info/<stored>.trashinfo` once its item has left the trash.
+pub fn forget_trashinfo(info_dir: &DirFd, stored: &std::ffi::OsStr) -> Result<()> {
+    let mut info = stored.to_os_string();
+    info.push(".trashinfo");
     let info_c = component(&info)?;
     match rustix::fs::unlinkat(info_dir.as_fd(), info_c.as_c_str(), AtFlags::empty()) {
         Ok(()) | Err(Errno::NOENT) => Ok(()),
         Err(err) => Err(Error::from_errno(&info, err)),
+    }
+}
+
+/// Whether a restore put the item back or the user skipped it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restored {
+    Restored,
+    Skipped,
+}
+
+/// [`restore_from_trash`], asking through the conflict dialog when
+/// `name` is taken. Keep both restores under a fresh name; Replace calls
+/// `make_room` to clear the way first (the window moves the existing
+/// item to the trash, so nothing is lost).
+pub fn restore_asking(
+    trash: &DirFd,
+    stored: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    name: &std::ffi::OsStr,
+    opts: &mut CopyOpts<'_>,
+    make_room: &mut dyn FnMut(&DirFd, &std::ffi::OsStr) -> Result<()>,
+) -> Result<Restored> {
+    let name_c = component(name)?;
+    match rustix::fs::statat(
+        dest_parent.as_fd(),
+        name_c.as_c_str(),
+        AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Err(Errno::NOENT) => {
+            return restore_from_trash(trash, stored, dest_parent, name)
+                .map(|()| Restored::Restored)
+        }
+        Err(e) => return Err(Error::from_errno(name, e)),
+        Ok(_) => {}
+    }
+    let files = trash.open_dir_nofollow(std::ffi::OsStr::new("files"))?;
+    match settle_conflict(&files, stored, dest_parent, name, opts)? {
+        Conflict::Skip => Ok(Restored::Skipped),
+        Conflict::Rename => {
+            let fresh = fresh_name(dest_parent, name)?;
+            restore_from_trash(trash, stored, dest_parent, &fresh).map(|()| Restored::Restored)
+        }
+        Conflict::Replace => {
+            make_room(dest_parent, name)?;
+            restore_from_trash(trash, stored, dest_parent, name).map(|()| Restored::Restored)
+        }
     }
 }
 
@@ -2248,6 +2447,81 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn across_fixture(label: &str) -> (std::path::PathBuf, DirFd, DirFd, DirFd) {
+        let root = scratch(label);
+        std::fs::create_dir_all(root.join("trash/files/album/sub")).unwrap();
+        std::fs::create_dir_all(root.join("trash/info")).unwrap();
+        std::fs::create_dir_all(root.join("back")).unwrap();
+        std::fs::write(root.join("trash/files/album/a.jpg"), vec![7u8; 200_000]).unwrap();
+        std::fs::write(root.join("trash/files/album/sub/b"), "bee").unwrap();
+        std::os::unix::fs::symlink("a.jpg", root.join("trash/files/album/link")).unwrap();
+        std::fs::write(root.join("trash/info/album.trashinfo"), "[Trash Info]").unwrap();
+        let files = DirFd::open(&root.join("trash/files")).unwrap();
+        let info = DirFd::open(&root.join("trash/info")).unwrap();
+        let back = DirFd::open(&root.join("back")).unwrap();
+        (root, files, info, back)
+    }
+
+    #[test]
+    fn restore_across_devices_copies_verifies_then_empties_the_trash() {
+        let (root, files, info, back) = across_fixture("restore-across");
+        restore_across(&files, &info, "album".as_ref(), &back, "album".as_ref()).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("back/album/a.jpg")).unwrap(),
+            vec![7u8; 200_000]
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("back/album/sub/b")).unwrap(),
+            "bee"
+        );
+        assert_eq!(
+            std::fs::read_link(root.join("back/album/link")).unwrap(),
+            Path::new("a.jpg")
+        );
+        assert!(!root.join("trash/files/album").exists());
+        assert!(!root.join("trash/info/album.trashinfo").exists());
+        assert_eq!(std::fs::read_dir(root.join("back")).unwrap().count(), 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restore_across_devices_failing_before_the_rename_keeps_the_trash_whole() {
+        let (root, files, info, back) = across_fixture("restore-across-fail");
+        std::fs::write(root.join("back/album"), "taken").unwrap();
+        let err = restore_across(&files, &info, "album".as_ref(), &back, "album".as_ref());
+        assert!(err.is_err());
+        assert_eq!(
+            std::fs::read(root.join("trash/files/album/a.jpg"))
+                .unwrap()
+                .len(),
+            200_000
+        );
+        assert!(root.join("trash/info/album.trashinfo").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("back/album")).unwrap(),
+            "taken"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("back")).unwrap().count(),
+            1,
+            "no partial left"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn same_tree_notices_a_changed_byte() {
+        let (root, files, _info, back) = across_fixture("same-tree");
+        std::fs::create_dir_all(root.join("back/album/sub")).unwrap();
+        std::fs::write(root.join("back/album/a.jpg"), vec![7u8; 200_000]).unwrap();
+        std::fs::write(root.join("back/album/sub/b"), "bee").unwrap();
+        std::os::unix::fs::symlink("a.jpg", root.join("back/album/link")).unwrap();
+        assert!(same_tree(&files, "album".as_ref(), &back, "album".as_ref()).unwrap());
+        std::fs::write(root.join("back/album/sub/b"), "bed").unwrap();
+        assert!(!same_tree(&files, "album".as_ref(), &back, "album".as_ref()).unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn replace_ask(prompt: &ConflictPrompt) -> Result<ConflictChoice> {

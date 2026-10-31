@@ -4,6 +4,7 @@
 //! directly.
 
 use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -239,6 +240,9 @@ pub struct Job {
     pub dest: PathBuf,
     /// What a Restore job puts back; empty otherwise.
     pub restore: Vec<Trashed>,
+    /// Empty Trash: after the deletes, prune orphan trashinfo and stale
+    /// directorysizes lines.
+    pub empty_trash: bool,
 }
 
 impl Job {
@@ -249,6 +253,7 @@ impl Job {
             names,
             dest: dest.to_path_buf(),
             restore: Vec::new(),
+            empty_trash: false,
         }
     }
 
@@ -269,6 +274,7 @@ impl Job {
             names,
             dest: first,
             restore: items,
+            empty_trash: false,
         }
     }
 
@@ -365,6 +371,8 @@ pub struct Outcome {
     /// Moves refused up front, for the move-refused dialog.
     pub refused: Vec<(OsString, Vec<KeptEntry>)>,
     pub trashed: Vec<Trashed>,
+    /// Folders a restore had to recreate, as shown to the user (`~/…`).
+    pub recreated: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -391,6 +399,15 @@ impl Outcome {
         };
         if kind == JobKind::Restore {
             let stayed = self.failed.len();
+            if let [folder] = self.recreated.as_slice() {
+                text = if self.done == 1 {
+                    format!("Restored to {folder} (folder recreated)")
+                } else {
+                    format!("{text}, recreated {folder}")
+                };
+            } else if self.recreated.len() > 1 {
+                text = format!("{text}, recreated {} folders", self.recreated.len());
+            }
             return Toast {
                 tone: if stayed == 0 { "" } else { "warning" },
                 text: if stayed == 0 {
@@ -628,14 +645,30 @@ pub fn run_asking(
     let mut out = Outcome::default();
     let total = job.names.len();
     if job.kind == JobKind::Restore {
+        let mut policy = ConflictPolicy::new();
         for (i, t) in job.restore.iter().enumerate() {
+            if cancel.is_cancelled() {
+                out.cancelled = true;
+                break;
+            }
             progress(&Progress {
                 done: i,
                 total,
                 current: job.names[i].to_string_lossy().into_owned(),
             });
-            match restore_one(t) {
-                Ok(()) => out.done += 1,
+            let item = Cancel::new();
+            let mut opts = CopyOpts {
+                cancel: &item,
+                policy: &mut policy,
+                ask: &mut *ask,
+            };
+            match restore_one(t, env, &mut opts, &mut out.recreated) {
+                Ok(fsops::Restored::Restored) => out.done += 1,
+                Ok(fsops::Restored::Skipped) => {}
+                Err(Error::Cancelled) => {
+                    out.cancelled = true;
+                    break;
+                }
                 Err(e) => out.failed.push(format!("{}: {e}", t.original.display())),
             }
         }
@@ -674,6 +707,11 @@ pub fn run_asking(
         },
         _ => None,
     };
+    // Deleting inside a trash's files/ also drops each item's trashinfo.
+    let info_dir = match job.kind {
+        JobKind::Delete => trash_info_dir(&job.src, env),
+        _ => None,
+    };
     for (i, name) in job.names.iter().enumerate() {
         if cancel.is_cancelled() {
             out.cancelled = true;
@@ -701,7 +739,11 @@ pub fn run_asking(
                 }
             }
             JobKind::Trash => trash_one(job, &src, trash.as_ref().unwrap(), name, &mut out),
-            JobKind::Delete => fsops::remove_child(&src, name, &mut |_| {}, &item),
+            JobKind::Delete => fsops::remove_child(&src, name, &mut |_| {}, &item).and_then(|()| {
+                info_dir
+                    .as_ref()
+                    .map_or(Ok(()), |d| fsops::forget_trashinfo(d, name))
+            }),
             JobKind::Restore => unreachable!("handled above"),
         };
         match result {
@@ -715,6 +757,13 @@ pub fn run_asking(
             Err(e) => out.failed.push(format!("{}: {e}", name.to_string_lossy())),
         }
     }
+    if job.empty_trash {
+        if let Some(trash) = job.src.parent().filter(|_| info_dir.is_some()) {
+            if let Err(e) = tidy_trash(trash) {
+                out.failed.push(format!("trash info: {e}"));
+            }
+        }
+    }
     if cancel.is_cancelled() && out.done + out.failed.len() + out.refused.len() < total {
         out.cancelled = true;
     }
@@ -724,6 +773,91 @@ pub fn run_asking(
         current: String::new(),
     });
     out
+}
+
+/// The `info/` beside `dir` when `dir` is a trash's `files/`.
+fn trash_info_dir(dir: &Path, env: &Env) -> Option<DirFd> {
+    let trash = dir.parent()?;
+    let uid = rustix::process::getuid().as_raw();
+    if dir.file_name()? != "files" || !is_trash_dir(trash, &env.home_trash, uid) {
+        return None;
+    }
+    let parent = DirFd::open(trash).ok()?;
+    parent.open_dir_nofollow(OsStr::new("info")).ok()
+}
+
+/// Drop trashinfo whose item is gone and directorysizes lines for
+/// folders no longer in files/, so nothing stale outlives Empty Trash.
+fn tidy_trash(trash: &Path) -> std::io::Result<()> {
+    let files = trash.join("files");
+    if let Ok(infos) = std::fs::read_dir(trash.join("info")) {
+        for entry in infos.flatten() {
+            let name = entry.file_name();
+            let Some(stem) = name.as_bytes().strip_suffix(b".trashinfo") else {
+                continue;
+            };
+            let item = files.join(OsStr::from_bytes(stem));
+            if std::fs::symlink_metadata(&item).is_err() {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+    }
+    let sizes = trash.join("directorysizes");
+    let Ok(text) = std::fs::read(&sizes) else {
+        return Ok(());
+    };
+    let kept: Vec<&[u8]> = text
+        .split(|b| *b == b'\n')
+        .filter(|line| {
+            let Some(enc) = line.rsplit(|b| *b == b' ').next() else {
+                return false;
+            };
+            std::str::from_utf8(enc)
+                .ok()
+                .and_then(crate::trash::unescape)
+                .filter(|n| !n.is_empty())
+                .is_some_and(|n| {
+                    std::fs::symlink_metadata(files.join(OsStr::from_bytes(&n))).is_ok()
+                })
+        })
+        .collect();
+    if kept.is_empty() {
+        return std::fs::remove_file(&sizes);
+    }
+    let mut out = kept.join(&b'\n');
+    out.push(b'\n');
+    let tmp = trash.join(".directorysizes.robin");
+    std::fs::write(&tmp, out)?;
+    std::fs::rename(tmp, sizes)
+}
+
+/// `~/…` under home, the full path elsewhere.
+fn shown_path(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rel) if rel.as_os_str().is_empty() => "~".into(),
+        Some(rel) => format!("~/{}", rel.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// Only the home trash and the spec's per-device trashes,
+/// `$topdir/.Trash/$uid` and `$topdir/.Trash-$uid`. A user's own folder
+/// called `Trash` is just a folder.
+fn is_trash_dir(trash: &Path, home_trash: &Path, uid: u32) -> bool {
+    if trash == home_trash {
+        return true;
+    }
+    let Some(name) = trash.file_name() else {
+        return false;
+    };
+    if name.to_str() == Some(&format!(".Trash-{uid}")) {
+        return true;
+    }
+    name.to_str() == Some(&uid.to_string())
+        && trash
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|p| p == ".Trash")
 }
 
 fn keep_both(_: &fsops::ConflictPrompt) -> Result<ConflictChoice> {
@@ -841,16 +975,44 @@ pub(crate) fn undo(items: &[Trashed]) -> (usize, Vec<String>) {
     (out.done, out.failed)
 }
 
-/// Put one trashed entry back where it was, never over a new file.
-fn restore_one(t: &Trashed) -> Result<()> {
+/// Put one trashed entry back where it was, asking when the name is taken.
+fn restore_one(
+    t: &Trashed,
+    env: &Env,
+    opts: &mut CopyOpts<'_>,
+    recreated: &mut Vec<String>,
+) -> Result<fsops::Restored> {
     let parent = t
         .original
         .parent()
         .ok_or_else(|| Error::Message("no parent folder".into()))?;
     let name = t.original.file_name().ok_or(Error::InvalidName)?;
     let trash = DirFd::open(&t.trash)?;
+    // Like Nautilus: a folder deleted since is recreated, not asked about.
+    if std::fs::symlink_metadata(parent).is_err() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Message(format!("{}: {e}", parent.display())))?;
+        let shown = shown_path(parent, env.home.as_deref());
+        if !recreated.contains(&shown) {
+            recreated.push(shown);
+        }
+    }
     let dest = DirFd::open(parent)?;
-    fsops::restore_from_trash(&trash, &t.stored, &dest, name)
+    // Replace moves what is there now to the trash rather than deleting it.
+    let mut make_room = |dir: &DirFd, name: &OsStr| -> Result<()> {
+        let target = trash_target(parent, env)?;
+        let original = parent.join(name);
+        let info = match &target.top {
+            Some(top) => original
+                .strip_prefix(top)
+                .unwrap_or(&original)
+                .to_string_lossy()
+                .into_owned(),
+            None => original.to_string_lossy().into_owned(),
+        };
+        fsops::place_in_trash(dir, name, &target.fd, target.choice, &info).map(|_| ())
+    };
+    fsops::restore_asking(&trash, &t.stored, &dest, name, opts, &mut make_room)
 }
 
 #[cfg(test)]
@@ -1149,19 +1311,228 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    #[test]
-    fn undo_never_replaces_a_new_file() {
-        let root = scratch("undo-clash");
+    /// Trash `a` ("old"), write a new `a` ("new"), then restore answering `pick`.
+    fn restore_over_new(label: &str, pick: fsops::Conflict) -> (PathBuf, Outcome, Vec<String>) {
+        let root = scratch(label);
         let dir = root.join("work");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("a"), "old").unwrap();
-        let job = Job::new(JobKind::Trash, &dir, names(&["a"]), &dir);
-        let out = run(&job, &env(&root), &Cancel::new(), &mut |_| {});
+        let e = env(&root);
+        let out = run(
+            &Job::new(JobKind::Trash, &dir, names(&["a"]), &dir),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+        );
         fs::write(dir.join("a"), "new").unwrap();
-        let (restored, failed) = undo(&out.trashed);
-        assert_eq!((restored, failed.len()), (0, 1));
-        assert_eq!(fs::read_to_string(dir.join("a")).unwrap(), "new");
+        let mut asked = Vec::new();
+        let back = run_asking(
+            &Job::restore(out.trashed),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+            &mut |p| {
+                asked.push(p.name.clone());
+                Ok(ConflictChoice {
+                    action: pick,
+                    apply_all: false,
+                })
+            },
+        );
+        (root, back, asked)
+    }
+
+    #[test]
+    fn deleting_in_the_trash_drops_the_trashinfo_too() {
+        let root = scratch("trash-delete");
+        fs::write(root.join("a"), "x").unwrap();
+        let e = env(&root);
+        run(
+            &Job::new(JobKind::Trash, &root, names(&["a"]), &root),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        let files = root.join("trash/files");
+        let out = run(
+            &Job::new(JobKind::Delete, &files, names(&["a"]), &files),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        assert_eq!(out.done, 1, "{out:?}");
+        assert!(!files.join("a").exists());
+        assert!(!root.join("trash/info/a.trashinfo").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn deleting_in_a_folder_merely_named_files_keeps_its_neighbours() {
+        let root = scratch("files-delete");
+        fs::create_dir_all(root.join("proj/files")).unwrap();
+        fs::create_dir_all(root.join("proj/info")).unwrap();
+        fs::write(root.join("proj/files/a"), "x").unwrap();
+        fs::write(root.join("proj/info/a.trashinfo"), "mine").unwrap();
+        let files = root.join("proj/files");
+        run(
+            &Job::new(JobKind::Delete, &files, names(&["a"]), &files),
+            &env(&root),
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        assert!(root.join("proj/info/a.trashinfo").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restore_recreates_a_missing_folder_and_says_so() {
+        let root = scratch("restore-parent");
+        fs::create_dir_all(root.join("Documents/Finance")).unwrap();
+        fs::write(root.join("Documents/Finance/q3.ods"), b"q3").unwrap();
+        let e = env(&root);
+        let out = run(
+            &Job::new(
+                JobKind::Trash,
+                &root.join("Documents/Finance"),
+                names(&["q3.ods"]),
+                &root,
+            ),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        fs::remove_dir_all(root.join("Documents")).unwrap();
+        let back = run(
+            &Job::restore(out.trashed.clone()),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        assert_eq!((back.done, back.failed.len()), (1, 0), "{back:?}");
+        assert_eq!(
+            fs::read(root.join("Documents/Finance/q3.ods")).unwrap(),
+            b"q3"
+        );
+        assert_eq!(
+            back.toast(JobKind::Restore).text,
+            "Restored to ~/Documents/Finance (folder recreated)"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn empty_trash_prunes_orphans_and_reports_what_stayed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("empty-tidy");
+        let t = root.join("trash");
+        fs::create_dir_all(t.join("files/stuck/inner")).unwrap();
+        fs::create_dir_all(t.join("info")).unwrap();
+        fs::write(t.join("files/a"), "a").unwrap();
+        fs::write(t.join("files/stuck/inner/x"), "x").unwrap();
+        fs::write(t.join("info/a.trashinfo"), "i").unwrap();
+        fs::write(t.join("info/stuck.trashinfo"), "i").unwrap();
+        fs::write(t.join("info/ghost.trashinfo"), "orphan").unwrap();
+        fs::write(
+            t.join("directorysizes"),
+            "4096 1 stuck\n4096 1 gone%20dir\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            t.join("files/stuck/inner"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        let files = t.join("files");
+        let mut job = Job::new(JobKind::Delete, &files, names(&["a", "stuck"]), &files);
+        job.empty_trash = true;
+        let out = run(&job, &env(&root), &Cancel::new(), &mut |_| {});
+        fs::set_permissions(
+            t.join("files/stuck/inner"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert_eq!(out.done, 1);
+        let toast = out.toast(JobKind::Delete);
+        assert_eq!(toast.text, "Deleted 1 item, 1 failed");
+        assert!(
+            toast.details.iter().any(|d| d.starts_with("stuck: ")),
+            "{:?}",
+            toast.details
+        );
+        assert!(!t.join("info/ghost.trashinfo").exists());
+        assert!(!t.join("info/a.trashinfo").exists());
+        assert!(
+            t.join("info/stuck.trashinfo").exists(),
+            "kept with its item"
+        );
+        assert_eq!(
+            fs::read_to_string(t.join("directorysizes")).unwrap(),
+            "4096 1 stuck\n"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_projects_trash_folder_is_not_a_trash() {
+        let root = scratch("projects-trash");
+        fs::create_dir_all(root.join("Projects/Trash/files")).unwrap();
+        fs::create_dir_all(root.join("Projects/Trash/info")).unwrap();
+        fs::write(root.join("Projects/Trash/files/a"), "x").unwrap();
+        fs::write(root.join("Projects/Trash/info/a.trashinfo"), "mine").unwrap();
+        let files = root.join("Projects/Trash/files");
+        run(
+            &Job::new(JobKind::Delete, &files, names(&["a"]), &files),
+            &env(&root),
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        assert!(root.join("Projects/Trash/info/a.trashinfo").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn only_the_spec_trashes_count() {
+        let home = Path::new("/h/.local/share/Trash");
+        assert!(is_trash_dir(home, home, 1000));
+        assert!(is_trash_dir(Path::new("/mnt/d/.Trash-1000"), home, 1000));
+        assert!(is_trash_dir(Path::new("/mnt/d/.Trash/1000"), home, 1000));
+        assert!(!is_trash_dir(Path::new("/mnt/d/.Trash-1001"), home, 1000));
+        assert!(!is_trash_dir(Path::new("/mnt/d/.Trash/1001"), home, 1000));
+        assert!(!is_trash_dir(Path::new("/h/Projects/Trash"), home, 1000));
+        assert!(!is_trash_dir(Path::new("/h/.Trashy"), home, 1000));
+    }
+
+    #[test]
+    fn restore_onto_a_taken_name_asks_and_skip_leaves_it_in_the_trash() {
+        let (root, back, asked) = restore_over_new("restore-skip", fsops::Conflict::Skip);
+        assert_eq!(asked, ["a"]);
+        assert_eq!((back.done, back.failed.len()), (0, 0));
+        assert_eq!(fs::read_to_string(root.join("work/a")).unwrap(), "new");
         assert!(root.join("trash/files/a").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restore_keep_both_lands_under_a_fresh_name() {
+        let (root, back, _) = restore_over_new("restore-keep", fsops::Conflict::Rename);
+        assert_eq!(back.done, 1, "{back:?}");
+        assert_eq!(fs::read_to_string(root.join("work/a")).unwrap(), "new");
+        assert_eq!(fs::read_to_string(root.join("work/a (2)")).unwrap(), "old");
+        assert!(!root.join("trash/info/a.trashinfo").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restore_replace_trashes_the_newer_file_instead_of_deleting_it() {
+        let (root, back, _) = restore_over_new("restore-replace", fsops::Conflict::Replace);
+        assert_eq!(back.done, 1, "{back:?}");
+        assert_eq!(fs::read_to_string(root.join("work/a")).unwrap(), "old");
+        let kept: Vec<_> = fs::read_dir(root.join("trash/files"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read_to_string(kept[0].path()).unwrap(), "new");
         fs::remove_dir_all(&root).unwrap();
     }
 

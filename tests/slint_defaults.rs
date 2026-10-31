@@ -64,38 +64,103 @@ fn strip_comments(src: &str) -> String {
 /// The live code only: `#[cfg(test)]` modules set properties too, and a
 /// setter there doesn't make the window show real data.
 fn live_rust(src: &str) -> String {
+    try_live_rust(src).unwrap_or_else(|e| panic!("live_rust: {e}"))
+}
+
+/// Cuts each inline `#[cfg(test)] [pub] mod <ident> { ... }` block and
+/// keeps scanning after it. An out-of-line `mod tests;` has no block here
+/// and is left alone. Braces inside strings and char literals don't
+/// count, and a block that never closes is an error, not a silent cut.
+fn try_live_rust(src: &str) -> Result<String, String> {
+    const ATTR: &str = "#[cfg(test)]";
     let mut src = strip_comments(src);
     let mut from = 0;
-    while let Some(at) = src[from..].find("#[cfg(test)]") {
+    while let Some(at) = src[from..].find(ATTR) {
         let i = from + at;
-        let rest = src[i + "#[cfg(test)]".len()..].trim_start();
-        let rest = rest.strip_prefix("pub ").unwrap_or(rest).trim_start();
-        if rest.starts_with("mod ") || rest.starts_with("mod\t") {
-            // Cut just this module's block, matched by brace depth, so
-            // code after it is still checked. Strings holding braces are
-            // rare enough in app.rs that depth counting is good enough.
-            let open = src[i..].find('{').map(|o| i + o);
-            let close = open.and_then(|o| {
-                let mut depth = 0i32;
-                src[o..].char_indices().find_map(|(k, c)| {
-                    depth += match c {
-                        '{' => 1,
-                        '}' => -1,
-                        _ => 0,
-                    };
-                    (depth == 0).then_some(o + k + 1)
-                })
-            });
-            match close {
-                Some(end) => src.replace_range(i..end, ""),
-                None => src.truncate(i),
+        match inline_mod_open(&src[i + ATTR.len()..]) {
+            Some(off) => {
+                let open = i + ATTR.len() + off;
+                let end = block_end(&src, open)
+                    .ok_or_else(|| format!("unbalanced braces in the test module at byte {i}"))?;
+                src.replace_range(i..end, "");
+                from = i;
             }
-            from = i;
-            continue;
+            None => from = i + ATTR.len(),
         }
-        from = i + 1;
     }
-    src
+    Ok(src)
+}
+
+/// Offset of the `{` when `rest` starts with `[pub] mod <ident> {`.
+fn inline_mod_open(rest: &str) -> Option<usize> {
+    let t = rest.trim_start();
+    let t = t
+        .strip_prefix("pub")
+        .filter(|r| r.starts_with(char::is_whitespace))
+        .map(str::trim_start)
+        .unwrap_or(t);
+    let t = t.strip_prefix("mod")?;
+    if !t.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let t = t.trim_start();
+    let ident = t
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(t.len());
+    if ident == 0 {
+        return None;
+    }
+    let after = t[ident..].trim_start();
+    after.starts_with('{').then(|| rest.len() - after.len())
+}
+
+/// Byte just past the `}` matching the `{` at `open`, skipping string,
+/// raw string and char literals.
+fn block_end(src: &str, open: usize) -> Option<usize> {
+    let b = src.as_bytes();
+    let mut depth = 0i32;
+    let mut k = open;
+    while k < b.len() {
+        match b[k] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k + 1);
+                }
+            }
+            b'r' if matches!(b.get(k + 1), Some(b'"' | b'#'))
+                && (k == 0 || !(b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_')) =>
+            {
+                let hashes = b[k + 1..].iter().take_while(|&&c| c == b'#').count();
+                if b.get(k + 1 + hashes) == Some(&b'"') {
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let body = k + 2 + hashes;
+                    k = body + src[body..].find(&close)? + close.len();
+                    continue;
+                }
+            }
+            b'"' => {
+                k += 1;
+                while k < b.len() && b[k] != b'"' {
+                    k += if b[k] == b'\\' { 2 } else { 1 };
+                }
+            }
+            // A char literal ('{', '\''); a lifetime ('a) has no closing quote.
+            b'\'' => {
+                if b.get(k + 1) == Some(&b'\\') {
+                    if let Some(q) = src[k + 3..].find('\'') {
+                        k += 3 + q;
+                    }
+                } else if b.get(k + 2) == Some(&b'\'') {
+                    k += 2;
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    None
 }
 
 /// `(name, default)` for each in/in-out property of AppWindow; a property

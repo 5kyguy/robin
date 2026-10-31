@@ -29,6 +29,8 @@ pub enum Dialog {
     /// The drive has no trash: Delete permanently is the only way.
     TrashNo(Vec<OsString>),
     Delete(Vec<OsString>),
+    /// Empty Trash: everything in the Trash view, deleted for good.
+    EmptyTrash(Vec<OsString>),
     /// A move left `names` where they were. Button 1 is Copy instead when
     /// any of them can be copied; it copies `copy`, the ones that can.
     Refused {
@@ -61,7 +63,7 @@ impl Dialog {
         match self {
             Dialog::Trash(_) => "trash",
             Dialog::TrashNo(_) => "trash-no",
-            Dialog::Delete(_) => "delete",
+            Dialog::Delete(_) | Dialog::EmptyTrash(_) => "delete",
             Dialog::Refused { .. } => "move-refused",
             Dialog::Conflict { .. } => "conflict-live",
         }
@@ -81,7 +83,7 @@ impl Dialog {
     /// Cancel so a held Enter can't destroy anything.
     fn default_focus(&self) -> i32 {
         match self {
-            Dialog::Delete(_) | Dialog::TrashNo(_) => 0,
+            Dialog::Delete(_) | Dialog::EmptyTrash(_) | Dialog::TrashNo(_) => 0,
             Dialog::Trash(_) => 1,
             Dialog::Refused { can_copy, .. } => i32::from(*can_copy),
             Dialog::Conflict { .. } => 1,
@@ -192,6 +194,8 @@ pub struct Controller {
     pub unreadable: Option<bool>,
     /// A navigation failed; reread the folder still open.
     refresh_due: bool,
+    /// The Trash view's trashinfo, by stored name; empty elsewhere.
+    pub trash: TrashInfo,
 }
 
 /// How long a navigation read may take before the breadcrumb jumps to the
@@ -221,6 +225,9 @@ pub struct ReadTicket {
     gen: u64,
     kind: ReadKind,
     dir: PathBuf,
+    /// Set when `dir` is the home trash's files/: its trash folder, whose
+    /// info/ is read alongside.
+    trash: Option<PathBuf>,
 }
 
 /// A finished read: the folder actually read (an ancestor after a
@@ -230,7 +237,11 @@ pub struct ReadResult {
     gen: u64,
     kind: ReadKind,
     result: Result<(PathBuf, Snapshot)>,
+    trash: Option<TrashInfo>,
 }
+
+/// Where each item in the trash came from, by stored name.
+pub type TrashInfo = std::collections::HashMap<OsString, crate::trash::Info>;
 
 impl ReadTicket {
     /// The request's generation number.
@@ -255,10 +266,15 @@ impl ReadTicket {
             }
             Err(e) => Err(e),
         };
+        let trash = self
+            .trash
+            .as_deref()
+            .map(|t| crate::trash::read_all(t, None));
         ReadResult {
             gen: self.gen,
             kind: self.kind,
             result,
+            trash,
         }
     }
 }
@@ -342,6 +358,7 @@ impl Controller {
             nav: None,
             unreadable: None,
             refresh_due: false,
+            trash: TrashInfo::new(),
         }
     }
 
@@ -430,11 +447,82 @@ impl Controller {
     fn ticket(&mut self, dir: PathBuf, kind: ReadKind) -> ReadTicket {
         self.read_gen += 1;
         self.in_flight = Some(kind);
+        let trash = (dir == self.trash_files()).then(|| self.env.home_trash.clone());
         ReadTicket {
             gen: self.read_gen,
             kind,
             dir,
+            trash,
         }
+    }
+
+    /// The home trash's files/, the folder the Trash view shows.
+    pub fn trash_files(&self) -> PathBuf {
+        self.env.home_trash.join("files")
+    }
+
+    /// Whether the open folder is the Trash.
+    pub fn in_trash(&self) -> bool {
+        self.dir == self.trash_files()
+    }
+
+    /// Restore the selected trash items to where they came from. Items
+    /// with no trashinfo have nowhere to go and stay put.
+    pub fn restore_selected(&self) -> Action {
+        if !self.in_trash() {
+            return Action::None;
+        }
+        let items: Vec<ops::Trashed> = self
+            .names()
+            .into_iter()
+            .filter_map(|n| {
+                let info = self.trash.get(&n)?;
+                Some(ops::Trashed {
+                    trash: self.env.home_trash.clone(),
+                    stored: n,
+                    original: info.original.clone(),
+                })
+            })
+            .collect();
+        if items.is_empty() {
+            return Action::None;
+        }
+        Action::Run(Job::restore(items))
+    }
+
+    /// The banner over the trash list when the selection holds items with
+    /// no trashinfo: Restore skips them, so say how to keep them.
+    pub fn trash_note(&self) -> String {
+        if !self.in_trash() {
+            return String::new();
+        }
+        let lost = self
+            .names()
+            .iter()
+            .filter(|n| !self.trash.contains_key(*n))
+            .count();
+        match lost {
+            0 => String::new(),
+            1 => "1 item has no saved location and can't be restored. Drag it out to keep it."
+                .into(),
+            n => format!(
+                "{n} items have no saved location and can't be restored. Drag them out to keep them."
+            ),
+        }
+    }
+
+    /// Empty Trash: ask first, naming how many items go.
+    pub fn empty_trash(&self) -> Action {
+        let names: Vec<OsString> = self
+            .listing
+            .entries()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        if !self.in_trash() || names.is_empty() {
+            return Action::None;
+        }
+        Action::Open(Dialog::EmptyTrash(names))
     }
 
     /// Apply a finished read unless a newer request superseded it.
@@ -444,6 +532,9 @@ impl Controller {
         }
         self.in_flight = None;
         self.nav = None;
+        if read.result.is_ok() {
+            self.trash = read.trash.unwrap_or_default();
+        }
         let was_loaded = std::mem::replace(&mut self.loaded, true);
         let was_unreadable = self.unreadable.take().is_some();
         if let Err(e) = &read.result {
@@ -495,6 +586,11 @@ impl Controller {
 
     pub fn reload(&mut self) -> Result<()> {
         let snap = Snapshot::read(&self.dir)?;
+        self.trash = if self.in_trash() {
+            crate::trash::read_all(&self.env.home_trash, None)
+        } else {
+            TrashInfo::new()
+        };
         self.apply_snapshot(snap);
         Ok(())
     }
@@ -512,7 +608,7 @@ impl Controller {
 
     pub fn open_dialog(&mut self, dialog: Dialog) {
         self.focus = dialog.default_focus();
-        self.armed = !matches!(dialog, Dialog::Delete(_));
+        self.armed = !matches!(dialog, Dialog::Delete(_) | Dialog::EmptyTrash(_));
         self.dialog = Some(dialog);
     }
 
@@ -522,7 +618,8 @@ impl Controller {
         if names.is_empty() {
             return Action::None;
         }
-        if permanent {
+        // The trash has no trash: Del there deletes for good, and says so.
+        if permanent || self.in_trash() {
             return Action::Open(Dialog::Delete(names));
         }
         match ops::trash_choice(&self.dir, &self.env) {
@@ -647,6 +744,11 @@ impl Controller {
             }
             Dialog::TrashNo(names) | Dialog::Delete(names) => {
                 Action::Run(Job::new(JobKind::Delete, &self.dir, names, &self.dir))
+            }
+            Dialog::EmptyTrash(names) => {
+                let mut job = Job::new(JobKind::Delete, &self.dir, names, &self.dir);
+                job.empty_trash = true;
+                Action::Run(job)
             }
             Dialog::Refused {
                 job,
@@ -825,7 +927,10 @@ impl Controller {
         };
         let target = self.drag.as_ref().and_then(|d| d.target);
         let refused = self.drag.as_ref().and_then(|d| d.refused);
-        self.listing
+        let in_trash = self.in_trash();
+        let home = self.env.home.as_deref();
+        let rows: Vec<Row> = self
+            .listing
             .view()
             .iter()
             .enumerate()
@@ -848,6 +953,26 @@ impl Controller {
                 cut: self.clip.is_cut(&self.dir, &e.name),
                 drop: target == Some(i),
                 drop_refused: refused == Some(i),
+            })
+            .collect();
+        if !in_trash {
+            return rows;
+        }
+        // Trash columns: Name, Original location, Deleted.
+        rows.into_iter()
+            .zip(self.listing.view().iter())
+            .map(|(mut row, e)| {
+                let info = self.trash.get(&e.name);
+                row.size = SharedString::new();
+                row.kind = info
+                    .map(|i| crate::trash::location_text(&i.original, home))
+                    .unwrap_or_else(|| "Unknown".into())
+                    .into();
+                row.modified = info
+                    .map(|i| crate::trash::deleted_text(&i.deleted))
+                    .unwrap_or_default()
+                    .into();
+                row
             })
             .collect()
     }
@@ -1094,6 +1219,10 @@ fn side_abandoned(_ui: &AppWindow, st: &Shared, gen: u64) {
 fn draw_crumbs(ui: &AppWindow, s: &State) -> Vec<String> {
     let user = std::env::var("USER").ok();
     let home = s.ctl.env.home.as_deref();
+    if s.ctl.crumb_dir() == s.ctl.trash_files() {
+        ui.set_crumbs("Trash".into());
+        return vec!["Trash".into()];
+    }
     let crumbs: Vec<String> = crumbs_for(s.ctl.crumb_dir(), home, &s.side.devices, user.as_deref())
         .iter()
         .map(|c| c.label.clone())
@@ -1362,6 +1491,22 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         };
         if let (Some(ui), Some(t)) = (w.upgrade(), target) {
             apply(&ui, &st, Action::Navigate(t));
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_trash_restore(move || {
+        let action = st.borrow().ctl.restore_selected();
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_trash_empty(move || {
+        let action = st.borrow().ctl.empty_trash();
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
         }
     });
     let w = ui.as_weak();
@@ -1677,12 +1822,17 @@ fn redraw(ui: &AppWindow, s: &State) {
         ui.set_state_note("".into());
     }
     ui.set_status_left(ctl.status_left().into());
+    ui.set_trash_view(ctl.in_trash());
+    ui.set_trash_can_restore(matches!(ctl.restore_selected(), Action::Run(_)));
+    ui.set_trash_note(ctl.trash_note().into());
     let n = ctl.listing.view().len();
     ui.set_state(
         if !ctl.loaded {
             "loading"
         } else if ctl.unreadable.is_some() {
             "denied"
+        } else if n == 0 && ctl.in_trash() {
+            "trash-empty"
         } else if n == 0 {
             "empty"
         } else {
@@ -1703,6 +1853,11 @@ fn redraw(ui: &AppWindow, s: &State) {
         Some(d) => {
             ui.set_overlay(d.overlay().into());
             match d {
+                Dialog::EmptyTrash(names) => {
+                    ui.set_confirm_noun(format!("{} in Trash", ops::count(names.len())).into());
+                    ui.set_confirm_names(names_text(names).into());
+                    ui.set_confirm_names_count(names.len().min(6) as i32);
+                }
                 Dialog::Trash(names) | Dialog::TrashNo(names) | Dialog::Delete(names) => {
                     ui.set_confirm_noun(noun(names).into());
                     ui.set_confirm_names(names_text(names).into());
@@ -1810,6 +1965,12 @@ fn pump(ui: &AppWindow, st: &Shared) {
     ui.set_job_label(job.label().into());
     ui.set_job_detail(format!("0 of {}", ops::count(job.names.len())).into());
     ui.set_job_amount(0.0);
+    // Renders have no event loop to post back to: run the job here.
+    if SCRIPTED.with(|s| s.get()) {
+        let outcome = ops::run(&job, &env, &cancel, &mut |_| {});
+        done(ui, st, job, outcome);
+        return;
+    }
     let dest = job.dest.file_name().map_or_else(
         || job.dest.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
@@ -2453,6 +2614,122 @@ mod tests {
         c.open_dialog(Dialog::Trash(vec!["a.jpg".into()]));
         assert_eq!(c.key(keys::ESCAPE, false, false), Action::Redraw);
         assert!(c.dialog.is_none());
+    }
+
+    /// Trash a.jpg from Pictures and open the Trash view.
+    fn in_trash_view(label: &str) -> Controller {
+        let mut c = setup(label);
+        let job = Job::new(JobKind::Trash, &c.dir, vec!["a.jpg".into()], &c.dir);
+        ops::run(&job, &c.env, &Cancel::new(), &mut |_| {});
+        c.dir = c.trash_files();
+        c.reload().unwrap();
+        c
+    }
+
+    #[test]
+    fn the_trash_view_shows_where_items_came_from_and_when() {
+        let c = in_trash_view("trash-view");
+        assert!(c.in_trash());
+        let rows = c.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "a.jpg");
+        assert_eq!(rows[0].kind, "~/Pictures");
+        assert_eq!(rows[0].size, "");
+        assert_eq!(
+            rows[0].modified.len(),
+            "2026-10-29 10:00".len(),
+            "{}",
+            rows[0].modified
+        );
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn restore_puts_the_selection_back_and_del_in_the_trash_is_permanent() {
+        let mut c = in_trash_view("trash-restore");
+        assert_eq!(c.restore_selected(), Action::None, "nothing selected");
+        c.listing.select_only("a.jpg".into());
+        let Action::Run(job) = c.restore_selected() else {
+            panic!("no restore job");
+        };
+        assert_eq!(job.kind, JobKind::Restore);
+        assert_eq!(
+            job.restore[0].original,
+            c.env.home.clone().unwrap().join("Pictures/a.jpg")
+        );
+        assert!(matches!(c.remove(false), Action::Open(Dialog::Delete(_))));
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn items_without_trashinfo_say_unknown_and_restore_skips_them() {
+        let mut c = in_trash_view("trash-noinfo");
+        fs::write(c.trash_files().join("stray.txt"), "s").unwrap();
+        fs::write(c.trash_files().join("stray2.txt"), "s").unwrap();
+        c.reload().unwrap();
+        let rows = c.rows();
+        let stray = rows.iter().find(|r| r.name == "stray.txt").unwrap();
+        assert_eq!(
+            (stray.kind.as_str(), stray.modified.as_str()),
+            ("Unknown", "")
+        );
+        assert!(!stray.cut, "not greyed");
+        c.listing.select_only("a.jpg".into());
+        assert_eq!(c.trash_note(), "");
+        c.listing.select_only("stray.txt".into());
+        assert_eq!(
+            c.trash_note(),
+            "1 item has no saved location and can't be restored. Drag it out to keep it."
+        );
+        assert_eq!(c.restore_selected(), Action::None);
+        c.listing.move_cursor(crate::model::Nav::Home, false, 1);
+        c.listing.move_cursor(crate::model::Nav::Down, true, 1);
+        c.listing.move_cursor(crate::model::Nav::Down, true, 1);
+        assert!(c.trash_note().starts_with("2 items have no saved location"));
+        let Action::Run(job) = c.restore_selected() else {
+            panic!("restore should still run for the rest");
+        };
+        let names: Vec<_> = job.restore.iter().map(|t| t.stored.clone()).collect();
+        assert_eq!(names, vec![OsString::from("a.jpg")]);
+        assert!(matches!(c.remove(false), Action::Open(Dialog::Delete(_))));
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn empty_trash_asks_then_deletes_everything_and_its_info() {
+        let mut c = in_trash_view("trash-empty");
+        let Action::Open(d) = c.empty_trash() else {
+            panic!("no dialog");
+        };
+        assert_eq!(d, Dialog::EmptyTrash(vec!["a.jpg".into()]));
+        c.open_dialog(d);
+        assert_eq!(c.focus, 0, "Cancel is the default");
+        assert_eq!(c.button(1), Action::None, "not armed yet");
+        c.armed = true;
+        let Action::Run(job) = c.button(1) else {
+            panic!("no job");
+        };
+        assert_eq!(
+            (job.kind, job.src.clone()),
+            (JobKind::Delete, c.trash_files())
+        );
+        assert!(
+            job.empty_trash,
+            "Empty Trash tidies info and directorysizes"
+        );
+        ops::run(&job, &c.env, &Cancel::new(), &mut |_| {});
+        c.reload().unwrap();
+        assert!(c.listing.entries().is_empty());
+        assert!(!c.env.home_trash.join("info/a.jpg.trashinfo").exists());
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn empty_trash_does_nothing_outside_the_trash_or_when_empty() {
+        let c = setup("trash-outside");
+        assert_eq!(c.empty_trash(), Action::None);
+        assert_eq!(c.restore_selected(), Action::None);
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
     }
 
     #[test]
@@ -3253,6 +3530,7 @@ mod tests {
             gen: c.ticket(dir.clone(), ReadKind::Refresh).gen,
             kind: ReadKind::Refresh,
             result: Err(denied),
+            trash: None,
         };
         assert!(matches!(c.land(read), Landed::Failed(_)));
         assert_eq!(c.dir, dir, "no jump to the parent on EACCES");
