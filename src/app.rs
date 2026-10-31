@@ -1060,10 +1060,29 @@ fn start_side(s: &State) {
     });
 }
 
+/// The breadcrumb, rooted at a device's label when the folder is on one.
+fn draw_crumbs(ui: &AppWindow, s: &State) -> Vec<String> {
+    let home = s.ctl.env.home.as_deref();
+    let devices: Vec<(PathBuf, String)> = s
+        .side
+        .devices
+        .iter()
+        .filter(|d| d.path != Path::new("/") && !home.is_some_and(|h| h.starts_with(&d.path)))
+        .map(|d| (d.path.clone(), d.name.clone()))
+        .collect();
+    let crumbs: Vec<String> = crate::model::breadcrumbs_on(s.ctl.crumb_dir(), home, &devices)
+        .iter()
+        .map(|c| c.label.clone())
+        .collect();
+    ui.set_crumbs(crumbs.join("  ›  ").into());
+    crumbs
+}
+
 fn side_landed(ui: &AppWindow, st: &Shared, data: crate::sidebar::SideData) {
     let mut s = st.borrow_mut();
     s.side = data;
     draw_side(ui, &s);
+    draw_crumbs(ui, &s);
 }
 
 /// The sidebar sections and status-right from the last side job, with
@@ -1571,17 +1590,12 @@ fn redraw(ui: &AppWindow, s: &State) {
     let (column, desc) = ctl.sort_header();
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
-    let home = ctl.env.home.clone();
-    let crumbs: Vec<String> = crate::model::breadcrumbs(ctl.crumb_dir(), home.as_deref())
-        .iter()
-        .map(|c| c.label.clone())
-        .collect();
-    ui.set_crumbs(crumbs.join("  ›  ").into());
+    let crumbs = draw_crumbs(ui, s);
     ui.set_path_text(ctl.crumb_dir().display().to_string().into());
     ui.set_nav_busy(ctl.nav_pending());
     draw_side(ui, s);
     if let Some(denied) = ctl.unreadable {
-        let name = crumbs.join("/");
+        let name = crumbs.join("/").replacen("//", "/", 1);
         ui.set_state_title(
             if denied {
                 format!("No permission to open {name}")

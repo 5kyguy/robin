@@ -401,30 +401,35 @@ pub struct Crumb {
 
 /// `~/Pictures` becomes `~`, `Pictures` when `path` is under `home`.
 pub fn breadcrumbs(path: &Path, home: Option<&Path>) -> Vec<Crumb> {
-    let mut crumbs = Vec::new();
-    if let Some(home) = home {
-        if let Ok(rest) = path.strip_prefix(home) {
-            crumbs.push(Crumb {
-                label: "~".into(),
-                path: home.to_path_buf(),
-            });
-            let mut acc = home.to_path_buf();
-            for part in rest.components() {
-                acc.push(part);
-                crumbs.push(Crumb {
-                    label: part.as_os_str().to_string_lossy().into_owned(),
-                    path: acc.clone(),
-                });
-            }
-            return crumbs;
+    breadcrumbs_on(path, home, &[])
+}
+
+/// Breadcrumbs rooted where a person would start: the device a path is
+/// on (`SANDISK`, `Photos`), else `~` under home, else `/`. A device
+/// wins over home when its mount is deeper, so a stick mounted inside
+/// home still reads as the stick. `devices` are (mount point, label).
+pub fn breadcrumbs_on(
+    path: &Path,
+    home: Option<&Path>,
+    devices: &[(PathBuf, String)],
+) -> Vec<Crumb> {
+    let mut root: (PathBuf, String) = (PathBuf::from("/"), "/".into());
+    if let Some(home) = home.filter(|h| path.starts_with(h)) {
+        root = (home.to_path_buf(), "~".into());
+    }
+    for (mount, label) in devices {
+        let deeper = mount.components().count() > root.0.components().count();
+        if deeper && path.starts_with(mount) {
+            root = (mount.clone(), label.clone());
         }
     }
-    crumbs.push(Crumb {
-        label: "/".into(),
-        path: PathBuf::from("/"),
-    });
-    let mut acc = PathBuf::from("/");
-    for part in path.components().skip(1) {
+    let rest = path.strip_prefix(&root.0).unwrap_or(path);
+    let mut acc = root.0.clone();
+    let mut crumbs = vec![Crumb {
+        label: root.1,
+        path: root.0,
+    }];
+    for part in rest.components() {
         acc.push(part);
         crumbs.push(Crumb {
             label: part.as_os_str().to_string_lossy().into_owned(),
@@ -632,6 +637,36 @@ mod tests {
         let labels: Vec<_> = crumbs.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(labels, ["~", "Pictures", "2026"]);
         assert_eq!(crumbs[1].path, PathBuf::from("/home/sky/Pictures"));
+    }
+
+    #[test]
+    fn breadcrumbs_root_at_the_device_or_slash() {
+        let home = Some(Path::new("/home/sky"));
+        let devices = [
+            (
+                PathBuf::from("/run/media/sky/SANDISK"),
+                "SANDISK".to_string(),
+            ),
+            (PathBuf::from("/home/sky/media/STICK"), "STICK".to_string()),
+        ];
+        let labels = |p: &str| -> Vec<String> {
+            breadcrumbs_on(Path::new(p), home, &devices)
+                .into_iter()
+                .map(|c| c.label)
+                .collect()
+        };
+        assert_eq!(labels("/run/media/sky/SANDISK/DCIM"), ["SANDISK", "DCIM"]);
+        assert_eq!(labels("/run/media/sky/SANDISK"), ["SANDISK"]);
+        assert_eq!(
+            labels("/home/sky/media/STICK/a"),
+            ["STICK", "a"],
+            "deeper than home"
+        );
+        assert_eq!(labels("/home/sky/Pictures"), ["~", "Pictures"]);
+        assert_eq!(labels("/etc/robin"), ["/", "etc", "robin"]);
+        assert_eq!(labels("/"), ["/"]);
+        let c = breadcrumbs_on(Path::new("/run/media/sky/SANDISK/DCIM"), home, &devices);
+        assert_eq!(c[1].path, PathBuf::from("/run/media/sky/SANDISK/DCIM"));
     }
 
     #[test]
