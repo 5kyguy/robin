@@ -515,6 +515,8 @@ export component AppWindow inherits Window {
     // The open folder is the Trash: Name, Original location, Deleted.
     in property <bool> trash-view: false;
     in property <bool> trash-can-restore: false;
+    // Set when the selection holds items with no trashinfo.
+    in property <string> trash-note;
     callback trash-restore();
     callback trash-empty();
     in property <bool> collapsed: false;
@@ -997,6 +999,24 @@ export component AppWindow inherits Window {
                         }
                     }
                     if trash-view: Rectangle { height: 1px; background: divider; }
+                    if trash-view && trash-note != "": Rectangle {
+                        height: 32px;
+                        background: warning.with-alpha(0.12);
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            spacing: 8px;
+                            Text { text: "󰀦"; font-size: 13px; color: warning; vertical-alignment: center; }
+                            Text {
+                                text: trash-note;
+                                font-size: 11px;
+                                color: text;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                        }
+                    }
                     Rectangle {
                         height: 26px;
                         HeaderCell {

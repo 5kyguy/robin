@@ -490,6 +490,27 @@ impl Controller {
         Action::Run(Job::restore(items))
     }
 
+    /// The banner over the trash list when the selection holds items with
+    /// no trashinfo: Restore skips them, so say how to keep them.
+    pub fn trash_note(&self) -> String {
+        if !self.in_trash() {
+            return String::new();
+        }
+        let lost = self
+            .names()
+            .iter()
+            .filter(|n| !self.trash.contains_key(*n))
+            .count();
+        match lost {
+            0 => String::new(),
+            1 => "1 item has no saved location and can't be restored. Drag it out to keep it."
+                .into(),
+            n => format!(
+                "{n} items have no saved location and can't be restored. Drag them out to keep them."
+            ),
+        }
+    }
+
     /// Empty Trash: ask first, naming how many items go.
     pub fn empty_trash(&self) -> Action {
         let names: Vec<OsString> = self
@@ -940,7 +961,7 @@ impl Controller {
                 row.size = SharedString::new();
                 row.kind = info
                     .map(|i| crate::trash::location_text(&i.original, home))
-                    .unwrap_or_default()
+                    .unwrap_or_else(|| "Unknown".into())
                     .into();
                 row.modified = info
                     .map(|i| crate::trash::deleted_text(&i.deleted))
@@ -1798,6 +1819,7 @@ fn redraw(ui: &AppWindow, s: &State) {
     ui.set_status_left(ctl.status_left().into());
     ui.set_trash_view(ctl.in_trash());
     ui.set_trash_can_restore(matches!(ctl.restore_selected(), Action::Run(_)));
+    ui.set_trash_note(ctl.trash_note().into());
     let n = ctl.listing.view().len();
     ui.set_state(
         if !ctl.loaded {
@@ -2624,6 +2646,40 @@ mod tests {
             job.restore[0].original,
             c.env.home.clone().unwrap().join("Pictures/a.jpg")
         );
+        assert!(matches!(c.remove(false), Action::Open(Dialog::Delete(_))));
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn items_without_trashinfo_say_unknown_and_restore_skips_them() {
+        let mut c = in_trash_view("trash-noinfo");
+        fs::write(c.trash_files().join("stray.txt"), "s").unwrap();
+        fs::write(c.trash_files().join("stray2.txt"), "s").unwrap();
+        c.reload().unwrap();
+        let rows = c.rows();
+        let stray = rows.iter().find(|r| r.name == "stray.txt").unwrap();
+        assert_eq!(
+            (stray.kind.as_str(), stray.modified.as_str()),
+            ("Unknown", "")
+        );
+        assert!(!stray.cut, "not greyed");
+        c.listing.select_only("a.jpg".into());
+        assert_eq!(c.trash_note(), "");
+        c.listing.select_only("stray.txt".into());
+        assert_eq!(
+            c.trash_note(),
+            "1 item has no saved location and can't be restored. Drag it out to keep it."
+        );
+        assert_eq!(c.restore_selected(), Action::None);
+        c.listing.move_cursor(crate::model::Nav::Home, false, 1);
+        c.listing.move_cursor(crate::model::Nav::Down, true, 1);
+        c.listing.move_cursor(crate::model::Nav::Down, true, 1);
+        assert!(c.trash_note().starts_with("2 items have no saved location"));
+        let Action::Run(job) = c.restore_selected() else {
+            panic!("restore should still run for the rest");
+        };
+        let names: Vec<_> = job.restore.iter().map(|t| t.stored.clone()).collect();
+        assert_eq!(names, vec![OsString::from("a.jpg")]);
         assert!(matches!(c.remove(false), Action::Open(Dialog::Delete(_))));
         let _ = fs::remove_dir_all(c.env.home.unwrap());
     }
