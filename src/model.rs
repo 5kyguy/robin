@@ -79,6 +79,8 @@ pub struct Listing {
     query: String,
     selection: BTreeSet<OsString>,
     cursor: Option<OsString>,
+    /// Where a Shift range starts: the last item picked without Shift.
+    anchor: Option<OsString>,
 }
 
 impl Default for Listing {
@@ -92,6 +94,7 @@ impl Default for Listing {
             query: String::new(),
             selection: BTreeSet::new(),
             cursor: None,
+            anchor: None,
         }
     }
 }
@@ -214,12 +217,14 @@ impl Listing {
     pub fn select_only(&mut self, name: OsString) {
         self.selection.clear();
         self.selection.insert(name.clone());
+        self.anchor = Some(name.clone());
         self.cursor = Some(name);
     }
 
     pub fn clear_selection(&mut self) {
         self.selection.clear();
         self.cursor = None;
+        self.anchor = None;
     }
 
     /// Move the keyboard cursor. `columns` is 1 in the list and the tile
@@ -245,11 +250,23 @@ impl Listing {
             Nav::Down => (current + columns).min(names.len() - 1),
         };
         let name = names[next].clone();
-        if extend {
-            self.selection.insert(name.clone());
-        } else {
-            self.selection.clear();
-            self.selection.insert(name.clone());
+        let anchor = self
+            .anchor
+            .as_ref()
+            .and_then(|a| names.iter().position(|n| n == a));
+        match anchor.filter(|_| extend) {
+            // Shift: everything between the anchor and the new cursor.
+            Some(from) => {
+                let (lo, hi) = (from.min(next), from.max(next));
+                self.selection = names[lo..=hi].iter().cloned().collect();
+            }
+            None => {
+                if !extend {
+                    self.selection.clear();
+                }
+                self.selection.insert(name.clone());
+                self.anchor = Some(name.clone());
+            }
         }
         self.cursor = Some(name);
     }

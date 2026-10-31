@@ -2745,6 +2745,28 @@ mod tests {
     }
 
     #[test]
+    fn shift_down_in_the_grid_selects_the_whole_range() {
+        let mut c = setup("shift-range");
+        for n in ["c.jpg", "d.jpg", "e.jpg"] {
+            fs::write(c.dir.join(n), b"x").unwrap();
+        }
+        c.reload().unwrap();
+        c.set_grid(true);
+        c.columns.set(3);
+        c.key(keys::HOME, false, false);
+        c.key(keys::RIGHT, false, false);
+        c.key(keys::DOWN, false, true);
+        // raw-exports a b / c d e: a..d is a, b, c, d.
+        let picked: Vec<_> = c.names();
+        assert_eq!(
+            picked,
+            ["a.jpg", "b.jpg", "c.jpg", "d.jpg"].map(OsString::from)
+        );
+        c.key(keys::UP, false, true);
+        assert_eq!(c.names(), vec![OsString::from("a.jpg")]);
+    }
+
+    #[test]
     fn a_search_narrows_what_operations_act_on() {
         let mut c = setup("search-ops");
         c.listing.move_cursor(Nav::Home, false, 1);
