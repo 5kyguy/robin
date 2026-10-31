@@ -659,6 +659,9 @@ mod tests {
         assert_eq!(level(0.5), 0);
         assert_eq!(level(0.9), 1);
         assert_eq!(level(0.97), 2);
+        // The rail dot's edges: amber from exactly 85%, red from 95%.
+        assert_eq!((level(0.849), level(0.85)), (0, 1));
+        assert_eq!((level(0.949), level(0.95)), (1, 2));
     }
 
     #[test]
@@ -706,7 +709,7 @@ mod tests {
             .collect();
         assert_eq!(
             devices,
-            [("System", "75%"), ("Home disk", "55%"), ("SANDISK", "91%")]
+            [("System", "97%"), ("Home disk", "55%"), ("SANDISK", "91%")]
         );
         assert_eq!(d.trash.len(), 1);
         assert_eq!(

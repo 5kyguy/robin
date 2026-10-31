@@ -12,27 +12,40 @@ fn scripted_views_render_through_the_real_app() {
         return;
     }
     let dir = std::env::temp_dir().join(format!("robin-real-render-{}", std::process::id()));
-    for view in [
-        "browser-list",
-        "nav-pending",
-        "start-denied",
-        "sidebar-device",
-        "sidebar-trash",
-        "trash-view",
-        "trash-empty-confirm",
-        "trash-empty",
-        "trash-noinfo",
-        "trash-restore-recreated",
-        "grid-view",
-        "grid-hidden",
-        "list-density",
-        "search-results",
-        "search-nosearch",
-    ] {
-        let out = dir.join(format!("{view}.png"));
-        let fixture = dir.join(format!("home-{view}"));
+    // (scene, window width). 680 and 700 fold the sidebar to the rail,
+    // where full drives show their amber/red dots; 901 keeps it whole.
+    let scenes = [
+        ("browser-list", 800),
+        ("nav-pending", 800),
+        ("start-denied", 800),
+        ("sidebar-device", 800),
+        ("sidebar-trash", 800),
+        ("trash-view", 800),
+        ("trash-empty-confirm", 800),
+        ("trash-empty", 800),
+        ("trash-noinfo", 800),
+        ("trash-restore-recreated", 800),
+        ("grid-view", 800),
+        ("grid-hidden", 800),
+        ("list-density", 800),
+        ("search-results", 800),
+        ("search-nosearch", 800),
+        ("search-letters", 800),
+        ("browser-list", 680),
+        ("browser-list", 700),
+        ("browser-list", 901),
+    ];
+    for (view, width) in scenes {
+        let out = dir.join(format!("{view}-{width}.png"));
+        let fixture = dir.join(format!("home-{view}-{width}"));
         let status = Command::new(env!("CARGO_BIN_EXE_robin"))
-            .args(["--render", view, "--size", "800x500", "--fixture"])
+            .args([
+                "--render",
+                view,
+                "--size",
+                &format!("{width}x500"),
+                "--fixture",
+            ])
             .arg(&fixture)
             .arg("--out")
             .arg(&out)
@@ -40,7 +53,7 @@ fn scripted_views_render_through_the_real_app() {
             .unwrap();
         assert!(status.success(), "{view}: {status}");
         let img = image::open(&out).unwrap();
-        assert_eq!((img.width(), img.height()), (800, 500), "{view}");
+        assert_eq!((img.width(), img.height()), (width, 500), "{view}");
         robin::fixture::remove(&fixture).unwrap();
     }
     let _ = std::fs::remove_dir_all(&dir);

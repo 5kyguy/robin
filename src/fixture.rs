@@ -184,7 +184,7 @@ fn seed_home(top: &Path, root: &Path) -> Result<()> {
          41 22 8:1 / {t}/media/sky/SANDISK rw - exfat /dev/sda1 rw\n"
     );
     let space = format!(
-        "/ 512000000000 128000000000\n\
+        "/ 512000000000 15360000000\n\
          {t}/home 1800000000000 812000000000\n\
          {t}/media/sky/SANDISK 64000000000 6000000000\n"
     );

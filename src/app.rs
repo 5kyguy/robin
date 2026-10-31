@@ -20,7 +20,7 @@ use crate::fsops::{
 use crate::model::{Listing, Nav, SortDir, SortKey};
 use crate::ops::{self, Clipboard, Env, Job, JobKind, Mods, Op, Outcome, Progress, Trashed};
 use crate::safety::DirFd;
-use crate::{AppWindow, Columns, Error, GridLine, Mark, Result, Row};
+use crate::{AppWindow, Columns, Error, GridLine, Mark, MarkRun, Result, Row};
 
 /// What the trash/delete dialog is asking about.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,6 +206,8 @@ pub struct Controller {
     pub compact: bool,
     /// Tiles per grid line, refit to the content width on every redraw.
     pub columns: std::cell::Cell<usize>,
+    /// The list's middle-cut name budget the rows were last built for.
+    pub name_budget: std::cell::Cell<usize>,
 }
 
 /// Grid tile widths (S/M/L) per density, from the spec's density table.
@@ -222,12 +224,24 @@ pub fn fit_columns(width: f32, tile: f32) -> usize {
 
 /// The list drops its Type column under this content width
 /// (`Columns.no-type` in app.slint).
-pub const TYPE_MIN_LIST: f32 = 560.0;
-/// ...or when keeping Type would leave Name narrower than this.
+/// One cut, at the narrowest wide-column list that leaves Name 220px
+/// beside Type. Below it the columns only shrink and Name only grows
+/// as Type goes, so Type never flickers back on the way down.
+pub const TYPE_MIN_LIST: f32 = 668.0;
+/// Name never gets narrower than this while Type shows.
 pub const NAME_MIN_W: f32 = 220.0;
 
 /// How many characters the list's Name column holds at `width`,
 /// mirroring `Columns` in app.slint (monospace, ~7.3px a glyph at 12px).
+/// How many tiles a drag from the tile in column `col` moved, as an
+/// index offset: `dx` is clamped to the line so a drag past the grid's
+/// right or left edge can't wrap onto the next or previous line.
+pub fn tile_offset(col: usize, dx: i32, dy: i32, columns: usize) -> i32 {
+    let (col, columns) = (col as i32, columns.max(1) as i32);
+    let dx = dx.clamp(-col, (columns - 1 - col).max(0));
+    dy * columns + dx
+}
+
 pub fn name_chars(width: f32) -> usize {
     ((name_w(width) / 7.3).floor().max(6.0)) as usize
 }
@@ -244,7 +258,7 @@ pub fn columns(width: f32) -> (f32, bool) {
     };
     let without = width - 12.0 - modified - 16.0 - size - 16.0 - 40.0;
     let with = without - 120.0 - 16.0;
-    let no_type = width < TYPE_MIN_LIST || with < NAME_MIN_W;
+    let no_type = width < TYPE_MIN_LIST;
     (if no_type { without } else { with }, no_type)
 }
 
@@ -252,12 +266,14 @@ fn name_w(width: f32) -> f32 {
     columns(width).0
 }
 
-/// One printable character, as typed into a search: not a key name
+/// Printable text, as typed into a search: not a key name
 /// like Escape or an arrow, which arrive as control or private-use chars.
 fn is_typed(text: &str) -> bool {
-    let mut chars = text.chars();
-    matches!((chars.next(), chars.next()), (Some(c), None)
-        if !c.is_control() && !('\u{f700}'..='\u{f8ff}').contains(&c))
+    // An IME commit or a dead key can arrive as several chars at once.
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| !c.is_control() && !('\u{f700}'..='\u{f8ff}').contains(&c))
 }
 
 /// "812 GB free of 1.8 TB" as "812 GB free", for narrow windows.
@@ -268,15 +284,34 @@ pub fn short_free(space: &str) -> String {
 /// Cut `name` in the middle so its ending stays visible:
 /// `dune-sunset-0412.jpg` at 17 becomes `dune-sun…0412.jpg`.
 pub fn elide_middle(name: &str, max: usize) -> String {
-    let chars: Vec<char> = name.chars().collect();
-    if chars.len() <= max || max < 3 {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    // Cut between graphemes, never inside one (é as e + accent, flags,
+    // emoji families), and count wide CJK glyphs as two cells.
+    if name.width() <= max || max < 3 {
         return name.to_string();
     }
-    let tail = (max - 1) / 2;
-    let head = max - 1 - tail;
-    let mut out: String = chars[..head].iter().collect();
+    let parts: Vec<&str> = name.graphemes(true).collect();
+    let tail_budget = (max - 1) / 2;
+    let head_budget = max - 1 - tail_budget;
+    let take = |iter: &mut dyn Iterator<Item = &&str>, budget: usize| {
+        let mut used = 0;
+        let mut n = 0;
+        for g in iter {
+            let w = g.width();
+            if used + w > budget {
+                break;
+            }
+            used += w;
+            n += 1;
+        }
+        n
+    };
+    let head = take(&mut parts.iter(), head_budget);
+    let tail = take(&mut parts.iter().rev(), tail_budget).min(parts.len() - head);
+    let mut out: String = parts[..head].concat();
     out.push('…');
-    out.extend(&chars[chars.len() - tail..]);
+    out.push_str(&parts[parts.len() - tail..].concat());
     out
 }
 
@@ -455,6 +490,7 @@ impl Controller {
             tile_step: 1,
             compact: false,
             columns: std::cell::Cell::new(1),
+            name_budget: std::cell::Cell::new(0),
         }
     }
 
@@ -786,6 +822,14 @@ impl Controller {
         self.columns.replace(columns) != columns
     }
 
+    /// Fit the list to a content area `width` wide. True only when the
+    /// middle-cut name budget changed, so a resize rebuilds the rows
+    /// only when some label would read differently.
+    pub fn refit_list(&self, width: f32) -> bool {
+        let budget = name_chars(width);
+        self.name_budget.replace(budget) != budget
+    }
+
     /// The grid as lines of up to `columns` tiles.
     pub fn grid_lines(&self, rows: &[Row]) -> Vec<GridLine> {
         let columns = self.columns.get().max(1);
@@ -910,12 +954,17 @@ impl Controller {
                 self.close_search();
             }
             keys::BACKSPACE => {
-                let mut q = self.listing.query().to_string();
-                if q.pop().is_none() {
+                use unicode_segmentation::UnicodeSegmentation;
+                // Remove what the user sees as one character (é, a flag).
+                let q = self.listing.query();
+                let Some((at, _)) = q.grapheme_indices(true).next_back() else {
                     return Some(self.close_search());
-                }
+                };
+                let q = q[..at].to_string();
                 self.listing.set_query(&q);
             }
+            // No name holds a slash, so "/" is the open key, never text.
+            "/" => return Some(Action::None),
             _ if is_typed(text) => {
                 let q = format!("{}{text}", self.listing.query());
                 self.listing.set_query(&q);
@@ -923,6 +972,30 @@ impl Controller {
             _ => return None,
         }
         Some(Action::Redraw)
+    }
+
+    /// The empty-search state's title and note, when a query is set:
+    /// what was searched for, how much, where, and whether hidden files
+    /// were left out.
+    pub fn no_match_text(&self) -> Option<(String, String)> {
+        let query = self.listing.query();
+        if query.is_empty() {
+            return None;
+        }
+        let hidden = !self.listing.show_hidden() && self.listing.hidden_count() > 0;
+        Some((
+            format!("Nothing matches \"{query}\""),
+            format!(
+                "Searched {} in {}{}",
+                ops::count(self.listing.searchable_count()),
+                self.short_dir(),
+                if hidden {
+                    " (hidden files excluded)"
+                } else {
+                    ""
+                }
+            ),
+        ))
     }
 
     fn close_search(&mut self) -> Action {
@@ -1052,8 +1125,14 @@ impl Controller {
         match kind {
             0 => {
                 self.pressed = Some(index);
+                // Modifier clicks act on press, as in Thunar and Nautilus,
+                // so the selection is right before any drag starts.
                 if let Some((name, _)) = self.row_name(index) {
-                    if !self.listing.selection().contains(&name) {
+                    if mods.ctrl {
+                        self.listing.toggle(name);
+                    } else if mods.shift {
+                        self.listing.select_range_to(name);
+                    } else if !self.listing.selection().contains(&name) {
                         self.listing.select_only(name);
                     }
                 }
@@ -1110,7 +1189,7 @@ impl Controller {
             _ => {
                 self.pressed = None;
                 let Some(drag) = self.drag.take() else {
-                    if !far {
+                    if !far && !mods.ctrl && !mods.shift {
                         if let Some((name, _)) = self.row_name(index) {
                             self.listing.select_only(name);
                         }
@@ -1794,8 +1873,16 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     ui.on_content_resized(move || {
         let Some(ui) = w.upgrade() else { return };
         let Ok(s) = st.try_borrow() else { return };
-        // Grid columns and the list's middle-cut names both follow width.
-        if !s.ctl.grid || s.ctl.fit(ui.get_content_w()) {
+        // Grid columns and the list's middle-cut names both follow width;
+        // rebuild only when one of them changed.
+        let width = ui.get_content_w();
+        ui.global::<Columns>().set_row_w(width);
+        let changed = if s.ctl.grid {
+            s.ctl.fit(width)
+        } else {
+            s.ctl.refit_list(width)
+        };
+        if changed {
             redraw(&ui, &s);
         }
     });
@@ -1808,6 +1895,21 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
             apply(&ui, &st, action);
         }
         handled
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_tile_pointer(move |first, col, kind, dx, dy, far, ctrl, shift| {
+        let action = {
+            let mut s = st.borrow_mut();
+            let columns = s.ctl.columns.get();
+            let offset = tile_offset(col.max(0) as usize, dx, dy, columns);
+            let index = (first + col).max(0) as usize;
+            s.ctl
+                .pointer(index, kind, offset, far, Mods { ctrl, shift })
+        };
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
+        }
     });
     let w = ui.as_weak();
     let st = state.clone();
@@ -2182,6 +2284,7 @@ fn redraw(ui: &AppWindow, s: &State) {
     ui.global::<Columns>().set_row_w(content_w);
     // Before the first layout the width is 0; show full names then.
     let budget = if content_w > 0.0 {
+        ctl.refit_list(content_w);
         name_chars(content_w)
     } else {
         usize::MAX
@@ -2205,14 +2308,17 @@ fn redraw(ui: &AppWindow, s: &State) {
         .iter()
         .zip(&labels)
         .map(
-            |(r, label)| match crate::model::match_span(&r.name, query) {
-                Some((a, b)) if label.is_empty() => {
-                    let chars: Vec<char> = r.name.chars().collect();
-                    let part = |x: usize, y: usize| chars[x..y].iter().collect::<String>().into();
+            |(r, label)| match crate::model::match_runs(&r.name, query) {
+                Some(runs) if label.is_empty() => {
+                    let runs: Vec<MarkRun> = runs
+                        .into_iter()
+                        .map(|(text, hit)| MarkRun {
+                            text: text.into(),
+                            hit,
+                        })
+                        .collect();
                     Mark {
-                        pre: part(0, a),
-                        hit: part(a, b),
-                        post: part(b, chars.len()),
+                        runs: ModelRc::new(Rc::new(VecModel::from(runs))),
                     }
                 }
                 _ => Mark::default(),
@@ -2262,21 +2368,11 @@ fn redraw(ui: &AppWindow, s: &State) {
     } else {
         n.to_string().into()
     });
-    if n == 0 && !ctl.listing.query().is_empty() {
-        ui.set_state_title(format!("Nothing matches \"{}\"", ctl.listing.query()).into());
-        ui.set_state_note(
-            format!(
-                "Searched {} in {}{}",
-                ops::count(ctl.listing.searchable_count()),
-                ctl.short_dir(),
-                if !ctl.listing.show_hidden() && ctl.listing.hidden_count() > 0 {
-                    " (hidden files excluded)"
-                } else {
-                    ""
-                }
-            )
-            .into(),
-        );
+    if n == 0 {
+        if let Some((title, note)) = ctl.no_match_text() {
+            ui.set_state_title(title.into());
+            ui.set_state_note(note.into());
+        }
     }
     ui.set_state(
         if !ctl.loaded {
@@ -3044,6 +3140,13 @@ mod tests {
                 assert!(w as f32 >= TYPE_MIN_LIST);
             }
         }
+        // Sweeping narrower, Type goes once and never comes back.
+        let mut gone = false;
+        for w in (200..1600).rev() {
+            let no_type = columns(w as f32).1;
+            assert!(!gone || no_type, "Type came back at {w}px");
+            gone = no_type;
+        }
         // 913px window with the full sidebar: Type shows.
         assert!(!columns(913.0 - 232.0).1);
         assert!(columns(500.0).1);
@@ -3162,6 +3265,69 @@ mod tests {
 
     #[test]
     fn a_search_with_no_matches_says_where_it_looked() {
+        let mut c = setup("search-nomatch");
+        fs::write(c.dir.join(".secret.jpg"), b"s").unwrap();
+        c.reload().unwrap();
+        assert_eq!(c.no_match_text(), None);
+        c.key("/", false, false);
+        typed(&mut c, "zz");
+        assert!(c.rows().is_empty());
+        let (title, note) = c.no_match_text().unwrap();
+        assert_eq!(title, "Nothing matches \"zz\"");
+        assert!(note.contains("~/Pictures"), "{note}");
+        assert!(note.ends_with(" (hidden files excluded)"), "{note}");
+        c.toggle_hidden();
+        assert!(!c.no_match_text().unwrap().1.contains("hidden"));
+    }
+
+    #[test]
+    fn search_reaches_hidden_files_only_when_they_show() {
+        let mut c = setup("search-hidden");
+        fs::write(c.dir.join(".b-notes"), b"s").unwrap();
+        c.reload().unwrap();
+        c.key("/", false, false);
+        typed(&mut c, "b");
+        let names = |c: &Controller| -> Vec<String> {
+            c.rows().iter().map(|r| r.name.to_string()).collect()
+        };
+        assert_eq!(names(&c), ["b.jpg"]);
+        c.toggle_hidden();
+        assert_eq!(names(&c), [".b-notes", "b.jpg"]);
+        assert_eq!(c.listing.query(), "b", "showing hidden keeps the query");
+    }
+
+    #[test]
+    fn search_filters_the_grid_too() {
+        let mut c = setup("search-grid");
+        c.grid = true;
+        c.columns.set(4);
+        c.key("/", false, false);
+        typed(&mut c, "a.j");
+        let rows = c.rows();
+        let lines = c.grid_lines(&rows);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].n, 1);
+        assert_eq!(rows[0].name, "a.jpg");
+    }
+
+    #[test]
+    fn slash_and_ime_text_while_searching() {
+        let mut c = setup("search-ime");
+        c.key("/", false, false);
+        // "/" can't be in a name; a second one is swallowed, not typed.
+        assert_eq!(c.key("/", false, false), Action::None);
+        assert_eq!(c.listing.query(), "");
+        // An IME or dead key commits several characters in one event.
+        assert_eq!(c.key("写真", false, false), Action::Redraw);
+        assert_eq!(c.key("e\u{301}", false, false), Action::Redraw);
+        assert_eq!(c.listing.query(), "写真e\u{301}");
+        // Backspace takes back the accented letter whole.
+        c.key(keys::BACKSPACE, false, false);
+        assert_eq!(c.listing.query(), "写真");
+    }
+
+    #[test]
+    fn only_printable_keys_count_as_typing() {
         let c = setup("search-where");
         assert_eq!(c.short_dir(), "~/Pictures");
         assert!(!is_typed(keys::UP));
@@ -3188,7 +3354,78 @@ mod tests {
             "dune-sun…0412.jpg"
         );
         assert_eq!(elide_middle("short.jpg", 17), "short.jpg");
+    }
+
+    #[test]
+    fn eliding_keeps_graphemes_whole_and_counts_wide_glyphs_twice() {
+        use unicode_width::UnicodeWidthStr;
+        // e + combining acute is one grapheme; it is never split.
+        let name = "e\u{301}".repeat(20) + ".txt";
+        let cut = elide_middle(&name, 11);
+        assert!(!cut.contains("…\u{301}"));
+        assert!(cut.width() <= 11);
+        // Ten CJK glyphs are 20 cells wide.
+        let cjk = "写真写真写真写真写真.jpg";
+        let cut = elide_middle(cjk, 12);
+        assert!(cut.width() <= 12, "{cut}");
+        assert!(cut.ends_with(".jpg"));
+        assert_eq!(elide_middle("写真.jpg", 12), "写真.jpg");
         assert!(name_chars(567.0) > name_chars(500.0));
+    }
+
+    #[test]
+    fn tile_drags_stay_on_their_line_sideways() {
+        // Column 1 of 4: dx may reach columns 0..=3, no further.
+        assert_eq!(tile_offset(1, 9, 0, 4), 2);
+        assert_eq!(tile_offset(1, -9, 0, 4), -1);
+        assert_eq!(tile_offset(1, 1, 2, 4), 9);
+        assert_eq!(tile_offset(0, 3, 0, 1), 0);
+    }
+
+    #[test]
+    fn list_resizes_rebuild_only_when_the_name_budget_moves() {
+        let c = setup("refit");
+        assert!(c.refit_list(800.0));
+        assert!(!c.refit_list(800.0));
+        let same = (800..900)
+            .find(|w| name_chars(*w as f32) != name_chars(800.0))
+            .unwrap();
+        assert!(!c.refit_list(same as f32 - 1.0));
+        assert!(c.refit_list(same as f32));
+    }
+
+    #[test]
+    fn modifier_clicks_act_on_press() {
+        let mut c = setup("mod-press");
+        let at = |c: &Controller, n: &str| c.rows().iter().position(|r| r.name == n).unwrap();
+        let (a, b) = (at(&c, "a.jpg"), at(&c, "b.jpg"));
+        c.pointer(a, 0, 0, false, Mods::default());
+        c.pointer(a, 2, 0, false, Mods::default());
+        let ctrl = Mods {
+            ctrl: true,
+            shift: false,
+        };
+        c.pointer(b, 0, 0, false, ctrl);
+        assert_eq!(
+            c.listing.selection().len(),
+            2,
+            "ctrl press adds before release"
+        );
+        c.pointer(b, 2, 0, false, ctrl);
+        assert_eq!(c.listing.selection().len(), 2, "release keeps it");
+        c.pointer(b, 0, 0, false, ctrl);
+        assert_eq!(c.listing.selection().len(), 1, "ctrl press toggles off");
+        let first = at(&c, "raw-exports");
+        let shift = Mods {
+            ctrl: false,
+            shift: true,
+        };
+        c.pointer(first, 0, 0, false, shift);
+        assert_eq!(
+            c.listing.selection().len(),
+            3,
+            "shift press selects the range"
+        );
     }
 
     #[test]

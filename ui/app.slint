@@ -16,10 +16,9 @@ export global Columns {
     out property <bool> narrow: row-w < 640px;
     out property <bool> tight: row-w < 480px;
     // Narrow lists drop the Type column before any name is cut.
-    // Type goes when the list is under 560px, or when keeping it would
-    // leave Name under 220px. Mirrored by `name_chars` in app.rs.
-    out property <length> typed-name-w: row-w - pad - mod-w - gutter - 120px - gutter - size-w - gutter - name-x;
-    out property <bool> no-type: row-w < 560px || typed-name-w < 220px;
+    // One cut where the columns stop shrinking, so Type never comes
+    // back as the list narrows. Mirrored by `columns` in app.rs.
+    out property <bool> no-type: row-w < 668px;
     out property <length> size-w: tight ? 64px : narrow ? 72px : 88px;
     out property <length> type-w: no-type ? 0px : 120px;
     // Never below what "MODIFIED" and its sort arrow need.
@@ -56,10 +55,13 @@ export struct Place {
 }
 
 // A searched name split around the part that matched.
+export struct MarkRun {
+    text: string,
+    hit: bool,
+}
+
 export struct Mark {
-    pre: string,
-    hit: string,
-    post: string,
+    runs: [MarkRun],
 }
 
 export struct Row {
@@ -114,6 +116,10 @@ component SideRow inherits Rectangle {
     in property <color> muted;
     in property <color> accent;
     in property <color> selected-bg;
+    // A drive past 85% (amber) or 95% (red) full: on the rail, where the
+    // usage bar is gone, a dot on the icon says so.
+    in property <bool> dot;
+    in property <color> dot-color;
     callback clicked;
     height: side-row;
     border-radius: 6px;
@@ -131,6 +137,14 @@ component SideRow inherits Rectangle {
         color: muted;
         horizontal-alignment: center;
         vertical-alignment: center;
+    }
+    if rail && dot: Rectangle {
+        x: 27px;
+        y: parent.height / 2 - 9px;
+        width: 6px;
+        height: 6px;
+        border-radius: 3px;
+        background: dot-color;
     }
     if !rail: Text {
         text: name;
@@ -701,6 +715,8 @@ export component AppWindow inherits Window {
     // Row index, 0 down / 1 move / 2 up, rows from the pressed row, moved
     // far enough to be a drag, Ctrl, Shift.
     callback row-pointer(int, int, int, bool, bool, bool);
+    // A grid tile's press/drag: line start, column, kind, dx, dy, far, ctrl, shift.
+    callback tile-pointer(int, int, int, int, int, bool, bool, bool);
     callback row-open(int);
     /// A sidebar row: section 0 pinned, 1 devices, 2 trash.
     callback place-open(int, int);
@@ -826,6 +842,8 @@ export component AppWindow inherits Window {
                         muted: root.muted;
                         accent: root.accent;
                         selected-bg: root.selected;
+                        dot: place.usage >= 0 && place.level > 0;
+                        dot-color: place.level == 2 ? root.danger : root.warning;
                     }
                     if !root.rail-on && place.usage >= 0: Rectangle {
                         height: 4px;
@@ -1193,16 +1211,21 @@ export component AppWindow inherits Window {
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
-                            if marks[i].hit != "": HorizontalLayout {
+                            if marks[i].runs.length > 0: HorizontalLayout {
                                 x: Columns.name-x;
                                 width: Columns.name-w(parent.width);
                                 height: parent.height;
                                 opacity: row.hidden ? 0.6 : 1;
-                                Text { text: marks[i].pre; font-size: 12px; font-weight: row.selected ? 700 : 400; color: text; vertical-alignment: center; }
-                                Text { text: marks[i].hit; font-size: 12px; font-weight: row.selected ? 700 : 400; color: accent; vertical-alignment: center; }
-                                Text { text: marks[i].post; font-size: 12px; font-weight: row.selected ? 700 : 400; color: text; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                for run in marks[i].runs: Text {
+                                    text: run.text;
+                                    font-size: 12px;
+                                    font-weight: row.selected ? 700 : 400;
+                                    color: run.hit ? accent : text;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
                             }
-                            if marks[i].hit == "": Text {
+                            if marks[i].runs.length == 0: Text {
                                 text: labels[i] != "" ? labels[i] : row.name;
                                 x: Columns.name-x;
                                 y: 0px;
@@ -1271,37 +1294,37 @@ export component AppWindow inherits Window {
                         height: tile + 60px;
                         if line.n > 0: Tile {
                             glyph: line.g0; name: line.n0; role: line.r0; badge: line.b0; picked: line.s0; hot: line.h0; faded: line.f0;
-                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 0, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.tile-pointer(line.first, 0, kind, dx, dy, far, ctrl, shift); }
                             open => { root.row-open(line.first + 0); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 1: Tile {
                             glyph: line.g1; name: line.n1; role: line.r1; badge: line.b1; picked: line.s1; hot: line.h1; faded: line.f1;
-                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 1, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.tile-pointer(line.first, 1, kind, dx, dy, far, ctrl, shift); }
                             open => { root.row-open(line.first + 1); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 2: Tile {
                             glyph: line.g2; name: line.n2; role: line.r2; badge: line.b2; picked: line.s2; hot: line.h2; faded: line.f2;
-                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 2, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.tile-pointer(line.first, 2, kind, dx, dy, far, ctrl, shift); }
                             open => { root.row-open(line.first + 2); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 3: Tile {
                             glyph: line.g3; name: line.n3; role: line.r3; badge: line.b3; picked: line.s3; hot: line.h3; faded: line.f3;
-                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 3, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.tile-pointer(line.first, 3, kind, dx, dy, far, ctrl, shift); }
                             open => { root.row-open(line.first + 3); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 4: Tile {
                             glyph: line.g4; name: line.n4; role: line.r4; badge: line.b4; picked: line.s4; hot: line.h4; faded: line.f4;
-                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 4, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.tile-pointer(line.first, 4, kind, dx, dy, far, ctrl, shift); }
                             open => { root.row-open(line.first + 4); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 5: Tile {
                             glyph: line.g5; name: line.n5; role: line.r5; badge: line.b5; picked: line.s5; hot: line.h5; faded: line.f5;
-                            pointer(kind, dx, dy, far, ctrl, shift) => { root.row-pointer(line.first + 5, kind, dy * root.grid-columns + dx, far, ctrl, shift); }
+                            pointer(kind, dx, dy, far, ctrl, shift) => { root.tile-pointer(line.first, 5, kind, dx, dy, far, ctrl, shift); }
                             open => { root.row-open(line.first + 5); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
