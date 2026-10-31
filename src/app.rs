@@ -31,6 +31,8 @@ pub enum Dialog {
     Delete(Vec<OsString>),
     /// Empty Trash: everything in the Trash view, deleted for good.
     EmptyTrash(Vec<OsString>),
+    /// Clear thumbnail cache: Robin's own thumbnails under this cache root.
+    ClearThumbs(PathBuf),
     /// A move left `names` where they were. Button 1 is Copy instead when
     /// any of them can be copied; it copies `copy`, the ones that can.
     Refused {
@@ -63,7 +65,7 @@ impl Dialog {
         match self {
             Dialog::Trash(_) => "trash",
             Dialog::TrashNo(_) => "trash-no",
-            Dialog::Delete(_) | Dialog::EmptyTrash(_) => "delete",
+            Dialog::Delete(_) | Dialog::EmptyTrash(_) | Dialog::ClearThumbs(_) => "delete",
             Dialog::Refused { .. } => "move-refused",
             Dialog::Conflict { .. } => "conflict-live",
         }
@@ -83,7 +85,10 @@ impl Dialog {
     /// Cancel so a held Enter can't destroy anything.
     fn default_focus(&self) -> i32 {
         match self {
-            Dialog::Delete(_) | Dialog::EmptyTrash(_) | Dialog::TrashNo(_) => 0,
+            Dialog::Delete(_)
+            | Dialog::EmptyTrash(_)
+            | Dialog::ClearThumbs(_)
+            | Dialog::TrashNo(_) => 0,
             Dialog::Trash(_) => 1,
             Dialog::Refused { can_copy, .. } => i32::from(*can_copy),
             Dialog::Conflict { .. } => 1,
@@ -105,6 +110,8 @@ pub enum Action {
     Answer(Option<ConflictChoice>),
     /// Start a program detached, e.g. xdg-open on a video.
     Launch(Vec<OsString>),
+    /// Delete Robin's thumbnails under this cache root, then rescan stats.
+    ClearThumbs(PathBuf),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -880,7 +887,10 @@ impl Controller {
 
     pub fn open_dialog(&mut self, dialog: Dialog) {
         self.focus = dialog.default_focus();
-        self.armed = !matches!(dialog, Dialog::Delete(_) | Dialog::EmptyTrash(_));
+        self.armed = !matches!(
+            dialog,
+            Dialog::Delete(_) | Dialog::EmptyTrash(_) | Dialog::ClearThumbs(_)
+        );
         self.dialog = Some(dialog);
     }
 
@@ -1265,6 +1275,7 @@ impl Controller {
                 job.empty_trash = true;
                 Action::Run(job)
             }
+            Dialog::ClearThumbs(cache) => Action::ClearThumbs(cache),
             Dialog::Refused {
                 job,
                 copy,
@@ -1765,6 +1776,43 @@ fn cache_home(home: &Path) -> PathBuf {
         }
     }
     home.join(".cache")
+}
+
+/// Ask before clearing Robin's thumbnails from the cache root in use.
+fn ask_clear_thumbs(ui: &AppWindow, st: &Shared) {
+    let Some(home) = st.borrow().ctl.env.home.clone() else {
+        return;
+    };
+    apply(ui, st, Action::Open(Dialog::ClearThumbs(cache_home(&home))));
+}
+
+/// Delete Robin's own thumbnails off the UI thread, then say how many
+/// went and rescan so the cache card shows the new size.
+fn clear_thumbs(ui: &AppWindow, st: &Shared, cache: PathBuf) {
+    let home = st.borrow().ctl.env.home.clone();
+    redraw(ui, &st.borrow());
+    let work = move || crate::thumbs::clear_robins(&cache, home.as_deref());
+    let finish = |ui: &AppWindow, st: &Shared, (n, bytes): (usize, u64)| {
+        let text = match n {
+            0 => "No Robin thumbnails to clear".to_string(),
+            1 => format!("Cleared 1 thumbnail ({})", human(bytes)),
+            n => format!("Cleared {n} thumbnails ({})", human(bytes)),
+        };
+        show_toast(ui, st, "", text, Vec::new(), false, "");
+        if ui.get_stats_mode() != "" {
+            open_stats(ui, st);
+        }
+    };
+    if SCRIPTED.with(|s| s.get()) {
+        finish(ui, st, work());
+        return;
+    }
+    std::thread::spawn(move || {
+        let gone = work();
+        let _ = slint::invoke_from_event_loop(move || {
+            with_state(|ui, st| finish(&ui, st, gone));
+        });
+    });
 }
 
 /// Open the Statistics view and (re)scan on a worker: a home walk can
@@ -2368,6 +2416,12 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     ui.on_stats_rescan(move || {
         if let Some(ui) = w_sr.upgrade() {
             open_stats(&ui, &st_sr);
+        }
+    });
+    let (w_ct, st_ct) = (ui.as_weak(), state.clone());
+    ui.on_stats_clear_thumbs(move || {
+        if let Some(ui) = w_ct.upgrade() {
+            ask_clear_thumbs(&ui, &st_ct);
         }
     });
     let w = ui.as_weak();
@@ -3378,6 +3432,18 @@ fn redraw(ui: &AppWindow, s: &State) {
                     ui.set_confirm_names(names_text(names).into());
                     ui.set_confirm_names_count(names.len().min(6) as i32);
                 }
+                Dialog::ClearThumbs(cache) => {
+                    let home = ctl.env.home.as_deref();
+                    ui.set_confirm_noun("Robin's thumbnails".into());
+                    ui.set_confirm_names(
+                        format!(
+                            "{}\nOther apps' thumbnails stay",
+                            tilde(&cache.join("thumbnails"), home)
+                        )
+                        .into(),
+                    );
+                    ui.set_confirm_names_count(2);
+                }
                 Dialog::Refused { .. } => {}
                 Dialog::Conflict { ask, apply_all } => conflict_props(ui, ask, *apply_all),
             }
@@ -3392,7 +3458,12 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
         Action::None => {}
         Action::Redraw => redraw(ui, &st.borrow()),
         Action::Open(d) => {
-            let delete = matches!(d, Dialog::Delete(_));
+            // Every danger dialog arms after a beat, not just Delete:
+            // Empty Trash used to stay disarmed for good.
+            let delete = matches!(
+                d,
+                Dialog::Delete(_) | Dialog::EmptyTrash(_) | Dialog::ClearThumbs(_)
+            );
             st.borrow_mut().ctl.open_dialog(d);
             redraw(ui, &st.borrow());
             if delete {
@@ -3431,6 +3502,7 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
             });
         }
         Action::Launch(argv) => launch(ui, st, argv),
+        Action::ClearThumbs(cache) => clear_thumbs(ui, st, cache),
         Action::Answer(choice) => {
             if let Some(tx) = st.borrow_mut().reply.take() {
                 let _ = tx.send(choice);
@@ -4861,6 +4933,23 @@ mod tests {
         let names: Vec<_> = job.restore.iter().map(|t| t.stored.clone()).collect();
         assert_eq!(names, vec![OsString::from("a.jpg")]);
         assert!(matches!(c.remove(false), Action::Open(Dialog::Delete(_))));
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn clear_thumbnail_cache_asks_first_and_hands_over_the_cache_root() {
+        let mut c = in_trash_view("thumbs-clear");
+        let cache = c.env.home.clone().unwrap().join(".cache");
+        let d = Dialog::ClearThumbs(cache.clone());
+        assert_eq!(d.overlay(), "delete", "the red confirm dialog");
+        c.open_dialog(d);
+        assert_eq!(c.focus, 0, "Cancel is the default");
+        assert_eq!(c.button(1), Action::None, "not armed yet");
+        assert_eq!(c.button(0), Action::Redraw, "Cancel deletes nothing");
+        assert!(c.dialog.is_none());
+        c.open_dialog(Dialog::ClearThumbs(cache.clone()));
+        c.armed = true;
+        assert_eq!(c.button(1), Action::ClearThumbs(cache));
         let _ = fs::remove_dir_all(c.env.home.unwrap());
     }
 

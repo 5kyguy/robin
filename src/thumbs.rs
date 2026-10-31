@@ -18,6 +18,70 @@ use crate::error::{Error, Result};
 pub const NORMAL: u32 = 128;
 pub const LARGE: u32 = 256;
 pub const BUDGET: u64 = 256 * 1024 * 1024;
+/// The freedesktop `Software` key Robin stamps on every thumbnail it
+/// writes, so Clear thumbnail cache can tell its own entries apart.
+pub const SOFTWARE: &str = "Robin";
+const SIZE_DIRS: [&str; 4] = ["normal", "large", "x-large", "xx-large"];
+
+/// Whether `png` is a thumbnail Robin wrote: its `Software` key says so.
+pub fn is_robins(png: &Path) -> bool {
+    let Ok(file) = fs::File::open(png) else {
+        return false;
+    };
+    let Ok(reader) = png::Decoder::new(std::io::BufReader::new(file)).read_info() else {
+        return false;
+    };
+    reader
+        .info()
+        .uncompressed_latin1_text
+        .iter()
+        .any(|t| t.keyword == "Software" && t.text == SOFTWARE)
+}
+
+/// A cache root Clear thumbnail cache may work in: absolute, and nowhere
+/// near settings or another app's tree.
+pub fn clearable(cache: &Path, home: Option<&Path>) -> bool {
+    let bad = cache.components().any(|c| {
+        let c = c.as_os_str();
+        c == "r2-d2" || c == ".config" || c == ".."
+    });
+    let config = home.map(|h| h.join(".config"));
+    cache.is_absolute() && !bad && config.is_none_or(|c| !cache.starts_with(c))
+}
+
+/// Delete Robin's own thumbnails under `cache/thumbnails/<size>/`: plain
+/// `.png` files stamped by Robin, never symlinks, folders or other apps'
+/// entries. Returns how many files and bytes went.
+pub fn clear_robins(cache: &Path, home: Option<&Path>) -> (usize, u64) {
+    let mut gone = (0, 0);
+    if !clearable(cache, home) {
+        return gone;
+    }
+    for size in SIZE_DIRS {
+        let Ok(dir) = fs::read_dir(cache.join("thumbnails").join(size)) else {
+            continue;
+        };
+        for entry in dir.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() || path.extension().is_none_or(|e| e != "png") {
+                continue;
+            }
+            if is_robins(&path) && fs::remove_file(&path).is_ok() {
+                gone.0 += 1;
+                gone.1 += meta.len();
+            }
+        }
+    }
+    // The index only lists Robin's files; it would now point at nothing.
+    let index = cache.join("robin").join("thumb-index.txt");
+    if fs::symlink_metadata(&index).is_ok_and(|m| m.is_file()) {
+        let _ = fs::remove_file(&index);
+    }
+    gone
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThumbSize {
@@ -220,6 +284,9 @@ fn write_png(
         .write_text_chunk(&png::text_metadata::TEXtChunk::new("Thumb::MTime", mtime))
         .map_err(|e| Error::Message(e.to_string()))?;
     writer
+        .write_text_chunk(&png::text_metadata::TEXtChunk::new("Software", SOFTWARE))
+        .map_err(|e| Error::Message(e.to_string()))?;
+    writer
         .write_image_data(rgba)
         .map_err(|e| Error::Message(e.to_string()))?;
     Ok(())
@@ -330,6 +397,52 @@ mod tests {
         assert_eq!(name.len(), 36);
         assert!(name.ends_with(".png"));
         assert_eq!(name, cache_name(&uri));
+    }
+
+    #[test]
+    fn clearing_removes_only_robins_own_thumbnails() {
+        let root = std::env::temp_dir().join(format!("robin-clear-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let cache = home.join(".cache");
+        let src = root.join("a.png");
+        let req = ThumbRequest {
+            source: &src,
+            cache_home: &cache,
+            size: ThumbSize::Large,
+            mtime: SystemTime::UNIX_EPOCH,
+        };
+        let ours = store_rgba(&req, &[9; 16], 2, 2).unwrap().path;
+        assert!(is_robins(&ours));
+        // Another app's thumbnail, a stray file, a symlink to ours, and a
+        // settings file that must all survive.
+        let normal = cache.join("thumbnails").join("normal");
+        fs::create_dir_all(&normal).unwrap();
+        let theirs = normal.join("theirs.png");
+        image::RgbaImage::new(2, 2).save(&theirs).unwrap();
+        let note = normal.join("note.txt");
+        fs::write(&note, "x").unwrap();
+        let link = normal.join("link.png");
+        std::os::unix::fs::symlink(&ours, &link).unwrap();
+        let config = home.join(".config").join("robin");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("settings.toml"), "x").unwrap();
+
+        let (n, bytes) = clear_robins(&cache, Some(&home));
+        assert_eq!(n, 1);
+        assert!(bytes > 0);
+        assert!(!ours.exists());
+        assert!(theirs.exists() && note.exists());
+        assert!(fs::symlink_metadata(&link).is_ok(), "symlinks are left");
+        assert!(config.join("settings.toml").exists());
+        assert!(!cache.join("robin").join("thumb-index.txt").exists());
+
+        // Refused roots: settings, r2-d2 trees, relative paths.
+        assert!(!clearable(&home.join(".config"), Some(&home)));
+        assert!(!clearable(Path::new("/srv/r2-d2/cache"), None));
+        assert!(!clearable(Path::new("cache"), None));
+        assert!(clearable(&cache, Some(&home)));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

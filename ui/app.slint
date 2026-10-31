@@ -726,6 +726,7 @@ export component AppWindow inherits Window {
     in property <string> stat-trash-count: "";
     callback stats-open();
     callback stats-rescan();
+    callback stats-clear-thumbs();
     in property <string> status-left: "15 items · 1 hidden";
     in property <string> status-right: "";
     in property <bool> hidden-on: false;
@@ -2737,6 +2738,7 @@ export component AppWindow inherits Window {
                 border-width: 1px;
                 border-color: line;
                 Text { text: "Clear thumbnail cache"; font-size: 11px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.stats-clear-thumbs(); } }
             }
         }
         Rectangle {
