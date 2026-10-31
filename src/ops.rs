@@ -491,20 +491,31 @@ impl Outcome {
 /// Where trash goes for folders on the home filesystem.
 #[derive(Clone, Debug)]
 pub struct Env {
-    pub home: PathBuf,
+    /// `None` when `$HOME` is unset: nothing is shown as `~`.
+    pub home: Option<PathBuf>,
     pub home_trash: PathBuf,
 }
 
 impl Env {
     /// `$XDG_DATA_HOME/Trash`, or `~/.local/share/Trash`.
     pub fn from_system() -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/"));
-        let data = std::env::var_os("XDG_DATA_HOME")
+        Self::from_vars(std::env::var_os("HOME"), std::env::var_os("XDG_DATA_HOME"))
+    }
+
+    /// `from_system` with the variables passed in.
+    pub fn from_vars(home: Option<std::ffi::OsString>, data: Option<std::ffi::OsString>) -> Self {
+        // `/` as home would show every path as `~`: treat it as unset.
+        let home = home
+            .filter(|v| !v.is_empty() && Path::new(v) != Path::new("/"))
+            .map(PathBuf::from);
+        let data = data
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share"));
+            .unwrap_or_else(|| {
+                home.as_deref()
+                    .unwrap_or(Path::new("/"))
+                    .join(".local/share")
+            });
         Self {
             home_trash: data.join("Trash"),
             home,
@@ -512,9 +523,19 @@ impl Env {
     }
 }
 
+impl Env {
+    /// A seeded home: trash under its own `.local/share`, never the host's.
+    pub fn for_home(home: &Path) -> Self {
+        Self {
+            home: Some(home.to_path_buf()),
+            home_trash: home.join(".local/share/Trash"),
+        }
+    }
+}
+
 /// Whether Del can trash things in `dir`, or must offer a permanent delete.
 pub fn trash_choice(dir: &Path, env: &Env) -> TrashChoice {
-    if same_filesystem(dir, &env.home) {
+    if env.home.as_deref().is_some_and(|h| same_filesystem(dir, h)) {
         return TrashChoice::Home;
     }
     let creatable = fsops::mount_top(dir).is_ok_and(|top| {
@@ -792,7 +813,7 @@ fn trash_one(
 #[cfg(test)]
 pub(crate) fn undo(items: &[Trashed]) -> (usize, Vec<String>) {
     let env = Env {
-        home: PathBuf::from("/"),
+        home: Some(PathBuf::from("/")),
         home_trash: PathBuf::from("/nonexistent"),
     };
     let out = run(
@@ -901,9 +922,29 @@ mod tests {
         list.iter().map(OsString::from).collect()
     }
 
+    #[test]
+    fn a_fixture_home_keeps_trash_inside_it() {
+        let env = Env::for_home(Path::new("/tmp/fx"));
+        assert_eq!(env.home_trash, Path::new("/tmp/fx/.local/share/Trash"));
+    }
+
+    #[test]
+    fn an_unset_home_is_no_home_not_root() {
+        let env = Env::from_vars(None, None);
+        assert_eq!(env.home, None);
+        assert_eq!(env.home_trash, PathBuf::from("/.local/share/Trash"));
+        let env = Env::from_vars(Some("".into()), Some("/x/data".into()));
+        assert_eq!(env.home, None);
+        assert_eq!(env.home_trash, PathBuf::from("/x/data/Trash"));
+        let env = Env::from_vars(Some("/".into()), None);
+        assert_eq!(env.home, None, "HOME=/ is no home");
+        let env = Env::from_vars(Some("/home/sky".into()), None);
+        assert_eq!(env.home.as_deref(), Some(Path::new("/home/sky")));
+    }
+
     fn env(root: &Path) -> Env {
         Env {
-            home: root.to_path_buf(),
+            home: Some(root.to_path_buf()),
             home_trash: root.join("trash"),
         }
     }

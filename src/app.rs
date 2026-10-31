@@ -168,6 +168,8 @@ pub struct Controller {
     pub focus: i32,
     pub armed: bool,
     pub drag: Option<Drag>,
+    /// Mounts and free space; the system's, or a fixture's in renders.
+    pub mounts: std::sync::Arc<dyn crate::mounts::MountSource>,
     pressed: Option<usize>,
     pub job_running: bool,
     /// A fixed (now, UTC offset) for tests and renders; the system clock
@@ -296,6 +298,29 @@ fn ctrl_letter(text: &str, letter: char) -> bool {
 }
 
 impl Controller {
+    /// The item, selection and clipboard summary. Blank when the folder
+    /// can't be read: "0 items" would claim it is empty.
+    pub fn status_left(&self) -> String {
+        if self.unreadable.is_some() {
+            return String::new();
+        }
+        let n = self.listing.view().len();
+        let sel = self.listing.selection().len();
+        let mut left = ops::count(n);
+        if sel > 0 {
+            left = format!("{left} · {sel} selected");
+        }
+        if let Some(clip) = self.clip.clip() {
+            let verb = if clip.mode == ops::ClipMode::Cut {
+                "cut"
+            } else {
+                "copied"
+            };
+            left = format!("{left} · {} {verb}", ops::count(clip.names.len()));
+        }
+        left
+    }
+
     pub fn new(dir: PathBuf, env: Env) -> Self {
         Self {
             dir,
@@ -306,6 +331,7 @@ impl Controller {
             focus: 0,
             armed: false,
             drag: None,
+            mounts: std::sync::Arc::new(crate::mounts::SystemMounts),
             pressed: None,
             job_running: false,
             clock: None,
@@ -981,13 +1007,101 @@ type Shared = Rc<RefCell<State>>;
 
 thread_local! {
     static STATE: RefCell<Option<(Shared, slint::Weak<AppWindow>)>> = const { RefCell::new(None) };
+    /// Set by the render harness: reads wait in `PENDING_READS` until the
+    /// script lands them, instead of running on a worker thread.
+    static SCRIPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PENDING_READS: RefCell<VecDeque<ReadTicket>> = const { RefCell::new(VecDeque::new()) };
+}
+
+/// `build` for the render harness: the same window and callbacks, with
+/// folder reads held for [`land_reads`] so a script decides when each
+/// one arrives.
+pub fn build_scripted(launch: Launch) -> Result<AppWindow> {
+    SCRIPTED.with(|s| s.set(true));
+    build(launch)
+}
+
+/// Perform and land every held read in the order it was started,
+/// including rereads they queue.
+pub fn land_reads() {
+    while let Some(ticket) = PENDING_READS.with(|p| p.borrow_mut().pop_front()) {
+        let read = ticket.perform();
+        with_state(|ui, st| landed(&ui, st, read));
+    }
+}
+
+/// Start a navigation to `target` at `t0` and hold its read, then move the
+/// clock past `NAV_PENDING_AFTER` so the pending state shows. `phase`
+/// freezes the progress bar's sweep for a still frame.
+pub fn navigate_pending(target: PathBuf, t0: std::time::Instant, phase: f32) {
+    with_state(|ui, st| {
+        let ticket = st.borrow_mut().ctl.begin_navigate_at(target, t0);
+        sync_drop_dest(&st.borrow());
+        let gen = ticket.gen();
+        start_read(Some(ticket));
+        st.borrow_mut().ctl.tick_nav(gen, t0 + NAV_PENDING_AFTER);
+        redraw(&ui, &st.borrow());
+        ui.set_nav_phase(phase);
+    });
+}
+
+/// What a window starts with: the folder, where trash and home are, the
+/// look, and an optional frozen clock for renders.
+pub struct Launch {
+    pub dir: PathBuf,
+    pub env: Env,
+    pub theme: crate::theme::Theme,
+    pub compact: bool,
+    pub clock: Option<(i64, i64)>,
+    pub mounts: std::sync::Arc<dyn crate::mounts::MountSource>,
+}
+
+impl Launch {
+    /// The interactive app: the system's home and trash, cyan, comfortable.
+    pub fn system(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            env: Env::from_system(),
+            theme: crate::theme::Theme::cyan(),
+            compact: false,
+            clock: None,
+            mounts: std::sync::Arc::new(crate::mounts::SystemMounts),
+        }
+    }
 }
 
 pub fn run(dir: PathBuf) -> Result<i32> {
+    let ui = build(Launch::system(dir))?;
+    ui.show().map_err(|e| Error::Message(e.to_string()))?;
+    slint::run_event_loop().map_err(|e| Error::Message(e.to_string()))?;
+    Ok(0)
+}
+
+pub fn apply_theme(ui: &AppWindow, theme: &crate::theme::Theme) {
+    ui.set_bg(theme.bg.to_slint());
+    ui.set_surface(theme.surface.to_slint());
+    ui.set_text(theme.text.to_slint());
+    ui.set_muted(theme.muted.to_slint());
+    ui.set_accent(theme.accent.to_slint());
+    ui.set_on_accent(theme.on_accent.to_slint());
+    ui.set_line(theme.line.to_slint());
+    ui.set_danger(theme.danger.to_slint());
+    ui.set_on_danger(theme.on_danger.to_slint());
+    ui.set_warning(theme.warning.to_slint());
+    ui.set_on_warning(theme.on_warning.to_slint());
+}
+
+/// Make the window and wire every callback, with the startup read
+/// already requested, but don't show it or run the event loop: `run`
+/// does that interactively and the render harness drives it by script.
+pub fn build(launch: Launch) -> Result<AppWindow> {
     let ui = AppWindow::new().map_err(|e| Error::Message(e.to_string()))?;
-    crate::shots::apply_theme(&ui, &crate::theme::Theme::cyan());
+    apply_theme(&ui, &launch.theme);
     ui.set_harness(false);
-    let mut ctl = Controller::new(dir, Env::from_system());
+    ui.set_compact(launch.compact);
+    let mut ctl = Controller::new(launch.dir, launch.env);
+    ctl.clock = launch.clock;
+    ctl.mounts = launch.mounts;
     ctl.loaded = false;
     let startup = ctl.begin_refresh();
     let state: Shared = Rc::new(RefCell::new(State {
@@ -1132,10 +1246,7 @@ pub fn run(dir: PathBuf) -> Result<i32> {
         ui.set_toast_on(false);
         apply(&ui, &st, Action::Run(Job::restore(items)));
     });
-
-    ui.show().map_err(|e| Error::Message(e.to_string()))?;
-    slint::run_event_loop().map_err(|e| Error::Message(e.to_string()))?;
-    Ok(0)
+    Ok(ui)
 }
 
 const WATCH_DEBOUNCE_MS: u64 = 200;
@@ -1261,6 +1372,10 @@ fn poll_watch(ui: &AppWindow, st: &Shared) {
 /// it finishes.
 fn start_read(ticket: Option<ReadTicket>) {
     let Some(ticket) = ticket else { return };
+    if SCRIPTED.with(|s| s.get()) {
+        PENDING_READS.with(|p| p.borrow_mut().push_back(ticket));
+        return;
+    }
     std::thread::spawn(move || {
         let read = ticket.perform();
         let _ = slint::invoke_from_event_loop(move || {
@@ -1374,7 +1489,7 @@ fn redraw(ui: &AppWindow, s: &State) {
     let (column, desc) = ctl.sort_header();
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = ctl.env.home.clone();
     let crumbs: Vec<String> = crate::model::breadcrumbs(ctl.crumb_dir(), home.as_deref())
         .iter()
         .map(|c| c.label.clone())
@@ -1394,21 +1509,8 @@ fn redraw(ui: &AppWindow, s: &State) {
         );
         ui.set_state_note("".into());
     }
+    ui.set_status_left(ctl.status_left().into());
     let n = ctl.listing.view().len();
-    let sel = ctl.listing.selection().len();
-    let mut left = ops::count(n);
-    if sel > 0 {
-        left = format!("{left} · {sel} selected");
-    }
-    if let Some(clip) = ctl.clip.clip() {
-        let verb = if clip.mode == ops::ClipMode::Cut {
-            "cut"
-        } else {
-            "copied"
-        };
-        left = format!("{left} · {} {verb}", ops::count(clip.names.len()));
-    }
-    ui.set_status_left(left.into());
     ui.set_state(
         if !ctl.loaded {
             "loading"
@@ -1971,7 +2073,7 @@ mod tests {
         fs::write(dir.join("a.jpg"), b"a").unwrap();
         fs::write(dir.join("b.jpg"), b"b").unwrap();
         let env = Env {
-            home: root.clone(),
+            home: Some(root.clone()),
             home_trash: root.join("trash"),
         };
         let mut c = Controller::new(dir, env);
@@ -2851,6 +2953,11 @@ mod tests {
         assert!(c.toasts_failure(ReadKind::Refresh));
         c.unreadable = Some(true);
         assert!(!c.toasts_failure(ReadKind::Refresh), "the state says it");
+        assert_eq!(
+            c.status_left(),
+            "",
+            "no item count for a folder it can't read"
+        );
         assert!(
             c.toasts_failure(ReadKind::Navigate),
             "a failed navigation still toasts"
