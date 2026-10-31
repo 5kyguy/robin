@@ -175,6 +175,9 @@ pub struct Controller {
     /// Mounts and free space; the system's, or a fixture's in renders.
     pub mounts: std::sync::Arc<dyn crate::mounts::MountSource>,
     pressed: Option<usize>,
+    /// A Ctrl-press on an already selected item: it is toggled off on
+    /// release, and only if no drag started, so Ctrl-drag can carry it.
+    ctrl_untoggle: Option<OsString>,
     pub job_running: bool,
     /// A fixed (now, UTC offset) for tests and renders; the system clock
     /// and zone otherwise.
@@ -519,6 +522,7 @@ impl Controller {
             drag: None,
             mounts: std::sync::Arc::new(crate::mounts::SystemMounts),
             pressed: None,
+            ctrl_untoggle: None,
             job_running: false,
             clock: None,
             counts: Default::default(),
@@ -1183,10 +1187,13 @@ impl Controller {
         match kind {
             0 => {
                 self.pressed = Some(index);
+                self.ctrl_untoggle = None;
                 // Modifier clicks act on press, as in Thunar and Nautilus,
                 // so the selection is right before any drag starts.
                 if let Some((name, _)) = self.row_name(index) {
-                    if mods.ctrl {
+                    if mods.ctrl && self.listing.selection().contains(&name) {
+                        self.ctrl_untoggle = Some(name);
+                    } else if mods.ctrl {
                         self.listing.toggle(name);
                     } else if mods.shift {
                         self.listing.select_range_to(name);
@@ -1246,8 +1253,11 @@ impl Controller {
             }
             _ => {
                 self.pressed = None;
+                let untoggle = self.ctrl_untoggle.take();
                 let Some(drag) = self.drag.take() else {
-                    if !far && !mods.ctrl && !mods.shift {
+                    if let Some(name) = untoggle {
+                        self.listing.toggle(name);
+                    } else if !far && !mods.ctrl && !mods.shift {
                         if let Some((name, _)) = self.row_name(index) {
                             self.listing.select_only(name);
                         }
@@ -3702,7 +3712,9 @@ mod tests {
         c.pointer(b, 2, 0, false, ctrl);
         assert_eq!(c.listing.selection().len(), 2, "release keeps it");
         c.pointer(b, 0, 0, false, ctrl);
-        assert_eq!(c.listing.selection().len(), 1, "ctrl press toggles off");
+        assert_eq!(c.listing.selection().len(), 2, "off waits for release");
+        c.pointer(b, 2, 0, false, ctrl);
+        assert_eq!(c.listing.selection().len(), 1, "ctrl release toggles off");
         let first = at(&c, "raw-exports");
         let shift = Mods {
             ctrl: false,
@@ -3845,6 +3857,37 @@ mod tests {
         assert_eq!(job.kind, JobKind::Copy);
         assert!(job.dest.ends_with("raw-exports"));
         assert!(c.drag.is_none());
+    }
+
+    #[test]
+    fn ctrl_on_a_selected_item_unselects_on_release_unless_it_dragged() {
+        let ctrl = Mods {
+            ctrl: true,
+            shift: false,
+        };
+        let mut c = setup("ctrl-untoggle");
+        let sel = |c: &Controller| c.listing.selection().iter().cloned().collect::<Vec<_>>();
+        c.pointer(1, 0, 0, false, ctrl);
+        c.pointer(1, 2, 0, false, ctrl);
+        c.pointer(2, 0, 0, false, ctrl);
+        c.pointer(2, 2, 0, false, ctrl);
+        assert_eq!(sel(&c), [OsString::from("a.jpg"), "b.jpg".into()]);
+        // Ctrl-drag the selected a.jpg onto raw-exports: both go, and a.jpg
+        // stays selected.
+        c.pointer(1, 0, 0, false, ctrl);
+        assert_eq!(sel(&c).len(), 2, "not dropped on press");
+        c.pointer(1, 1, -1, true, ctrl);
+        let Action::Run(job) = c.pointer(1, 2, -1, true, ctrl) else {
+            panic!("the drag runs")
+        };
+        assert_eq!(job.kind, JobKind::Copy);
+        assert_eq!(job.names.len(), 2, "the Ctrl-pressed item went too");
+        assert_eq!(sel(&c).len(), 2);
+        // A plain Ctrl-click on it still unselects, on release.
+        c.pointer(1, 0, 0, false, ctrl);
+        assert_eq!(sel(&c).len(), 2);
+        c.pointer(1, 2, 0, false, ctrl);
+        assert_eq!(sel(&c), [OsString::from("b.jpg")]);
     }
 
     #[test]

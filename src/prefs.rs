@@ -74,9 +74,19 @@ impl ViewPrefs {
     /// bigger than [`MAX_PREFS_BYTES`] (a few short lines, never more).
     pub fn load(path: &Path) -> Self {
         use std::io::Read;
-        let Ok(file) = std::fs::File::open(path) else {
+        use std::os::unix::fs::OpenOptionsExt;
+        // No symlinks, and O_NONBLOCK so opening a FIFO can't wait for a
+        // writer; then anything but a regular file is ignored.
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        else {
             return Self::fresh();
         };
+        if !file.metadata().is_ok_and(|m| m.is_file()) {
+            return Self::fresh();
+        }
         let mut bytes = Vec::new();
         let cap = MAX_PREFS_BYTES as u64;
         match file.take(cap + 1).read_to_end(&mut bytes) {
@@ -103,6 +113,28 @@ impl ViewPrefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_ignores_symlinks_fifos_and_folders() {
+        let dir = std::env::temp_dir().join(format!("robin-prefs-odd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut grid = ViewPrefs::fresh();
+        grid.grid = true;
+        let real = dir.join("real");
+        grid.save(&real).unwrap();
+        assert_eq!(ViewPrefs::load(&real), grid, "a regular file loads");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(ViewPrefs::load(&link), ViewPrefs::fresh(), "symlink");
+        let fifo = dir.join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        // Would block forever without O_NONBLOCK: nobody writes the FIFO.
+        assert_eq!(ViewPrefs::load(&fifo), ViewPrefs::fresh(), "fifo");
+        assert_eq!(ViewPrefs::load(&dir), ViewPrefs::fresh(), "folder");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn settings_round_trip_and_damage_falls_back_to_defaults() {
