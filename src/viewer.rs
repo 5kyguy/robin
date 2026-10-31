@@ -8,8 +8,6 @@ use std::path::Path;
 /// Zoom steps are ×1.25, from fit up to 16× (DESIGN §5).
 pub const ZOOM_STEP: f32 = 1.25;
 pub const ZOOM_MAX: f32 = 16.0;
-/// Larger images are refused rather than decoded: 16k × 16k RGBA is 1 GiB.
-pub const MAX_PIXELS: u64 = 16_384 * 16_384;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Media {
@@ -22,8 +20,9 @@ pub enum Media {
 pub fn media(name: &Path) -> Option<Media> {
     let ext = name.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "heic" | "heif" | "avif" | "tif"
-        | "tiff" => Some(Media::Image),
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "heic" | "heif" | "tif" | "tiff" => {
+            Some(Media::Image)
+        }
         "mp4" | "m4v" | "mkv" | "webm" | "mov" | "avi" => Some(Media::Video),
         _ => None,
     }
@@ -79,6 +78,30 @@ impl Viewer {
             info: false,
             strip: true,
         })
+    }
+
+    /// Keep only the items `keep` accepts (after a reread drops deleted
+    /// files), staying on the current item or the one that took its
+    /// place. False when nothing is left.
+    pub fn retain(&mut self, keep: impl Fn(&OsString) -> bool) -> bool {
+        let before = self.items.len();
+        let current = self.current().clone();
+        let gone_before = self.items[..self.index].iter().filter(|n| !keep(n)).count();
+        self.items.retain(|n| keep(n));
+        if self.items.is_empty() {
+            return false;
+        }
+        if self.items.len() != before {
+            match self.items.iter().position(|n| *n == current) {
+                Some(i) => self.index = i,
+                None => {
+                    self.index = (self.index - gone_before).min(self.items.len() - 1);
+                    self.zoom = Zoom::Fit;
+                    self.turns = 0;
+                }
+            }
+        }
+        true
     }
 
     pub fn current(&self) -> &OsString {

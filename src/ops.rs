@@ -513,13 +513,25 @@ pub struct Env {
     pub home_trash: PathBuf,
     /// `$XDG_CONFIG_HOME` when set to an absolute path; else `~/.config`.
     pub config_home: Option<PathBuf>,
+    /// `$XDG_CACHE_HOME` when set to an absolute path; see [`Env::cache_dir`].
+    pub cache_home: Option<PathBuf>,
 }
 
 impl Env {
+    /// `$XDG_CACHE_HOME`, or `~/.cache`; `None` with neither.
+    pub fn cache_dir(&self) -> Option<PathBuf> {
+        self.cache_home
+            .clone()
+            .or_else(|| self.home.as_ref().map(|h| h.join(".cache")))
+    }
+
     /// `$XDG_DATA_HOME/Trash`, or `~/.local/share/Trash`.
     pub fn from_system() -> Self {
         let mut env = Self::from_vars(std::env::var_os("HOME"), std::env::var_os("XDG_DATA_HOME"));
         env.config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute());
+        env.cache_home = std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute());
         env
@@ -543,6 +555,7 @@ impl Env {
             home_trash: data.join("Trash"),
             home,
             config_home: None,
+            cache_home: None,
         }
     }
 }
@@ -561,6 +574,7 @@ impl Env {
             home: Some(home.to_path_buf()),
             home_trash: home.join(".local/share/Trash"),
             config_home: None,
+            cache_home: None,
         }
     }
 }
@@ -989,6 +1003,7 @@ pub(crate) fn undo(items: &[Trashed]) -> (usize, Vec<String>) {
         home: Some(PathBuf::from("/")),
         home_trash: PathBuf::from("/nonexistent"),
         config_home: None,
+        cache_home: None,
     };
     let out = run(
         &Job::restore(items.to_vec()),
@@ -1149,6 +1164,7 @@ mod tests {
             home: Some(root.to_path_buf()),
             home_trash: root.join("trash"),
             config_home: None,
+            cache_home: None,
         }
     }
 

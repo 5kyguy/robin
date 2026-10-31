@@ -39,6 +39,7 @@ fn scripted_views_render_through_the_real_app() {
         ("view-info", 900),
         ("view-turn", 900),
         ("view-video", 900),
+        ("view-loading", 900),
     ];
     for (view, width) in scenes {
         let out = dir.join(format!("{view}-{width}.png"));

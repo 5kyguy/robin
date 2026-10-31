@@ -103,6 +103,8 @@ pub enum Action {
     CancelJob,
     /// Reply to the job thread's conflict question; `None` cancels the job.
     Answer(Option<ConflictChoice>),
+    /// Start a program detached, e.g. xdg-open on a video.
+    Launch(Vec<OsString>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -470,6 +472,18 @@ impl Controller {
         }
     }
 
+    /// Hand the open item to the desktop's default app (xdg-open): the
+    /// way out for videos and for pictures Robin can't show.
+    pub fn viewer_external(&self) -> Action {
+        match self.viewer.as_ref() {
+            Some(v) => Action::Launch(crate::delegate::argv(
+                crate::delegate::Handoff::Default,
+                &self.dir.join(v.current()),
+            )),
+            None => Action::None,
+        }
+    }
+
     /// Close the viewer; the browser's selection lands on the last item
     /// viewed, so Esc after browsing ten photos leaves you on the tenth.
     pub fn close_viewer(&mut self) {
@@ -738,6 +752,8 @@ impl Controller {
                 self.listing.set_sort(key, order);
                 self.listing.set_show_hidden(hidden);
                 self.apply_snapshot(snap);
+                // The viewer browses one folder; leaving it closes it.
+                self.viewer = None;
                 Landed::Shown { moved: true }
             }
             Ok((_, snap)) => {
@@ -749,6 +765,7 @@ impl Controller {
                     return Landed::Unchanged;
                 }
                 self.apply_snapshot(snap);
+                self.prune_viewer();
                 Landed::Shown { moved: false }
             }
             Err(e) => Landed::Failed(e),
@@ -762,6 +779,19 @@ impl Controller {
         match self.land(ticket.perform()) {
             Landed::Failed(e) => Err(e),
             _ => Ok(()),
+        }
+    }
+
+    /// After a reread: drop viewer items that are gone, closing the
+    /// viewer when none are left.
+    fn prune_viewer(&mut self) {
+        let Some(v) = self.viewer.as_mut() else {
+            return;
+        };
+        let present: std::collections::HashSet<&OsString> =
+            self.listing.entries().iter().map(|e| &e.name).collect();
+        if !v.retain(|n| present.contains(n)) {
+            self.viewer = None;
         }
     }
 
@@ -920,6 +950,17 @@ impl Controller {
             return self.dialog_key(text, shift);
         }
         if let Some(v) = self.viewer.as_mut() {
+            if ctrl {
+                // Ctrl+R, Ctrl+Q and friends are the app's, not the viewer's.
+                return Action::None;
+            }
+            let video =
+                crate::viewer::media(Path::new(v.current())) == Some(crate::viewer::Media::Video);
+            if video && text == keys::RETURN {
+                return self.viewer_external();
+            }
+            // Shift+Space steps back, as Space steps on.
+            let text = if shift && text == " " { "h" } else { text };
             let (image, view) = self.view_geom.get();
             return match v.key(text, image, view) {
                 crate::viewer::Step::Ignored => Action::None,
@@ -1579,6 +1620,8 @@ thread_local! {
     /// script lands them, instead of running on a worker thread.
     static SCRIPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PENDING_READS: RefCell<VecDeque<ReadTicket>> = const { RefCell::new(VecDeque::new()) };
+    static PENDING_DECODES: RefCell<VecDeque<DecodeJob>> = const { RefCell::new(VecDeque::new()) };
+    static LAUNCHED: RefCell<Vec<Vec<OsString>>> = const { RefCell::new(Vec::new()) };
     static PENDING_SIDE: RefCell<VecDeque<(u64, crate::sidebar::SideJob)>> = const { RefCell::new(VecDeque::new()) };
 }
 
@@ -1597,6 +1640,9 @@ pub fn land_reads() {
         if let Some(ticket) = PENDING_READS.with(|p| p.borrow_mut().pop_front()) {
             let read = ticket.perform();
             with_state(|ui, st| landed(&ui, st, read));
+        } else if let Some(job) = PENDING_DECODES.with(|p| p.borrow_mut().pop_front()) {
+            let done = job.perform();
+            with_state(|ui, st| decode_landed(&ui, st, done));
         } else if let Some((gen, job)) = PENDING_SIDE.with(|p| p.borrow_mut().pop_front()) {
             let data = job.perform();
             with_state(|ui, st| side_landed(&ui, st, gen, data));
@@ -1978,6 +2024,13 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         let action = st_vk.borrow_mut().ctl.key(&text, false, false);
         if let Some(ui) = w_vk.upgrade() {
             apply(&ui, &st_vk, action);
+        }
+    });
+    let (w_ve, st_ve) = (ui.as_weak(), state.clone());
+    ui.on_view_external(move || {
+        let action = st_ve.borrow().ctl.viewer_external();
+        if let Some(ui) = w_ve.upgrade() {
+            apply(&ui, &st_ve, action);
         }
     });
     ui.on_key(move |text, ctrl, shift, _alt| {
@@ -2363,50 +2416,164 @@ fn remember_prefs(s: &State) {
 pub const STRIP_TILES: usize = 11;
 
 /// A decoded picture, or why there is none.
-type Decoded = std::result::Result<Rc<image::RgbaImage>, String>;
+type Decoded = std::result::Result<Rc<image::RgbaImage>, crate::picture::Why>;
+
+/// Filmstrip tiles kept decoded; older ones are dropped past this.
+const TILE_CACHE: usize = 64;
+/// Longest side of a filmstrip tile's pixels.
+const TILE_SIDE: u32 = 144;
+
+/// A tile: its pixels (for the blurred stand-in) and them as shown, or
+/// `None` when it has no picture (videos without a cached frame).
+type Tile = Option<(Rc<image::RgbaImage>, slint::Image)>;
 
 #[derive(Default)]
 struct Pics {
-    /// The open item, decoded once.
+    /// The last picture decoded; kept on screen while the next loads.
     full: Option<(PathBuf, Decoded)>,
     /// It as shown, turned: (path, turns, image).
     shown: Option<(PathBuf, u8, slint::Image)>,
-    tiles: std::collections::HashMap<PathBuf, slint::Image>,
+    /// The picture asked for, while it decodes.
+    want: Option<PathBuf>,
+    decodes: crate::picture::Decodes<PathBuf>,
+    tiles: std::collections::HashMap<PathBuf, Tile>,
+    /// Tile paths, oldest first, for evicting.
+    tile_order: VecDeque<PathBuf>,
+    /// Tiles being made now (one batch at a time).
+    tiles_pending: std::collections::HashSet<PathBuf>,
+    spinner: Option<slint::Timer>,
 }
 
-/// Decode `path` for the viewer, shrunk to `max_side` when given.
-/// Videos and undecodable stills say why there is no picture.
-fn decode(path: &Path, max_side: Option<u32>) -> Decoded {
-    use crate::viewer::{media, Media};
-    if media(path) == Some(Media::Video) {
-        return Err("Video playback needs libmpv".into());
+/// Work for a decode thread.
+enum DecodeJob {
+    Full {
+        ticket: u64,
+        path: PathBuf,
+    },
+    Tiles {
+        paths: Vec<PathBuf>,
+        cache: Option<PathBuf>,
+    },
+}
+
+/// A finished [`DecodeJob`], sent back to the UI thread. Plain pixels:
+/// Slint images are made on the UI thread.
+enum DecodeDone {
+    Full {
+        ticket: u64,
+        path: PathBuf,
+        pic: std::result::Result<image::RgbaImage, crate::picture::Why>,
+    },
+    Tiles(Vec<(PathBuf, Option<image::RgbaImage>)>),
+}
+
+impl DecodeJob {
+    fn perform(self) -> DecodeDone {
+        match self {
+            DecodeJob::Full { ticket, path } => {
+                let pic = crate::picture::full(&path);
+                DecodeDone::Full { ticket, path, pic }
+            }
+            DecodeJob::Tiles { paths, cache } => DecodeDone::Tiles(
+                paths
+                    .into_iter()
+                    .map(|p| {
+                        let t = crate::picture::tile(&p, TILE_SIDE, cache.as_deref()).ok();
+                        (p, t)
+                    })
+                    .collect(),
+            ),
+        }
     }
-    let reader = image::ImageReader::open(path)
-        .and_then(|r| r.with_guessed_format())
-        .map_err(|e| format!("Can't open: {e}"))?;
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_uppercase())
-        .unwrap_or_default();
-    if reader.format().is_none() {
-        return Err(format!("Can't show {ext} images yet"));
+}
+
+/// Run a decode on a worker thread (or hold it for the render harness).
+fn start_decode(job: DecodeJob) {
+    if SCRIPTED.with(|s| s.get()) {
+        PENDING_DECODES.with(|p| p.borrow_mut().push_back(job));
+        return;
     }
-    let (w, h) = reader
-        .into_dimensions()
-        .map_err(|_| format!("Can't decode this {ext} file"))?;
-    if u64::from(w) * u64::from(h) > crate::viewer::MAX_PIXELS {
-        return Err("Too large to show".into());
+    std::thread::spawn(move || {
+        let done = job.perform();
+        let _ = slint::invoke_from_event_loop(move || {
+            with_state(|ui, st| decode_landed(&ui, st, done));
+        });
+    });
+}
+
+/// A decode finished: keep it if it is still wanted, start what waited.
+fn decode_landed(ui: &AppWindow, st: &Shared, done: DecodeDone) {
+    let s = st.borrow();
+    {
+        let mut pics = s.pics.borrow_mut();
+        match done {
+            DecodeDone::Full { ticket, path, pic } => {
+                let (wanted, next) = pics.decodes.finish(ticket);
+                if let Some((ticket, path)) = next {
+                    start_decode(DecodeJob::Full { ticket, path });
+                }
+                if !wanted || pics.want.as_ref() != Some(&path) {
+                    return;
+                }
+                pics.want = None;
+                pics.spinner = None;
+                pics.full = Some((path, pic.map(Rc::new)));
+            }
+            DecodeDone::Tiles(done) => {
+                for (path, pic) in done {
+                    pics.tiles_pending.remove(&path);
+                    let tile = pic.map(|p| {
+                        let shown = to_slint(&p, 0);
+                        (Rc::new(p), shown)
+                    });
+                    if pics.tiles.insert(path.clone(), tile).is_none() {
+                        pics.tile_order.push_back(path);
+                    }
+                }
+                while pics.tiles.len() > TILE_CACHE {
+                    let Some(old) = pics.tile_order.pop_front() else {
+                        break;
+                    };
+                    pics.tiles.remove(&old);
+                }
+            }
+        }
     }
-    let img = image::ImageReader::open(path)
-        .and_then(|r| r.with_guessed_format())
-        .map_err(|e| format!("Can't open: {e}"))?
-        .decode()
-        .map_err(|_| format!("Can't decode this {ext} file"))?;
-    let img = match max_side {
-        Some(m) => img.thumbnail(m, m),
-        None => img,
+    sync_viewer(ui, &s);
+}
+
+/// Start a program detached from Robin: no shared stdio, and a thread
+/// reaps it so it never lingers as a zombie. Renders and tests record
+/// the argv instead of running anything.
+fn launch(ui: &AppWindow, st: &Shared, argv: Vec<OsString>) {
+    if SCRIPTED.with(|s| s.get()) {
+        LAUNCHED.with(|l| l.borrow_mut().push(argv));
+        return;
+    }
+    use std::process::{Command, Stdio};
+    let Some((program, args)) = argv.split_first() else {
+        return;
     };
-    Ok(Rc::new(img.to_rgba8()))
+    match Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+        }
+        Err(e) => {
+            let text = format!("Couldn't start {}: {e}", program.to_string_lossy());
+            show_toast(ui, st, "", text, Vec::new(), false, "");
+        }
+    }
+}
+
+/// What the render harness was asked to launch, oldest first.
+pub fn launched() -> Vec<Vec<OsString>> {
+    LAUNCHED.with(|l| l.borrow().clone())
 }
 
 /// `img` turned `turns` quarter turns clockwise, as a Slint image.
@@ -2472,16 +2639,57 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
     };
     let path = ctl.dir.join(v.current());
     let mut pics = s.pics.borrow_mut();
-    if pics.full.as_ref().map(|f| &f.0) != Some(&path) {
-        pics.full = Some((path.clone(), decode(&path, None)));
+    let ready = pics.full.as_ref().map(|f| &f.0) == Some(&path);
+    if !ready && pics.want.as_ref() != Some(&path) {
+        pics.want = Some(path.clone());
+        if let Some((ticket, path)) = pics.decodes.request(path.clone()) {
+            start_decode(DecodeJob::Full { ticket, path });
+        }
+        // A spinner only for a slow decode.
+        let w = ui.as_weak();
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::SingleShot,
+            Duration::from_millis(300),
+            move || {
+                if let Some(ui) = w.upgrade() {
+                    ui.set_view_spinner(true);
+                }
+            },
+        );
+        pics.spinner = Some(timer);
     }
-    let pic = pics.full.as_ref().map(|f| f.1.clone()).unwrap();
-    if let Ok(img) = &pic {
-        let key = (path.clone(), v.turns);
-        if pics.shown.as_ref().map(|s| (&s.0, s.1)) != Some((&key.0, key.1)) {
-            pics.shown = Some((key.0, key.1, to_slint(img, v.turns)));
+    if pics.want.is_none() {
+        ui.set_view_spinner(false);
+    }
+    // Until the new picture lands, the last one stays on screen; on a
+    // first open, a blurred tile (or a plain box) stands in.
+    let loading_first = !ready && pics.full.is_none();
+    let placeholder = if loading_first {
+        pics.tiles
+            .get(&path)
+            .and_then(|t| t.as_ref())
+            .map(|(px, _)| to_slint(&image::imageops::blur(px.as_ref(), 4.0), 0))
+            .unwrap_or_default()
+    } else {
+        slint::Image::default()
+    };
+    ui.set_view_loading(loading_first);
+    ui.set_view_placeholder(placeholder);
+    let shown_path = pics.full.as_ref().map(|f| f.0.clone()).unwrap_or_default();
+    let turns = if ready { v.turns } else { 0 };
+    let pic = pics.full.as_ref().map(|f| f.1.clone());
+    if let Some(Ok(img)) = &pic {
+        if pics.shown.as_ref().map(|s| (&s.0, s.1)) != Some((&shown_path, turns)) {
+            pics.shown = Some((shown_path.clone(), turns, to_slint(img, turns)));
         }
     }
+    // A picture still loading shows nothing for zoom and facts yet.
+    let pic = match pic {
+        Some(p) if ready || p.is_ok() => p,
+        _ => Err(crate::picture::Why::Unreadable),
+    };
+    let quiet = !ready;
     let size = ui.window().size().to_logical(ui.window().scale_factor());
     let view_w = size.width - if v.info { 332.0 } else { 0.0 };
     let view = (view_w.max(1.0), size.height.max(1.0));
@@ -2496,7 +2704,7 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
         Ok(img) => {
             let (w, h) = img.dimensions();
             ctl.view_geom.set(((w as f32, h as f32), view));
-            let (dw, dh) = if v.turns % 2 == 1 { (h, w) } else { (w, h) };
+            let (dw, dh) = if turns % 2 == 1 { (h, w) } else { (w, h) };
             ui.set_view_image(pics.shown.as_ref().map(|s| s.2.clone()).unwrap_or_default());
             ui.set_view_px_w(dw as f32);
             ui.set_view_px_h(dh as f32);
@@ -2517,25 +2725,40 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
             ui.set_view_image(slint::Image::default());
             ui.set_view_px_w(0.0);
             ui.set_view_px_h(0.0);
-            ui.set_view_note(why.as_str().into());
+            ui.set_view_note(if quiet {
+                SharedString::new()
+            } else {
+                why.line().into()
+            });
             ui.set_view_zoom(SharedString::new());
             None
         }
     };
     let window = v.strip_window(STRIP_TILES);
     let mut tiles = Vec::new();
+    let mut missing = Vec::new();
     for i in window {
         let p = ctl.dir.join(&v.items[i]);
-        let shot = pics
-            .tiles
-            .entry(p.clone())
-            .or_insert_with(|| {
-                decode(&p, Some(144)).map_or_else(|_| slint::Image::default(), |i| to_slint(&i, 0))
-            })
-            .clone();
+        let shot = match pics.tiles.get(&p) {
+            Some(t) => t.as_ref().map(|t| t.1.clone()).unwrap_or_default(),
+            None => {
+                if !pics.tiles_pending.contains(&p) {
+                    missing.push(p.clone());
+                }
+                slint::Image::default()
+            }
+        };
         tiles.push(crate::ViewTile {
             shot,
             current: i == v.index,
+        });
+    }
+    // One batch of tiles at a time, so scrubbing can't pile them up.
+    if pics.tiles_pending.is_empty() && !missing.is_empty() {
+        pics.tiles_pending.extend(missing.iter().cloned());
+        start_decode(DecodeJob::Tiles {
+            paths: missing,
+            cache: ctl.env.cache_dir(),
         });
     }
     ui.set_view_tiles(Rc::new(VecModel::from(tiles)).into());
@@ -2762,6 +2985,7 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
                 }
             });
         }
+        Action::Launch(argv) => launch(ui, st, argv),
         Action::Answer(choice) => {
             if let Some(tx) = st.borrow_mut().reply.take() {
                 let _ = tx.send(choice);
@@ -3288,6 +3512,7 @@ mod tests {
             home: Some(root.clone()),
             home_trash: root.join("trash"),
             config_home: None,
+            cache_home: None,
         };
         let mut c = Controller::new(dir, env);
         c.reload().unwrap();
@@ -3959,28 +4184,81 @@ mod tests {
 
     #[test]
     fn decode_reads_real_stills_and_explains_the_rest() {
+        use crate::picture::{full, tile, Why};
         let dir = std::env::temp_dir().join(format!("robin-decode-{}", std::process::id()));
         crate::thumbs::write_fixture_stills(&dir).unwrap();
-        let img = decode(&dir.join("dune-sunset-0412.jpg"), None).unwrap();
+        let img = full(&dir.join("dune-sunset-0412.jpg")).unwrap();
         assert_eq!(img.dimensions(), (320, 180));
-        let small = decode(&dir.join("speeder-frame.png"), Some(144)).unwrap();
+        let small = tile(&dir.join("speeder-frame.png"), 144, None).unwrap();
         assert_eq!(small.dimensions(), (144, 81));
         fs::write(dir.join("x.heic"), b"ftypheic").unwrap();
-        assert_eq!(
-            decode(&dir.join("x.heic"), None).unwrap_err(),
-            "Can't show HEIC images yet"
-        );
+        assert_eq!(full(&dir.join("x.heic")).unwrap_err(), Why::Unreadable);
         fs::write(dir.join("x.mp4"), b"v").unwrap();
-        assert_eq!(
-            decode(&dir.join("x.mp4"), None).unwrap_err(),
-            "Video playback needs libmpv"
-        );
-        fs::write(dir.join("broken.png"), b"\x89PNG\r\n\x1a\nnope").unwrap();
-        assert_eq!(
-            decode(&dir.join("broken.png"), None).unwrap_err(),
-            "Can't decode this PNG file"
-        );
+        assert_eq!(full(&dir.join("x.mp4")).unwrap_err(), Why::Video);
+        assert_eq!(Why::Video.line(), "No built-in video player yet");
+        assert_eq!(Why::Unreadable.line(), "Can't read this file");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_deleted_while_open_leaves_the_viewer() {
+        let mut c = setup("viewer-deleted");
+        select(&mut c, "a.jpg");
+        c.key(keys::RETURN, false, false);
+        fs::remove_file(c.dir.join("a.jpg")).unwrap();
+        c.refresh().unwrap();
+        let v = c.viewer.as_ref().unwrap();
+        assert_eq!(v.items, vec![OsString::from("b.jpg")], "not cached");
+        assert_eq!(v.current(), "b.jpg");
+        fs::remove_file(c.dir.join("b.jpg")).unwrap();
+        c.refresh().unwrap();
+        assert!(c.viewer.is_none(), "nothing left to show");
+    }
+
+    #[test]
+    fn viewer_keys_leave_ctrl_to_the_app_and_shift_space_goes_back() {
+        let mut c = setup("viewer-keys");
+        select(&mut c, "a.jpg");
+        c.key(keys::RETURN, false, false);
+        c.key(" ", false, false);
+        assert_eq!(c.viewer.as_ref().unwrap().current(), "b.jpg");
+        c.key(" ", false, true);
+        assert_eq!(c.viewer.as_ref().unwrap().current(), "a.jpg");
+        assert_eq!(
+            c.key("r", true, false),
+            Action::None,
+            "Ctrl+R falls through"
+        );
+        assert_eq!(
+            c.key("q", true, false),
+            Action::None,
+            "Ctrl+Q falls through"
+        );
+        assert_eq!(c.viewer.as_ref().unwrap().turns, 0);
+        assert!(c.viewer.is_some());
+    }
+
+    #[test]
+    fn navigating_away_closes_the_viewer() {
+        let mut c = setup("viewer-nav");
+        fs::create_dir(c.dir.join("sub")).unwrap();
+        select(&mut c, "a.jpg");
+        c.key(keys::RETURN, false, false);
+        let t = c.ticket(c.dir.join("sub"), ReadKind::Navigate);
+        c.land(t.perform());
+        assert!(c.viewer.is_none());
+    }
+
+    #[test]
+    fn return_on_a_video_hands_it_to_the_default_player() {
+        let mut c = setup("viewer-video");
+        fs::write(c.dir.join("clip.mp4"), b"v").unwrap();
+        c.reload().unwrap();
+        select(&mut c, "clip.mp4");
+        c.key(keys::RETURN, false, false);
+        let want = Action::Launch(vec!["xdg-open".into(), c.dir.join("clip.mp4").into()]);
+        assert_eq!(c.viewer_external(), want);
+        assert_eq!(c.key(keys::RETURN, false, false), want);
     }
 
     #[test]

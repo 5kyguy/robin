@@ -46,6 +46,7 @@ pub fn scripted(view: &str) -> bool {
             | "view-info"
             | "view-turn"
             | "view-video"
+            | "view-loading"
     )
 }
 
@@ -239,11 +240,23 @@ fn paint_in(
         // Not contiguous anywhere: only the d and the j light up.
         "search-letters" => type_keys(&ui, "/dj"),
         // Return on a photo opens it; the scene's keys then act in the viewer.
+        // The decode is held: the stand-in box shows.
+        "view-loading" => {
+            select_row(&ui, "dune-sunset-0412.jpg");
+            type_keys(&ui, "\n");
+        }
         "view-image" | "view-zoom" | "view-info" | "view-turn" => {
             select_row(&ui, "dune-sunset-0412.jpg");
             type_keys(&ui, "\n");
+            // Land the decode (and tiles) before zooming: zoom steps
+            // need the picture's size.
+            app::land_reads();
             match view {
-                "view-zoom" => type_keys(&ui, "l++++"),
+                "view-zoom" => {
+                    type_keys(&ui, "l");
+                    app::land_reads();
+                    type_keys(&ui, "++++");
+                }
                 "view-info" => type_keys(&ui, "i"),
                 "view-turn" => type_keys(&ui, "r"),
                 _ => {}
@@ -252,6 +265,7 @@ fn paint_in(
         "view-video" => {
             select_row(&ui, "speeder-run.mp4");
             type_keys(&ui, "\n");
+            app::land_reads();
         }
         "trash-empty-confirm" => ui.invoke_trash_empty(),
         // Select the item with no trashinfo; the banner explains it.

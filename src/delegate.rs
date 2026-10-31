@@ -15,6 +15,8 @@ pub enum Handoff {
     Terminal,
     Notify,
     CopyPath,
+    /// The desktop's default app for the file, as a double-click would.
+    Default,
 }
 
 pub fn argv(kind: Handoff, target: &Path) -> Vec<OsString> {
@@ -27,6 +29,7 @@ pub fn argv(kind: Handoff, target: &Path) -> Vec<OsString> {
         Handoff::Terminal => "xdg-terminal-exec",
         Handoff::Notify => "r2-d2-notification-send",
         Handoff::CopyPath => "wl-copy",
+        Handoff::Default => "xdg-open",
     };
     let mut out = vec![OsString::from(program)];
     match kind {
@@ -56,6 +59,7 @@ mod tests {
             Handoff::Terminal,
             Handoff::Notify,
             Handoff::CopyPath,
+            Handoff::Default,
         ] {
             let argv = argv(kind, path);
             assert!(!argv[0].to_string_lossy().contains(' '));
@@ -64,5 +68,6 @@ mod tests {
         assert_eq!(argv(Handoff::Pdf, path)[0], "zathura");
         assert_eq!(argv(Handoff::Terminal, path).len(), 1);
         assert_eq!(argv(Handoff::CopyPath, path)[1], "/tmp/notes.pdf");
+        assert_eq!(argv(Handoff::Default, path), ["xdg-open", "/tmp/notes.pdf"]);
     }
 }
