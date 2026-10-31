@@ -216,6 +216,9 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         }
         .into(),
     );
+    if view == "loading-large-dir" {
+        ui.set_state_note("18 240 items".into());
+    }
     let kept = |path: &str, reason| crate::fsops::KeptEntry {
         path: path.into(),
         reason,

@@ -175,6 +175,77 @@ pub struct Controller {
     pub clock: Option<(i64, i64)>,
     /// Item counts of the folders in the open folder, taken on each reread.
     pub counts: std::collections::HashMap<OsString, usize>,
+    /// False until the first read of the open folder lands.
+    pub loaded: bool,
+    /// Bumped by every read request; a result from an older one is dropped.
+    read_gen: u64,
+    /// The read in flight, if any, and whether it is a navigation.
+    in_flight: Option<ReadKind>,
+}
+
+/// Why a folder is read: a navigation keeps the old folder on screen and
+/// never falls back; a refresh rereads the open folder and, when it is
+/// gone, walks up to the nearest ancestor that still exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadKind {
+    Navigate,
+    Refresh,
+}
+
+/// A read to run off the UI thread.
+#[derive(Debug)]
+pub struct ReadTicket {
+    gen: u64,
+    kind: ReadKind,
+    dir: PathBuf,
+}
+
+/// A finished read: the folder actually read (an ancestor after a
+/// fallback) and its snapshot, or the error.
+#[derive(Debug)]
+pub struct ReadResult {
+    gen: u64,
+    kind: ReadKind,
+    result: Result<(PathBuf, Snapshot)>,
+}
+
+impl ReadTicket {
+    /// Do the blocking read. Only ENOENT/ENOTDIR on a refresh walk up.
+    pub fn perform(self) -> ReadResult {
+        let result = match Snapshot::read(&self.dir) {
+            Ok(snap) => Ok((self.dir, snap)),
+            Err(e) if e.is_gone() && self.kind == ReadKind::Refresh => {
+                let mut dir = self.dir;
+                let mut found = None;
+                while dir.pop() {
+                    if let Ok(snap) = Snapshot::read(&dir) {
+                        found = Some((dir, snap));
+                        break;
+                    }
+                }
+                found.ok_or(e)
+            }
+            Err(e) => Err(e),
+        };
+        ReadResult {
+            gen: self.gen,
+            kind: self.kind,
+            result,
+        }
+    }
+}
+
+/// What landing a read did to the controller.
+#[derive(Debug)]
+pub enum Landed {
+    /// A newer request superseded it; nothing changed.
+    Stale,
+    /// Same entries and counts as shown.
+    Unchanged,
+    /// Applied; `moved` when the open folder changed.
+    Shown { moved: bool },
+    /// The read failed; the open folder and listing are kept.
+    Failed(Error),
 }
 
 pub mod keys {
@@ -213,43 +284,78 @@ impl Controller {
             job_running: false,
             clock: None,
             counts: Default::default(),
+            loaded: true,
+            read_gen: 0,
+            in_flight: None,
         }
     }
 
-    /// Reread after an outside change. Only when the folder itself is
-    /// gone (ENOENT/ENOTDIR) fall back to the nearest ancestor that still
-    /// exists; any other error keeps the folder and is returned.
-    pub fn refresh(&mut self) -> Result<()> {
-        match self.reload() {
-            Err(e) if e.is_gone() => self.fall_back(),
-            other => other,
+    /// Ask to open `dir`. The current folder stays until the read lands.
+    pub fn begin_navigate(&mut self, dir: PathBuf) -> ReadTicket {
+        self.ticket(dir, ReadKind::Navigate)
+    }
+
+    /// Ask to reread the open folder; `None` while a navigation is in
+    /// flight, since its result will replace this folder anyway.
+    pub fn begin_refresh(&mut self) -> Option<ReadTicket> {
+        if self.in_flight == Some(ReadKind::Navigate) {
+            return None;
+        }
+        Some(self.ticket(self.dir.clone(), ReadKind::Refresh))
+    }
+
+    /// Whether no read is in flight.
+    pub fn idle(&self) -> bool {
+        self.in_flight.is_none()
+    }
+
+    fn ticket(&mut self, dir: PathBuf, kind: ReadKind) -> ReadTicket {
+        self.read_gen += 1;
+        self.in_flight = Some(kind);
+        ReadTicket {
+            gen: self.read_gen,
+            kind,
+            dir,
         }
     }
 
-    fn fall_back(&mut self) -> Result<()> {
-        let mut dir = self.dir.clone();
-        while dir.pop() {
-            if let Ok(snap) = Snapshot::read(&dir) {
+    /// Apply a finished read unless a newer request superseded it.
+    pub fn land(&mut self, read: ReadResult) -> Landed {
+        if read.gen != self.read_gen {
+            return Landed::Stale;
+        }
+        self.in_flight = None;
+        let was_loaded = std::mem::replace(&mut self.loaded, true);
+        match read.result {
+            Ok((dir, snap)) if dir != self.dir => {
                 let (key, order) = self.listing.sort();
                 self.dir = dir;
                 self.listing = Listing::default();
                 self.listing.set_sort(key, order);
                 self.apply_snapshot(snap);
-                return Ok(());
+                Landed::Shown { moved: true }
             }
+            Ok((_, snap)) => {
+                if was_loaded
+                    && snap.entries == self.listing.entries()
+                    && snap.counts == self.counts
+                {
+                    return Landed::Unchanged;
+                }
+                self.apply_snapshot(snap);
+                Landed::Shown { moved: false }
+            }
+            Err(e) => Landed::Failed(e),
         }
-        self.reload()
     }
 
-    /// Apply a reread folder, or a gone/error result, as `refresh` would.
-    pub fn apply_read(&mut self, read: Result<Snapshot>) -> Result<()> {
-        match read {
-            Ok(snap) => {
-                self.apply_snapshot(snap);
-                Ok(())
-            }
-            Err(e) if e.is_gone() => self.fall_back(),
-            Err(e) => Err(e),
+    /// Reread after an outside change, synchronously, through the same
+    /// path as the worker: only a gone folder falls back to an ancestor.
+    pub fn refresh(&mut self) -> Result<()> {
+        let ticket = self.ticket(self.dir.clone(), ReadKind::Refresh);
+        match self.land(ticket.perform()) {
+            Landed::Failed(e) => Err(e),
+            _ => Ok(()),
         }
     }
 
@@ -750,8 +856,6 @@ struct State {
     fallback: Option<crate::watch::Fallback>,
     debounce: crate::model::Debounce,
     watch_timer: slint::Timer,
-    /// A reread running off the UI thread: the folder and its result.
-    reading: Option<(PathBuf, mpsc::Receiver<Result<Snapshot>>)>,
     /// The last reread error shown, so it isn't repeated every tick.
     read_error: Option<String>,
     /// Paths another app dropped on the window, each with the folder that
@@ -772,7 +876,8 @@ pub fn run(dir: PathBuf) -> Result<i32> {
     crate::shots::apply_theme(&ui, &crate::theme::Theme::cyan());
     ui.set_harness(false);
     let mut ctl = Controller::new(dir, Env::from_system());
-    ctl.reload()?;
+    ctl.loaded = false;
+    let startup = ctl.begin_refresh();
     let state: Shared = Rc::new(RefCell::new(State {
         ctl,
         queue: VecDeque::new(),
@@ -788,13 +893,13 @@ pub fn run(dir: PathBuf) -> Result<i32> {
         fallback: None,
         debounce: debounce(),
         watch_timer: slint::Timer::default(),
-        reading: None,
         read_error: None,
         dropped: Rc::default(),
         drop_dest: Rc::default(),
     }));
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
     redraw(&ui, &state.borrow());
+    start_read(startup);
     {
         // Inbound drops from other apps. winit reports one DroppedFile per
         // path (X11 only in winit 0.30) and no pointer position, so they
@@ -1022,56 +1127,54 @@ fn poll_watch(ui: &AppWindow, st: &Shared) {
             s.debounce.push(now);
         }
     }
-    if let Some((dir, rx)) = &s.reading {
-        let Ok(read) = rx.try_recv() else {
-            return; // still reading
-        };
-        let dir = dir.clone();
-        s.reading = None;
-        if dir != s.ctl.dir {
-            return; // navigated away meanwhile
-        }
-        let unchanged = matches!(&read, Ok(snap) if snap.entries == s.ctl.listing.entries()
-            && snap.counts == s.ctl.counts);
-        if unchanged {
-            return;
-        }
-        match s.ctl.apply_read(read) {
-            Ok(()) => s.read_error = None,
-            Err(e) => {
-                let text = e.to_string();
-                if s.read_error.as_deref() != Some(text.as_str()) {
-                    s.read_error = Some(text.clone());
-                    let st = st.clone();
-                    let ui = ui.as_weak();
-                    slint::Timer::single_shot(Duration::ZERO, move || {
-                        if let Some(ui) = ui.upgrade() {
-                            show_toast(&ui, &st, "danger", text, Vec::new(), false, "");
-                        }
-                    });
-                }
-                return;
+    if s.ctl.idle() && s.debounce.ready(now) {
+        start_read(s.ctl.begin_refresh());
+    }
+}
+
+/// Run a read on a worker thread and land it on the UI thread as soon as
+/// it finishes.
+fn start_read(ticket: Option<ReadTicket>) {
+    let Some(ticket) = ticket else { return };
+    std::thread::spawn(move || {
+        let read = ticket.perform();
+        let _ = slint::invoke_from_event_loop(move || {
+            with_state(|ui, st| landed(&ui, st, read));
+        });
+    });
+}
+
+/// Show a finished read: a navigation or fallback starts at the top, a
+/// reread keeps the scroll offset; errors keep the folder and toast.
+fn landed(ui: &AppWindow, st: &Shared, read: ReadResult) {
+    let kind = read.kind;
+    let mut s = st.borrow_mut();
+    match s.ctl.land(read) {
+        Landed::Stale | Landed::Unchanged => {}
+        Landed::Shown { moved } => {
+            s.read_error = None;
+            let (list_y, grid_y) = (ui.get_list_scroll(), ui.get_grid_scroll());
+            redraw(ui, &s);
+            if moved {
+                ui.set_list_scroll(0.0);
+                ui.set_grid_scroll(0.0);
+            } else {
+                ui.set_list_scroll(list_y);
+                ui.set_grid_scroll(grid_y);
             }
         }
-        let (list_y, grid_y) = (ui.get_list_scroll(), ui.get_grid_scroll());
-        redraw(ui, s);
-        if s.ctl.dir == dir {
-            ui.set_list_scroll(list_y);
-            ui.set_grid_scroll(grid_y);
-        } else {
-            ui.set_list_scroll(0.0);
-            ui.set_grid_scroll(0.0);
+        Landed::Failed(e) => {
+            let text = e.to_string();
+            redraw(ui, &s);
+            if kind == ReadKind::Refresh {
+                if s.read_error.as_deref() == Some(text.as_str()) {
+                    return;
+                }
+                s.read_error = Some(text.clone());
+            }
+            drop(s);
+            show_toast(ui, st, "danger", text, Vec::new(), false, "");
         }
-        return;
-    }
-    if s.debounce.ready(now) {
-        let dir = s.ctl.dir.clone();
-        let (tx, rx) = mpsc::channel();
-        let path = dir.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(Snapshot::read(&path));
-        });
-        s.reading = Some((dir, rx));
     }
 }
 
@@ -1153,7 +1256,16 @@ fn redraw(ui: &AppWindow, s: &State) {
         left = format!("{left} · {} {verb}", ops::count(clip.names.len()));
     }
     ui.set_status_left(left.into());
-    ui.set_state(if n == 0 { "empty" } else { "files" }.into());
+    ui.set_state(
+        if !ctl.loaded {
+            "loading"
+        } else if n == 0 {
+            "empty"
+        } else {
+            "files"
+        }
+        .into(),
+    );
     match ctl.drag_label() {
         Some((label, glyph)) => {
             ui.set_drag_label(label.into());
@@ -1204,21 +1316,8 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
             }
         }
         Action::Navigate(dir) => {
-            let mut s = st.borrow_mut();
-            let old = std::mem::replace(&mut s.ctl.dir, dir);
-            let (key, order) = s.ctl.listing.sort();
-            s.ctl.listing = Listing::default();
-            s.ctl.listing.set_sort(key, order);
-            if let Err(e) = s.ctl.reload() {
-                s.ctl.dir = old;
-                let _ = s.ctl.reload();
-                drop(s);
-                show_toast(ui, st, "danger", e.to_string(), Vec::new(), false, "");
-                return;
-            }
-            redraw(ui, &s);
-            ui.set_list_scroll(0.0);
-            ui.set_grid_scroll(0.0);
+            let ticket = st.borrow_mut().ctl.begin_navigate(dir);
+            start_read(Some(ticket));
         }
         Action::Answer(choice) => {
             if let Some(tx) = st.borrow_mut().reply.take() {
@@ -1538,7 +1637,8 @@ fn done(ui: &AppWindow, st: &Shared, job: Job, outcome: Outcome) {
         let mut s = st.borrow_mut();
         s.ctl.job_running = false;
         s.cancel = None;
-        let _ = s.ctl.reload();
+        let ticket = s.ctl.begin_refresh();
+        start_read(ticket);
         s.ctl.finish(&job, &outcome)
     };
     redraw(ui, &st.borrow());
@@ -2362,12 +2462,103 @@ mod tests {
     }
 
     #[test]
+    fn navigation_keeps_the_old_folder_until_its_read_lands() {
+        let mut c = setup("nav-async");
+        let old = c.dir.clone();
+        let ticket = c.begin_navigate(old.join("raw-exports"));
+        assert_eq!(c.dir, old, "no switch before the read lands");
+        assert_eq!(c.listing.entries().len(), 3, "old listing still shown");
+        assert!(c.begin_refresh().is_none(), "a reread can't cancel it");
+        assert!(matches!(
+            c.land(ticket.perform()),
+            Landed::Shown { moved: true }
+        ));
+        assert_eq!(c.dir, old.join("raw-exports"));
+        assert!(c.listing.entries().is_empty());
+        assert!(c.idle());
+    }
+
+    #[test]
+    fn a_superseded_read_is_dropped() {
+        let mut c = setup("nav-stale");
+        let old = c.dir.clone();
+        let first = c.begin_navigate(old.join("raw-exports"));
+        let second = c.begin_navigate(old.parent().unwrap().to_path_buf());
+        assert!(matches!(c.land(first.perform()), Landed::Stale));
+        assert_eq!(c.dir, old, "the stale folder never shows");
+        assert!(!c.idle());
+        assert!(matches!(
+            c.land(second.perform()),
+            Landed::Shown { moved: true }
+        ));
+        assert_eq!(&c.dir, old.parent().unwrap());
+        // A reread overtaken by a navigation is dropped too.
+        let reread = c.begin_refresh().unwrap();
+        let nav = c.begin_navigate(old.clone());
+        assert!(matches!(c.land(reread.perform()), Landed::Stale));
+        assert!(matches!(
+            c.land(nav.perform()),
+            Landed::Shown { moved: true }
+        ));
+        assert_eq!(c.dir, old);
+    }
+
+    #[test]
+    fn a_failed_navigation_stays_put_and_never_falls_back() {
+        let mut c = setup("nav-fail");
+        let old = c.dir.clone();
+        let ticket = c.begin_navigate(old.join("missing").join("deeper"));
+        let Landed::Failed(e) = c.land(ticket.perform()) else {
+            panic!("navigating to a missing folder should fail")
+        };
+        assert!(e.is_gone());
+        assert_eq!(c.dir, old);
+        assert_eq!(c.listing.entries().len(), 3);
+        assert!(c.idle());
+    }
+
+    #[test]
+    fn a_worker_reread_walks_up_only_when_gone() {
+        let mut c = setup("reread-gone");
+        let sub = c.dir.join("raw-exports");
+        let nav = c.begin_navigate(sub.clone());
+        c.land(nav.perform());
+        let ticket = c.begin_refresh().unwrap();
+        fs::remove_dir(&sub).unwrap();
+        assert!(matches!(
+            c.land(ticket.perform()),
+            Landed::Shown { moved: true }
+        ));
+        assert_eq!(&c.dir, sub.parent().unwrap(), "fell back on the worker");
+        let ticket = c.begin_refresh().unwrap();
+        assert!(matches!(c.land(ticket.perform()), Landed::Unchanged));
+    }
+
+    #[test]
+    fn startup_shows_loading_until_the_first_read_lands() {
+        let mut c = setup("startup");
+        c.loaded = false;
+        let ticket = c.begin_refresh().unwrap();
+        assert!(!c.loaded);
+        assert!(matches!(
+            c.land(ticket.perform()),
+            Landed::Shown { moved: false }
+        ));
+        assert!(c.loaded);
+    }
+
+    #[test]
     fn a_reread_error_other_than_gone_keeps_the_folder() {
         let mut c = setup("refresh-error");
         let dir = c.dir.clone();
         let denied = Error::io(&dir, std::io::Error::from_raw_os_error(libc::EACCES));
         assert!(!denied.is_gone());
-        assert!(c.apply_read(Err(denied)).is_err());
+        let read = ReadResult {
+            gen: c.ticket(dir.clone(), ReadKind::Refresh).gen,
+            kind: ReadKind::Refresh,
+            result: Err(denied),
+        };
+        assert!(matches!(c.land(read), Landed::Failed(_)));
         assert_eq!(c.dir, dir, "no jump to the parent on EACCES");
         assert!(!c.listing.entries().is_empty(), "old listing kept");
         let gone = Error::io(&dir, std::io::Error::from_raw_os_error(libc::ENOTDIR));
@@ -2384,11 +2575,15 @@ mod tests {
             fs::write(c.dir.join(format!("f{i:06}.jpg")), b"").unwrap();
         }
         let mut c = c;
+        let big = c.dir.clone();
+        c.dir = big.parent().unwrap().to_path_buf();
+        c.reload().unwrap();
+        let ticket = c.begin_navigate(big);
         let t = std::time::Instant::now();
-        let snap = Snapshot::read(&c.dir).unwrap();
+        let done = ticket.perform();
         let read = t.elapsed();
         let t = std::time::Instant::now();
-        c.apply_snapshot(snap);
+        assert!(matches!(c.land(done), Landed::Shown { moved: true }));
         let apply = t.elapsed();
         let t = std::time::Instant::now();
         let rows = c.rows();
