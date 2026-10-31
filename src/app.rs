@@ -162,6 +162,8 @@ fn subfolder_counts(
 }
 
 pub struct Controller {
+    /// The type-to-filter field is open (Ctrl+F or `/`).
+    pub searching: bool,
     pub dir: PathBuf,
     pub listing: Listing,
     pub clip: Clipboard,
@@ -232,6 +234,14 @@ pub fn name_chars(width: f32) -> usize {
     let kind = if width < 680.0 { 0.0 } else { 120.0 + 16.0 };
     let name_w = width - 12.0 - modified - 2.0 * 16.0 - kind - size - 40.0;
     ((name_w / 7.3).floor().max(6.0)) as usize
+}
+
+/// One printable character, as typed into a search: not a key name
+/// like Escape or an arrow, which arrive as control or private-use chars.
+fn is_typed(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!((chars.next(), chars.next()), (Some(c), None)
+        if !c.is_control() && !('\u{f700}'..='\u{f8ff}').contains(&c))
 }
 
 /// "812 GB free of 1.8 TB" as "812 GB free", for narrow windows.
@@ -420,6 +430,7 @@ impl Controller {
             refresh_due: false,
             trash: TrashInfo::new(),
             grid: false,
+            searching: false,
             tile_step: 1,
             compact: false,
             columns: std::cell::Cell::new(1),
@@ -614,6 +625,8 @@ impl Controller {
                 let (key, order) = self.listing.sort();
                 let hidden = self.listing.show_hidden();
                 self.dir = dir;
+                // A new folder starts unfiltered.
+                self.searching = false;
                 self.listing = Listing::default();
                 self.listing.set_sort(key, order);
                 self.listing.set_show_hidden(hidden);
@@ -791,6 +804,9 @@ impl Controller {
         if self.dialog.is_some() {
             return self.dialog_key(text, shift);
         }
+        if let Some(action) = self.search_key(text, ctrl) {
+            return action;
+        }
         if ctrl {
             if ctrl_letter(text, 'x') {
                 self.clip.cut(&self.dir, self.names());
@@ -851,6 +867,60 @@ impl Controller {
                 None => Action::None,
             },
             _ => Action::None,
+        }
+    }
+
+    /// Search keys, or None to fall through to the normal ones. Arrows,
+    /// Return and Ctrl shortcuts keep working while searching.
+    fn search_key(&mut self, text: &str, ctrl: bool) -> Option<Action> {
+        let opens = (ctrl && ctrl_letter(text, 'f')) || (!ctrl && text == "/");
+        if !self.searching {
+            if opens {
+                self.searching = true;
+                return Some(Action::Redraw);
+            }
+            return None;
+        }
+        if ctrl {
+            return ctrl_letter(text, 'f').then_some(Action::None);
+        }
+        match text {
+            keys::ESCAPE => {
+                self.close_search();
+            }
+            keys::BACKSPACE => {
+                let mut q = self.listing.query().to_string();
+                if q.pop().is_none() {
+                    return Some(self.close_search());
+                }
+                self.listing.set_query(&q);
+            }
+            _ if is_typed(text) => {
+                let q = format!("{}{text}", self.listing.query());
+                self.listing.set_query(&q);
+            }
+            _ => return None,
+        }
+        Some(Action::Redraw)
+    }
+
+    fn close_search(&mut self) -> Action {
+        self.searching = false;
+        self.listing.set_query("");
+        Action::Redraw
+    }
+
+    /// "~/Pictures" for a folder under home, the full path otherwise.
+    pub fn short_dir(&self) -> String {
+        match self
+            .env
+            .home
+            .as_deref()
+            .and_then(|h| self.dir.strip_prefix(h).ok())
+        {
+            Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+            Some(rest) => format!("~/{}", rest.display()),
+            None => self.dir.display().to_string(),
         }
     }
 
@@ -2105,11 +2175,30 @@ fn redraw(ui: &AppWindow, s: &State) {
     ui.set_trash_can_restore(matches!(ctl.restore_selected(), Action::Run(_)));
     ui.set_trash_note(ctl.trash_note().into());
     let n = ctl.listing.view().len();
+    ui.set_search_query(ctl.listing.query().into());
+    ui.set_search_count(if ctl.listing.query().is_empty() {
+        SharedString::new()
+    } else {
+        n.to_string().into()
+    });
+    if n == 0 && !ctl.listing.query().is_empty() {
+        ui.set_state_title(format!("Nothing matches \"{}\"", ctl.listing.query()).into());
+        ui.set_state_note(
+            format!(
+                "Searched {} in {}",
+                ops::count(ctl.listing.entries().len()),
+                ctl.short_dir()
+            )
+            .into(),
+        );
+    }
     ui.set_state(
         if !ctl.loaded {
             "loading"
         } else if ctl.unreadable.is_some() {
             "denied"
+        } else if n == 0 && !ctl.listing.query().is_empty() {
+            "nosearch"
         } else if n == 0 && ctl.in_trash() {
             "trash-empty"
         } else if n == 0 {
@@ -2146,6 +2235,7 @@ fn redraw(ui: &AppWindow, s: &State) {
                 Dialog::Conflict { ask, apply_all } => conflict_props(ui, ask, *apply_all),
             }
         }
+        None if ctl.searching => ui.set_overlay("search".into()),
         None => ui.set_overlay(SharedString::new()),
     }
 }
@@ -2880,6 +2970,77 @@ mod tests {
         c.toggle_hidden();
         assert!(c.rows().iter().all(|r| r.name != ".secret"));
         assert!(c.listing.selection().is_empty());
+    }
+
+    fn typed(c: &mut Controller, text: &str) {
+        for ch in text.chars() {
+            c.key(&ch.to_string(), false, false);
+        }
+    }
+
+    #[test]
+    fn slash_opens_search_and_typing_filters() {
+        let mut c = setup("search-type");
+        assert_eq!(c.key("/", false, false), Action::Redraw);
+        assert!(c.searching);
+        typed(&mut c, "b.j");
+        assert_eq!(c.listing.query(), "b.j");
+        let names: Vec<String> = c.rows().iter().map(|r| r.name.to_string()).collect();
+        assert_eq!(names, ["b.jpg"]);
+        // Arrows still move through the matches.
+        c.key(keys::DOWN, false, false);
+        assert_eq!(c.listing.cursor(), Some(&OsString::from("b.jpg")));
+    }
+
+    #[test]
+    fn backspace_pops_then_closes_and_escape_clears() {
+        let mut c = setup("search-keys");
+        c.key("f", true, false);
+        assert!(c.searching);
+        typed(&mut c, "ab");
+        c.key(keys::BACKSPACE, false, false);
+        assert_eq!(c.listing.query(), "a");
+        c.key(keys::BACKSPACE, false, false);
+        assert_eq!(c.listing.query(), "");
+        assert!(c.searching, "an empty field stays open");
+        c.key(keys::BACKSPACE, false, false);
+        assert!(!c.searching);
+        c.key("/", false, false);
+        typed(&mut c, "zz");
+        c.key(keys::ESCAPE, false, false);
+        assert!(!c.searching);
+        assert_eq!(c.listing.query(), "");
+        assert_eq!(c.rows().len(), 3);
+    }
+
+    #[test]
+    fn typing_drops_selected_names_the_search_hides() {
+        let mut c = setup("search-drop");
+        select(&mut c, "a.jpg");
+        c.key("/", false, false);
+        typed(&mut c, "b.jpg");
+        assert!(c.listing.selection().is_empty());
+        assert!(c.names().is_empty());
+    }
+
+    #[test]
+    fn navigating_clears_the_search() {
+        let mut c = setup("search-nav");
+        c.key("/", false, false);
+        typed(&mut c, "raw");
+        let ticket = c.begin_navigate(c.dir.join("raw-exports"));
+        c.land(ticket.perform());
+        assert!(!c.searching);
+        assert_eq!(c.listing.query(), "");
+    }
+
+    #[test]
+    fn a_search_with_no_matches_says_where_it_looked() {
+        let c = setup("search-where");
+        assert_eq!(c.short_dir(), "~/Pictures");
+        assert!(!is_typed(keys::UP));
+        assert!(!is_typed(keys::ESCAPE));
+        assert!(is_typed("k"));
     }
 
     #[test]

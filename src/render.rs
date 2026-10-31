@@ -38,6 +38,8 @@ pub fn scripted(view: &str) -> bool {
             | "grid-view"
             | "grid-hidden"
             | "list-density"
+            | "search-results"
+            | "search-nosearch"
     )
 }
 
@@ -215,6 +217,9 @@ fn paint_in(
         }
         // The density label flips Comfortable to Compact.
         "list-density" => ui.invoke_toggle_density(),
+        // Slash opens the search; typed keys narrow the listing.
+        "search-results" => type_keys(&ui, "/dune"),
+        "search-nosearch" => type_keys(&ui, "/kotlin"),
         "trash-empty-confirm" => ui.invoke_trash_empty(),
         // Select the item with no trashinfo; the banner explains it.
         "trash-noinfo" => select_row(&ui, "mystery.bin"),
@@ -274,6 +279,13 @@ pub fn snapshot(ui: &AppWindow, size: (u32, u32), out: &Path) -> Result<()> {
     )
     .map_err(|e| Error::Message(format!("write {}: {e}", out.display())))?;
     Ok(())
+}
+
+/// Sends each character as a key press, as the window would.
+fn type_keys(ui: &AppWindow, text: &str) {
+    for ch in text.chars() {
+        ui.invoke_key(ch.to_string().into(), false, false, false);
+    }
 }
 
 #[cfg(test)]
