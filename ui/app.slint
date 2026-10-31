@@ -445,8 +445,8 @@ component FilmTile inherits Rectangle {
         image-fit: cover;
         opacity: current ? 1 : 0.62;
     }
-    // No picture: the video icon, or the file icon for a still that
-    // can't be read; never a blank tile.
+    // No picture yet (loading) or ever (unreadable): the video icon or
+    // the file icon; never a blank tile.
     if shot.width == 0: Text {
         text: video ? "󰕧" : "󰈟";
         width: parent.width;
@@ -456,14 +456,21 @@ component FilmTile inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
     }
-    if video && shot.width > 0: Text {
-        text: "󰐊";
-        x: 4px;
-        y: parent.height - 18px;
-        width: 14px;
-        height: 14px;
-        font-size: 12px;
-        color: #ffffff;
+    // Play badge centred on the frame, about 40% of the tile's height.
+    if video && shot.width > 0: Rectangle {
+        width: parent.height * 0.4;
+        height: self.width;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: self.width / 2;
+        background: #000000a0;
+        Text {
+            text: "󰐊";
+            font-size: parent.width * 0.6;
+            color: #ffffff;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
     }
     if current: Rectangle {
         width: parent.width;
@@ -2136,25 +2143,31 @@ export component AppWindow inherits Window {
             y: (parent.height - self.height) / 2 + view-pan-y * 1px;
             image-fit: fill;
         }
+        // The loading area stops above the filmstrip and below the top bar,
+        // where a decoded picture at fit would sit.
+        property <bool> strip-on: view-chrome && view-strip && view-tiles.length > 1;
+        property <length> load-top: strip-on ? 64px : 0px;
+        property <length> load-h: strip-on ? self.height - 64px - 144px : self.height;
         if view-loading && view-placeholder.width > 0: Image {
             source: view-placeholder;
             x: 0px;
+            y: load-top;
             width: open-w;
-            height: parent.height;
+            height: load-h;
             image-fit: contain;
             image-rendering: smooth;
         }
         if view-loading && view-placeholder.width == 0: Rectangle {
             x: (open-w - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            width: min(480px, open-w - 64px);
+            y: load-top + (load-h - self.height) / 2;
+            width: min(480px, open-w - 64px, (load-h - 32px) * 3 / 2);
             height: self.width * 2 / 3;
             border-radius: 6px;
             background: surface;
         }
         if view-spinner: Text {
             x: (open-w - self.width) / 2;
-            y: (parent.height - self.height) / 2;
+            y: load-top + (load-h - self.height) / 2;
             text: "󰔟";
             font-size: 22px;
             color: muted;
