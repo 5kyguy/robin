@@ -1823,7 +1823,12 @@ fn open_stats(ui: &AppWindow, st: &Shared) {
         let mut s = st.borrow_mut();
         s.stats_gen += 1;
         match &s.stats {
-            Some(r) => show_stats(ui, r, &scanned_line(&s.ctl, s.stats_at, true)),
+            Some(r) => show_stats(
+                ui,
+                r,
+                &scanned_line(&s.ctl, s.stats_at, true),
+                s.ctl.listing.show_hidden(),
+            ),
             None => ui.set_stat_scanned("Scanning…".into()),
         }
         let Some(home) = s.ctl.env.home.clone() else {
@@ -1860,13 +1865,18 @@ fn stats_landed(ui: &AppWindow, st: &Shared, gen: u64, report: crate::stats::Rep
     }
     s.stats_at = ctl_now(&s.ctl);
     if ui.get_stats_mode() != "" {
-        show_stats(ui, &report, &scanned_line(&s.ctl, s.stats_at, false));
+        show_stats(
+            ui,
+            &report,
+            &scanned_line(&s.ctl, s.stats_at, false),
+            s.ctl.listing.show_hidden(),
+        );
     }
     s.stats = Some(report);
 }
 
 /// Fill the Statistics view from a report. `stale` marks a rescan running.
-pub fn show_stats(ui: &AppWindow, r: &crate::stats::Report, scanned: &str) {
+pub fn show_stats(ui: &AppWindow, r: &crate::stats::Report, scanned: &str, hidden: bool) {
     use crate::stats::UsageLevel;
     let disks: Vec<crate::StatDisk> = r
         .disks
@@ -1913,7 +1923,7 @@ pub fn show_stats(ui: &AppWindow, r: &crate::stats::Report, scanned: &str) {
         })
         .collect();
     ui.set_stat_types(ModelRc::new(VecModel::from(types)));
-    let weights = crate::stats::treemap_weights(&r.home.top, 9);
+    let weights = crate::stats::treemap_weights(&r.home.top, 9, hidden);
     ui.set_map_cells(ModelRc::new(VecModel::from(map_cells(
         &weights, 623.0, 300.0,
     ))));
@@ -1931,9 +1941,17 @@ pub fn show_stats(ui: &AppWindow, r: &crate::stats::Report, scanned: &str) {
         } else {
             r.cache_parts
                 .iter()
-                .map(|(n, b)| format!("{} {n}", human(*b)))
+                .map(|(n, b)| {
+                    // Short labels so the line fits; it wraps if not.
+                    let n = if n == "thumbnails" {
+                        "thumbs"
+                    } else {
+                        n.as_str()
+                    };
+                    format!("{} {n}", human(*b))
+                })
                 .collect::<Vec<_>>()
-                .join(" · ")
+                .join("  ·  ")
         }
         .into(),
     );
@@ -1960,6 +1978,8 @@ fn ctl_now(ctl: &Controller) -> i64 {
 
 /// Treemap cells for (name, bytes) weights in a `w` by `h` box: the
 /// largest is full accent and each lower rank, or deeper row, is darker.
+/// Full accent marks the biggest of several: other tiles stay below it,
+/// and a lone tile is a surface tint with an accent outline.
 pub fn map_cells(weights: &[(String, u64)], w: f32, h: f32) -> Vec<crate::MapCell> {
     let rank_of: std::collections::HashMap<&str, usize> = weights
         .iter()
@@ -1970,11 +1990,20 @@ pub fn map_cells(weights: &[(String, u64)], w: f32, h: f32) -> Vec<crate::MapCel
         weights.iter().map(|(n, b)| (n.as_str(), *b)).collect();
     // 1px off each shared edge is a 2px surface gutter.
     const GUTTER: f32 = 1.0;
+    const LONE_TINT: f32 = 0.12;
+    let lone = weights.len() == 1;
     crate::stats::squarify(weights, w, h)
         .into_iter()
         .map(|rect| {
             let rank = rank_of.get(rect.name.as_str()).copied().unwrap_or(0) as f32;
-            let shade = (1.0 - rank * 0.08 - rect.depth as f32 * 0.15).clamp(0.18, 1.0);
+            let top = rank == 0.0 && rect.depth == 0;
+            let shade = if lone {
+                LONE_TINT
+            } else if top {
+                1.0
+            } else {
+                (0.8 - rank * 0.07 - rect.depth as f32 * 0.12).clamp(0.18, 0.8)
+            };
             crate::MapCell {
                 x: rect.x + GUTTER,
                 y: rect.y + GUTTER,
@@ -1983,6 +2012,7 @@ pub fn map_cells(weights: &[(String, u64)], w: f32, h: f32) -> Vec<crate::MapCel
                 detail: human(bytes.get(rect.name.as_str()).copied().unwrap_or(0)).into(),
                 name: rect.name.into(),
                 shade,
+                outline: lone,
             }
         })
         .collect()

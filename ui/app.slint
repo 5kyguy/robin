@@ -134,6 +134,8 @@ export struct MapCell {
     name: string,
     detail: string,
     shade: float,
+    // A lone tile: surface tint ringed in accent, not a solid block.
+    outline: bool,
 }
 
 component SideRow inherits Rectangle {
@@ -538,6 +540,12 @@ component TypeRow inherits Rectangle {
     in property <color> ink;
     in property <color> muted-ink;
     in property <color> swatch;
+    // Fixed right-aligned colwumns; the name keeps at least name-min.
+    // Without room for all three the count goes and the size stays.
+    property <length> name-min: 72px;
+    property <length> colw: 64px;
+    property <length> gapw: 8px;
+    property <bool> with-count: self.width >= 18px + name-min + gapw + colw + gapw + colw;
     height: 22px;
     Rectangle {
         x: 0px;
@@ -551,19 +559,18 @@ component TypeRow inherits Rectangle {
         text: name;
         x: 18px;
         y: 0px;
-        width: 88px;
+        width: max(name-min, parent.width - 18px - gapw - (with-count ? colw + gapw + colw : colw));
         height: parent.height;
         font-size: 12px;
         color: ink;
+        overflow: elide;
         vertical-alignment: center;
     }
-    Text {
+    if with-count: Text {
         text: count;
-        // Only when it clears the name; narrow cards show sizes alone.
-        visible: parent.width >= 18px + 88px + 148px;
-        x: parent.width - 148px;
+        x: parent.width - colw - gapw - colw;
         y: 0px;
-        width: 70px;
+        width: colw;
         height: parent.height;
         font-size: 12px;
         color: muted-ink;
@@ -572,9 +579,9 @@ component TypeRow inherits Rectangle {
     }
     Text {
         text: size;
-        x: parent.width - 72px;
+        x: parent.width - colw;
         y: 0px;
-        width: 72px;
+        width: colw;
         height: parent.height;
         font-size: 12px;
         color: ink;
@@ -2672,6 +2679,8 @@ export component AppWindow inherits Window {
                     height: cell.h;
                     background: root.accent.with-alpha(cell.shade);
                     border-radius: 3px;
+                    border-width: cell.outline ? 1px : 0px;
+                    border-color: root.accent;
                     property <bool> light: cell.shade >= 0.45;
                     property <color> label-ink: light ? root.on-accent : root.text;
                     property <color> detail-ink: light ? root.on-accent : root.muted;
@@ -2728,7 +2737,8 @@ export component AppWindow inherits Window {
             border-color: hairline;
             Text { text: "CACHE"; x: 16px; y: 12px; width: 80px; height: 16px; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; }
             Text { text: stat-cache-total; x: 16px; y: 34px; width: 120px; height: 24px; font-size: 20px; font-weight: 700; color: text; }
-            Text { text: stat-cache-detail; x: 16px; y: 66px; width: parent.width - 32px - 188px; height: 18px; font-size: 11px; color: muted; overflow: elide; }
+            // Short labels, wrapping to a second line rather than cut off.
+            Text { text: stat-cache-detail; x: 16px; y: 62px; width: parent.width - 32px - 188px; height: 30px; font-size: 11px; color: muted; wrap: word-wrap; overflow: elide; }
             Rectangle {
                 x: parent.width - 16px - 180px;
                 y: 32px;
@@ -2751,18 +2761,23 @@ export component AppWindow inherits Window {
             border-width: 1px;
             border-color: hairline;
             Text { text: "TRASH"; x: 16px; y: 12px; width: 80px; height: 16px; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; }
-            Text { text: stat-trash-size; x: 16px; y: 36px; width: 90px; height: 28px; font-size: 20px; font-weight: 700; color: text; }
-            Text { text: stat-trash-count; x: 110px; y: 42px; width: 120px; height: 18px; font-size: 11px; color: muted; }
+            Text { text: stat-trash-size; x: 16px; y: 34px; width: parent.width - 32px - 140px; height: 24px; font-size: 20px; font-weight: 700; color: text; }
+            // Under the size, as on the cache card.
+            Text { text: stat-trash-count; x: 16px; y: 62px; width: parent.width - 32px - 140px; height: 18px; font-size: 11px; color: muted; overflow: elide; }
             Rectangle {
                 x: parent.width - 16px - 112px;
                 y: 32px;
                 width: 112px;
                 height: 32px;
                 border-radius: 6px;
-                background: danger;
-                Text { text: "Empty trash"; font-size: 12px; color: on-danger; horizontal-alignment: center; vertical-alignment: center; }
+                // Outline danger, as in the Trash bar (#23): solid red is
+                // kept for the confirm dialog.
+                border-width: 1px;
+                border-color: danger;
+                background: trash-touch.has-hover ? danger.with-alpha(0.12) : transparent;
+                Text { text: "Empty trash"; font-size: 12px; color: danger; horizontal-alignment: center; vertical-alignment: center; }
                 // Opens the Trash, where emptying asks to confirm.
-                TouchArea { clicked => { root.place-open(2, 0); } }
+                trash-touch := TouchArea { clicked => { root.place-open(2, 0); } }
             }
         }
         if stats-mode == "empty-trash": Rectangle {

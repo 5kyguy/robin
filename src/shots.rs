@@ -303,7 +303,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
     };
     ui.set_stats_mode(stats_mode.into());
     if !stats_mode.is_empty() {
-        crate::app::show_stats(ui, &mock_report(), "Scanned 16:10  ·  Rescan");
+        crate::app::show_stats(ui, &mock_report(), "Scanned 16:10  ·  Rescan", false);
         if stats_mode == "drilled" {
             let weights: Vec<(String, u64)> = vec![
                 ("raw-exports".into(), 180_000_000_000),
@@ -1273,10 +1273,18 @@ mod tests {
 
     #[test]
     fn treemap_tiles_keep_a_surface_gutter() {
-        let weights = crate::stats::treemap_weights(&mock_report().home.top, 9);
+        let weights = crate::stats::treemap_weights(&mock_report().home.top, 9, false);
         let cells = crate::app::map_cells(&weights, 623.0, 300.0);
         let videos = cells.iter().find(|c| c.name == "Videos").unwrap();
         assert!((videos.shade - 1.0).abs() < 0.001, "{}", videos.shade);
+        let full = cells.iter().filter(|c| c.shade > 0.999).count();
+        assert_eq!(full, 1, "only the largest tile is full accent");
+        assert!(cells.iter().all(|c| !c.outline));
+        let lone = crate::app::map_cells(&[("Videos".into(), 9)], 623.0, 300.0);
+        assert!(
+            lone[0].outline && lone[0].shade < 0.2,
+            "a lone tile is a tint"
+        );
         let mut gaps = Vec::new();
         for a in &cells {
             for b in &cells {

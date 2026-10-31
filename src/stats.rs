@@ -322,8 +322,14 @@ pub fn group_digits(n: u64) -> String {
 }
 
 /// The `keep` largest entries, the rest folded into one "other" cell.
-pub fn treemap_weights(top: &[(String, u64)], keep: usize) -> Vec<(String, u64)> {
-    let mut sorted: Vec<(String, u64)> = top.iter().filter(|e| e.1 > 0).cloned().collect();
+/// Dot-named entries such as `.cache` only count when `hidden` is on, as
+/// in the file list.
+pub fn treemap_weights(top: &[(String, u64)], keep: usize, hidden: bool) -> Vec<(String, u64)> {
+    let mut sorted: Vec<(String, u64)> = top
+        .iter()
+        .filter(|e| e.1 > 0 && (hidden || !e.0.starts_with('.')))
+        .cloned()
+        .collect();
     sorted.sort_by_key(|e| std::cmp::Reverse(e.1));
     let rest: u64 = sorted.iter().skip(keep).map(|e| e.1).sum();
     sorted.truncate(keep);
@@ -557,9 +563,13 @@ mod tests {
         assert_eq!(group_digits(1_840), "1 840");
         assert_eq!(group_digits(612), "612");
         let top: Vec<(String, u64)> = (1..=5).map(|i| (format!("d{i}"), i * 10)).collect();
-        let w = treemap_weights(&top, 3);
+        let w = treemap_weights(&top, 3, false);
         assert_eq!(w.last().unwrap(), &("other".to_string(), 30));
         assert_eq!(w[0].0, "d5");
+        let mut top = top;
+        top.push((".cache".into(), 99));
+        assert_eq!(treemap_weights(&top, 3, false)[0].0, "d5", "hidden off");
+        assert_eq!(treemap_weights(&top, 3, true)[0].0, ".cache", "hidden on");
     }
 
     #[test]
