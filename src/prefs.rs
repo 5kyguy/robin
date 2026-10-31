@@ -4,6 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
+/// The settings file is a few short lines; anything bigger is not ours.
+pub const MAX_PREFS_BYTES: usize = 4096;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ViewPrefs {
     pub grid: bool,
@@ -67,21 +70,33 @@ impl ViewPrefs {
         )
     }
 
+    /// Read the file, or the defaults if it is missing, unreadable or
+    /// bigger than [`MAX_PREFS_BYTES`] (a few short lines, never more).
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .map(|t| Self::parse(&t))
-            .unwrap_or_else(|_| Self::fresh())
+        use std::io::Read;
+        let Ok(file) = std::fs::File::open(path) else {
+            return Self::fresh();
+        };
+        let mut bytes = Vec::new();
+        let cap = MAX_PREFS_BYTES as u64;
+        match file.take(cap + 1).read_to_end(&mut bytes) {
+            Ok(n) if n as u64 <= cap => Self::parse(&String::from_utf8_lossy(&bytes)),
+            _ => Self::fresh(),
+        }
     }
 
-    /// Write through a temp and rename, so a crash leaves the old
-    /// settings or the new ones.
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-        std::fs::write(&tmp, self.render())?;
-        std::fs::rename(&tmp, path)
+    /// Write through `fsops::replace_file`, so a crash leaves the old
+    /// settings or the new ones and a symlinked temp is never followed.
+    pub fn save(&self, path: &Path) -> crate::Result<()> {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(crate::Error::Message(format!(
+                "no folder for {}",
+                path.display()
+            )));
+        };
+        std::fs::create_dir_all(dir).map_err(|e| crate::Error::io(dir, e))?;
+        let fd = crate::safety::DirFd::open(dir)?;
+        crate::fsops::replace_file(&fd, name, self.render().as_bytes())
     }
 }
 
@@ -99,6 +114,20 @@ mod tests {
         };
         assert_eq!(ViewPrefs::parse(&p.render()), p);
         assert_eq!(ViewPrefs::parse("garbage\nview = ?"), ViewPrefs::fresh());
+    }
+
+    #[test]
+    fn an_oversized_file_loads_the_defaults() {
+        let dir = std::env::temp_dir().join(format!("robin-prefs-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("view");
+        let mut text = "view = grid\n".to_string();
+        text.push_str(&"#".repeat(MAX_PREFS_BYTES));
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(ViewPrefs::load(&path), ViewPrefs::fresh());
+        std::fs::write(&path, "view = grid\n").unwrap();
+        assert!(ViewPrefs::load(&path).grid);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
