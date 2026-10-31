@@ -55,6 +55,13 @@ export struct Place {
     section: int,
 }
 
+// A searched name split around the part that matched.
+export struct Mark {
+    pre: string,
+    hit: string,
+    post: string,
+}
+
 export struct Row {
     glyph: string,
     name: string,
@@ -585,6 +592,7 @@ export component AppWindow inherits Window {
     in property <int> grid-columns: 3;
     // Middle-elided list names, by row; empty falls back to the name.
     in property <[string]> labels;
+    in property <[Mark]> marks;
     in property <string> state: "files";
     /// The line under "Reading…" while a folder loads.
     in property <string> state-note: "";
@@ -605,6 +613,9 @@ export component AppWindow inherits Window {
     in property <string> path-text: "/home/sky/Pictures";
     in property <string> search-query: "";
     in property <string> search-count: "";
+    in property <string> search-scope: "";
+    callback search-open();
+    callback search-clear();
     in property <string> dialog-title: "";
     in property <string> dialog-body: "";
     in property <[Place]> places;
@@ -943,25 +954,27 @@ export component AppWindow inherits Window {
                         horizontal-alignment: left;
                         overflow: elide;
                     }
-                    if overlay == "search": Text {
+                    if overlay == "search": HorizontalLayout {
                         x: 8px;
-                        width: parent.width - 48px;
+                        width: parent.width - 16px;
                         height: parent.height;
-                        text: search-query;
-                        font-size: 12px;
-                        color: text;
-                        vertical-alignment: center;
-                        horizontal-alignment: left;
-                    }
-                    if overlay == "search": Text {
-                        x: parent.width - 40px;
-                        width: 32px;
-                        height: parent.height;
-                        text: search-count;
-                        font-size: 11px;
-                        color: muted;
-                        vertical-alignment: center;
-                        horizontal-alignment: right;
+                        spacing: 6px;
+                        Text { text: "󰍉"; font-size: 13px; color: muted; vertical-alignment: center; }
+                        Text { text: search-query; font-size: 12px; color: text; vertical-alignment: center; }
+                        Text {
+                            text: search-scope;
+                            font-size: 11px;
+                            color: muted;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                        Text { text: search-count; font-size: 11px; color: muted; vertical-alignment: center; }
+                        Rectangle {
+                            width: 18px;
+                            Text { text: "×"; font-size: 14px; color: muted; horizontal-alignment: center; vertical-alignment: center; }
+                            TouchArea { clicked => { root.search-clear(); } }
+                        }
                     }
                     if overlay == "path-edit" || overlay == "path-invalid" || overlay == "path-complete": Text {
                         x: 8px;
@@ -981,7 +994,9 @@ export component AppWindow inherits Window {
                     width: icon-box;
                     height: icon-box;
                     border-radius: 3px;
-                    Text { text: "󰍉"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                    background: overlay == "search" ? accent : transparent;
+                    Text { text: "󰍉"; font-size: 16px; color: overlay == "search" ? surface : text; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.search-open(); } }
                 }
                 Rectangle {
                     x: right-x + icon-box + 6px;
@@ -1178,7 +1193,16 @@ export component AppWindow inherits Window {
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
-                            Text {
+                            if marks[i].hit != "": HorizontalLayout {
+                                x: Columns.name-x;
+                                width: Columns.name-w(parent.width);
+                                height: parent.height;
+                                opacity: row.hidden ? 0.6 : 1;
+                                Text { text: marks[i].pre; font-size: 12px; font-weight: row.selected ? 700 : 400; color: text; vertical-alignment: center; }
+                                Text { text: marks[i].hit; font-size: 12px; font-weight: row.selected ? 700 : 400; color: accent; vertical-alignment: center; }
+                                Text { text: marks[i].post; font-size: 12px; font-weight: row.selected ? 700 : 400; color: text; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                            }
+                            if marks[i].hit == "": Text {
                                 text: labels[i] != "" ? labels[i] : row.name;
                                 x: Columns.name-x;
                                 y: 0px;

@@ -20,7 +20,7 @@ use crate::fsops::{
 use crate::model::{Listing, Nav, SortDir, SortKey};
 use crate::ops::{self, Clipboard, Env, Job, JobKind, Mods, Op, Outcome, Progress, Trashed};
 use crate::safety::DirFd;
-use crate::{AppWindow, Columns, Error, GridLine, Result, Row};
+use crate::{AppWindow, Columns, Error, GridLine, Mark, Result, Row};
 
 /// What the trash/delete dialog is asking about.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -404,9 +404,14 @@ impl Controller {
         }
         let n = self.listing.view().len();
         let sel = self.listing.selection().len();
-        let mut left = ops::count(n);
+        let searching = !self.listing.query().is_empty();
+        let mut left = if searching {
+            format!("{n} of {}", ops::count(self.listing.searchable_count()))
+        } else {
+            ops::count(n)
+        };
         let hidden = self.listing.hidden_count();
-        if !self.listing.show_hidden() && hidden > 0 {
+        if !searching && !self.listing.show_hidden() && hidden > 0 {
             left = format!("{left} · {hidden} hidden");
         }
         if sel > 0 {
@@ -922,6 +927,26 @@ impl Controller {
 
     fn close_search(&mut self) -> Action {
         self.searching = false;
+        self.listing.set_query("");
+        Action::Redraw
+    }
+
+    /// The folder's own name, for the search field's scope label.
+    pub fn dir_name(&self) -> String {
+        self.dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.dir.display().to_string())
+    }
+
+    /// Opens the search, as the toolbar button does.
+    pub fn open_search(&mut self) -> Action {
+        self.searching = true;
+        Action::Redraw
+    }
+
+    /// The field's clear button: empty the query, keep the field open.
+    pub fn clear_search(&mut self) -> Action {
         self.listing.set_query("");
         Action::Redraw
     }
@@ -1730,6 +1755,22 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     });
     let w = ui.as_weak();
     let st = state.clone();
+    ui.on_search_open(move || {
+        let action = st.borrow_mut().ctl.open_search();
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_search_clear(move || {
+        let action = st.borrow_mut().ctl.clear_search();
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
     ui.on_toggle_hidden(move || {
         st.borrow_mut().ctl.toggle_hidden();
         if let Some(ui) = w.upgrade() {
@@ -2157,13 +2198,36 @@ fn redraw(ui: &AppWindow, s: &State) {
             }
         })
         .collect();
+    // The matched part of each name, painted in the accent colour.
+    // Elided names keep plain text: their chars no longer line up.
+    let query = ctl.listing.query();
+    let marks: Vec<Mark> = rows
+        .iter()
+        .zip(&labels)
+        .map(
+            |(r, label)| match crate::model::match_span(&r.name, query) {
+                Some((a, b)) if label.is_empty() => {
+                    let chars: Vec<char> = r.name.chars().collect();
+                    let part = |x: usize, y: usize| chars[x..y].iter().collect::<String>().into();
+                    Mark {
+                        pre: part(0, a),
+                        hit: part(a, b),
+                        post: part(b, chars.len()),
+                    }
+                }
+                _ => Mark::default(),
+            },
+        )
+        .collect();
     // Only the visible mode gets a model; the other stays empty.
     if ctl.grid {
         ui.set_files(ModelRc::default());
         ui.set_labels(ModelRc::default());
+        ui.set_marks(ModelRc::default());
         ui.set_grid_rows(ModelRc::new(Rc::new(VecModel::from(ctl.grid_lines(&rows)))));
     } else {
         ui.set_labels(ModelRc::new(Rc::new(VecModel::from(labels))));
+        ui.set_marks(ModelRc::new(Rc::new(VecModel::from(marks))));
         ui.set_files(ModelRc::new(Rc::new(VecModel::from(rows))));
         ui.set_grid_rows(ModelRc::default());
     }
@@ -2192,6 +2256,7 @@ fn redraw(ui: &AppWindow, s: &State) {
     ui.set_trash_note(ctl.trash_note().into());
     let n = ctl.listing.view().len();
     ui.set_search_query(ctl.listing.query().into());
+    ui.set_search_scope(format!("in {}", ctl.dir_name()).into());
     ui.set_search_count(if ctl.listing.query().is_empty() {
         SharedString::new()
     } else {
@@ -2201,9 +2266,14 @@ fn redraw(ui: &AppWindow, s: &State) {
         ui.set_state_title(format!("Nothing matches \"{}\"", ctl.listing.query()).into());
         ui.set_state_note(
             format!(
-                "Searched {} in {}",
-                ops::count(ctl.listing.entries().len()),
-                ctl.short_dir()
+                "Searched {} in {}{}",
+                ops::count(ctl.listing.searchable_count()),
+                ctl.short_dir(),
+                if !ctl.listing.show_hidden() && ctl.listing.hidden_count() > 0 {
+                    " (hidden files excluded)"
+                } else {
+                    ""
+                }
             )
             .into(),
         );
@@ -3052,6 +3122,31 @@ mod tests {
         typed(&mut c, "b.jpg");
         assert!(c.listing.selection().is_empty());
         assert!(c.names().is_empty());
+    }
+
+    #[test]
+    fn the_status_bar_counts_matches_of_searchable_items() {
+        let mut c = setup("search-status");
+        c.key("/", false, false);
+        typed(&mut c, "b.j");
+        let total = c.listing.searchable_count();
+        assert_eq!(c.status_left(), format!("1 of {}", ops::count(total)));
+        c.listing.set_show_hidden(true);
+        assert_eq!(
+            c.listing.searchable_count(),
+            total + c.listing.hidden_count()
+        );
+    }
+
+    #[test]
+    fn the_clear_button_keeps_the_field_open() {
+        let mut c = setup("search-clear");
+        c.open_search();
+        typed(&mut c, "dune");
+        c.clear_search();
+        assert!(c.searching);
+        assert_eq!(c.listing.query(), "");
+        assert_eq!(c.dir_name(), "Pictures");
     }
 
     #[test]
