@@ -5,7 +5,9 @@ use std::process::Command;
 
 #[test]
 fn scripted_views_render_through_the_real_app() {
-    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+    // test-bwrap.sh blanks these rather than unsetting them.
+    let set = |k| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    if !set("DISPLAY") && !set("WAYLAND_DISPLAY") {
         eprintln!("no display; skipping");
         return;
     }
