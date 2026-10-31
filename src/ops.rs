@@ -365,6 +365,8 @@ pub struct Outcome {
     /// Moves refused up front, for the move-refused dialog.
     pub refused: Vec<(OsString, Vec<KeptEntry>)>,
     pub trashed: Vec<Trashed>,
+    /// Folders a restore had to recreate, as shown to the user (`~/…`).
+    pub recreated: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -391,6 +393,15 @@ impl Outcome {
         };
         if kind == JobKind::Restore {
             let stayed = self.failed.len();
+            if let [folder] = self.recreated.as_slice() {
+                text = if self.done == 1 {
+                    format!("Restored to {folder} (folder recreated)")
+                } else {
+                    format!("{text}, recreated {folder}")
+                };
+            } else if self.recreated.len() > 1 {
+                text = format!("{text}, recreated {} folders", self.recreated.len());
+            }
             return Toast {
                 tone: if stayed == 0 { "" } else { "warning" },
                 text: if stayed == 0 {
@@ -645,7 +656,7 @@ pub fn run_asking(
                 policy: &mut policy,
                 ask: &mut *ask,
             };
-            match restore_one(t, env, &mut opts) {
+            match restore_one(t, env, &mut opts, &mut out.recreated) {
                 Ok(fsops::Restored::Restored) => out.done += 1,
                 Ok(fsops::Restored::Skipped) => {}
                 Err(Error::Cancelled) => {
@@ -760,6 +771,15 @@ fn trash_info_dir(dir: &Path, env: &Env) -> Option<DirFd> {
     }
     let parent = DirFd::open(trash).ok()?;
     parent.open_dir_nofollow(OsStr::new("info")).ok()
+}
+
+/// `~/…` under home, the full path elsewhere.
+fn shown_path(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rel) if rel.as_os_str().is_empty() => "~".into(),
+        Some(rel) => format!("~/{}", rel.display()),
+        None => path.display().to_string(),
+    }
 }
 
 /// Only the home trash and the spec's per-device trashes,
@@ -898,13 +918,27 @@ pub(crate) fn undo(items: &[Trashed]) -> (usize, Vec<String>) {
 }
 
 /// Put one trashed entry back where it was, asking when the name is taken.
-fn restore_one(t: &Trashed, env: &Env, opts: &mut CopyOpts<'_>) -> Result<fsops::Restored> {
+fn restore_one(
+    t: &Trashed,
+    env: &Env,
+    opts: &mut CopyOpts<'_>,
+    recreated: &mut Vec<String>,
+) -> Result<fsops::Restored> {
     let parent = t
         .original
         .parent()
         .ok_or_else(|| Error::Message("no parent folder".into()))?;
     let name = t.original.file_name().ok_or(Error::InvalidName)?;
     let trash = DirFd::open(&t.trash)?;
+    // Like Nautilus: a folder deleted since is recreated, not asked about.
+    if std::fs::symlink_metadata(parent).is_err() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Message(format!("{}: {e}", parent.display())))?;
+        let shown = shown_path(parent, env.home.as_deref());
+        if !recreated.contains(&shown) {
+            recreated.push(shown);
+        }
+    }
     let dest = DirFd::open(parent)?;
     // Replace moves what is there now to the trash rather than deleting it.
     let mut make_room = |dir: &DirFd, name: &OsStr| -> Result<()> {
@@ -1289,6 +1323,42 @@ mod tests {
             &mut |_| {},
         );
         assert!(root.join("proj/info/a.trashinfo").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restore_recreates_a_missing_folder_and_says_so() {
+        let root = scratch("restore-parent");
+        fs::create_dir_all(root.join("Documents/Finance")).unwrap();
+        fs::write(root.join("Documents/Finance/q3.ods"), b"q3").unwrap();
+        let e = env(&root);
+        let out = run(
+            &Job::new(
+                JobKind::Trash,
+                &root.join("Documents/Finance"),
+                names(&["q3.ods"]),
+                &root,
+            ),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        fs::remove_dir_all(root.join("Documents")).unwrap();
+        let back = run(
+            &Job::restore(out.trashed.clone()),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        assert_eq!((back.done, back.failed.len()), (1, 0), "{back:?}");
+        assert_eq!(
+            fs::read(root.join("Documents/Finance/q3.ods")).unwrap(),
+            b"q3"
+        );
+        assert_eq!(
+            back.toast(JobKind::Restore).text,
+            "Restored to ~/Documents/Finance (folder recreated)"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
