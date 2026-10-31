@@ -84,6 +84,7 @@ pub fn known(view: &str) -> bool {
             | "list-name-desc"
             | "watch-fallback"
             | "nav-pending"
+            | "start-denied"
     )
 }
 
@@ -217,6 +218,10 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         }
         .into(),
     );
+    if view == "permission-denied" {
+        ui.set_state_title("No permission to open ~/secret".into());
+        ui.set_state_note("Owned by root (drwx------)".into());
+    }
     if view == "loading-large-dir" {
         ui.set_state_note("18 240 items".into());
     }
@@ -953,7 +958,11 @@ fn menu() -> Vec<slint::SharedString> {
 /// The views of the wired file operations: cut rows, a drag over a folder,
 /// a running job, the keyboard-focused confirms, and the undo toast.
 fn fileops_scene(ui: &AppWindow, view: &str) {
-    if view.starts_with("list-") || view == "watch-fallback" || view == "nav-pending" {
+    if view.starts_with("list-")
+        || view == "watch-fallback"
+        || view == "nav-pending"
+        || view == "start-denied"
+    {
         return list_scene(ui, view);
     }
     let mut rows = files(false);
@@ -1160,12 +1169,32 @@ fn list_scene(ui: &AppWindow, view: &str) {
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
     ui.set_status_left(crate::ops::count(ctl.listing.view().len()).into());
+    if view == "start-denied" {
+        // The app started in a folder it can't read: the denied state and
+        // the error toast, as `landed` shows them.
+        ctl.unreadable = Some(true);
+        ctl.listing.set_entries(Vec::new());
+        ui.set_files(ModelRc::new(Rc::new(VecModel::from(ctl.rows()))));
+        ui.set_crumbs("~  ›  secret".into());
+        ui.set_status_left(crate::ops::count(0).into());
+        ui.set_state("denied".into());
+        ui.set_state_title("No permission to open ~/secret".into());
+        ui.set_state_note("".into());
+        ui.set_toast_tone("danger".into());
+        ui.set_toast_glyph(crate::app::toast_glyph("danger").into());
+        ui.set_toast_text("/home/sky/secret: Permission denied (os error 13)".into());
+        crate::app::set_toast_rows(ui, &crate::app::detail_rows(&[], false, false));
+        ui.set_toast_on(true);
+        ui.set_toast_open(true);
+    }
     if view == "nav-pending" {
         // A slow navigation into raw-exports: the crumb names the target,
         // the old listing stays, and the bar runs under the toolbar.
         let t0 = std::time::Instant::now();
-        let _ = ctl.begin_navigate_at("/demo/Pictures/raw-exports".into(), t0);
-        ctl.tick_nav(t0 + crate::app::NAV_PENDING_AFTER);
+        let gen = ctl
+            .begin_navigate_at("/demo/Pictures/raw-exports".into(), t0)
+            .gen();
+        ctl.tick_nav(gen, t0 + crate::app::NAV_PENDING_AFTER);
         let crumbs: Vec<String> =
             crate::model::breadcrumbs(ctl.crumb_dir(), Some(Path::new("/demo")))
                 .iter()

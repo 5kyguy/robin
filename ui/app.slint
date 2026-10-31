@@ -515,6 +515,8 @@ export component AppWindow inherits Window {
     in property <string> state: "files";
     /// The line under "Reading…" while a folder loads.
     in property <string> state-note: "";
+    /// The headline of the denied state.
+    in property <string> state-title: "";
     /// A navigation read is slow: a thin progress bar under the toolbar.
     in property <bool> nav-busy: false;
     /// Renders pin the bar's position (0..1); negative animates it.
@@ -925,6 +927,7 @@ export component AppWindow inherits Window {
                 vertical-stretch: 1;
                 background: bg;
                 if state == "files" && !grid: VerticalLayout {
+                    opacity: nav-busy ? 0.6 : 1;
                     Rectangle {
                         height: 26px;
                         HeaderCell {
@@ -1071,6 +1074,7 @@ export component AppWindow inherits Window {
                     }
                 }
                 if state == "files" && grid: ListView {
+                    opacity: nav-busy ? 0.6 : 1;
                     vertical-stretch: 1;
                     viewport-y <=> root.grid-scroll;
                     for line in grid-rows: HorizontalLayout {
@@ -1118,7 +1122,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 12px; }
                     Text {
-                        text: state == "empty" ? "This folder is empty" : state == "denied" ? "No permission to open ~/secret" : state == "unmounted" ? "SANDISK is not mounted" : state == "ejected" ? "SANDISK was removed" : state == "nosearch" ? "Nothing matches \"kotlin\"" : "Reading…";
+                        text: state == "empty" ? "This folder is empty" : state == "denied" ? state-title : state == "unmounted" ? "SANDISK is not mounted" : state == "ejected" ? "SANDISK was removed" : state == "nosearch" ? "Nothing matches \"kotlin\"" : "Reading…";
                         font-size: 18px;
                         font-weight: 700;
                         color: text;
@@ -1127,7 +1131,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 6px; }
                     Text {
-                        text: state == "empty" ? "Drop files here or press Ctrl+N" : state == "denied" ? "Owned by root (drwx------)" : state == "nosearch" ? "Searched 4 812 items in ~/Projects" : state == "loading" ? state-note : "";
+                        text: state == "empty" ? "Drop files here or press Ctrl+N" : state == "denied" ? state-note : state == "nosearch" ? "Searched 4 812 items in ~/Projects" : state == "loading" ? state-note : "";
                         font-size: 11px;
                         color: muted;
                         horizontal-alignment: center;

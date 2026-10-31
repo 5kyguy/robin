@@ -184,6 +184,12 @@ pub struct Controller {
     /// The navigation in flight: its target, when it started, and whether
     /// it has been slow enough to show as pending.
     nav: Option<PendingNav>,
+    /// Set when the first read of the open folder failed: the empty state
+    /// shows why instead of claiming the folder is empty.
+    /// `Some(denied)`; denied is true for EACCES/EPERM.
+    pub unreadable: Option<bool>,
+    /// A navigation failed; reread the folder still open.
+    refresh_due: bool,
 }
 
 /// How long a navigation read may take before the breadcrumb jumps to the
@@ -192,6 +198,7 @@ pub const NAV_PENDING_AFTER: Duration = Duration::from_millis(150);
 
 #[derive(Debug)]
 struct PendingNav {
+    gen: u64,
     target: PathBuf,
     started: std::time::Instant,
     shown: bool,
@@ -224,6 +231,11 @@ pub struct ReadResult {
 }
 
 impl ReadTicket {
+    /// The request's generation number.
+    pub fn gen(&self) -> u64 {
+        self.gen
+    }
+
     /// Do the blocking read. Only ENOENT/ENOTDIR on a refresh walk up.
     pub fn perform(self) -> ReadResult {
         let result = match Snapshot::read(&self.dir) {
@@ -302,6 +314,8 @@ impl Controller {
             read_gen: 0,
             in_flight: None,
             nav: None,
+            unreadable: None,
+            refresh_due: false,
         }
     }
 
@@ -314,19 +328,27 @@ impl Controller {
     /// already shown as pending retargets the breadcrumb right away.
     pub fn begin_navigate_at(&mut self, dir: PathBuf, now: std::time::Instant) -> ReadTicket {
         let shown = self.nav.as_ref().is_some_and(|n| n.shown);
+        let ticket = self.ticket(dir.clone(), ReadKind::Navigate);
         self.nav = Some(PendingNav {
-            target: dir.clone(),
+            gen: ticket.gen,
+            target: dir,
             started: now,
             shown,
         });
-        self.ticket(dir, ReadKind::Navigate)
+        ticket
     }
 
-    /// Mark the navigation in flight as pending once it has taken
-    /// `NAV_PENDING_AFTER`; true when that changed what is shown.
-    pub fn tick_nav(&mut self, now: std::time::Instant) -> bool {
+    /// Mark navigation `gen` as pending once it has taken
+    /// `NAV_PENDING_AFTER`, if it is still the one in flight; true when
+    /// that changed what is shown.
+    pub fn tick_nav(&mut self, gen: u64, now: std::time::Instant) -> bool {
         match &mut self.nav {
-            Some(n) if !n.shown && now.duration_since(n.started) >= NAV_PENDING_AFTER => {
+            Some(n)
+                if n.gen == gen
+                    && self.read_gen == gen
+                    && !n.shown
+                    && now.duration_since(n.started) >= NAV_PENDING_AFTER =>
+            {
                 n.shown = true;
                 true
             }
@@ -357,6 +379,12 @@ impl Controller {
         Some(self.ticket(self.dir.clone(), ReadKind::Refresh))
     }
 
+    /// Whether a failed navigation asked for the open folder to be
+    /// reread; clears the request.
+    pub fn take_refresh_due(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_due)
+    }
+
     /// Whether no read is in flight.
     pub fn idle(&self) -> bool {
         self.in_flight.is_none()
@@ -380,6 +408,15 @@ impl Controller {
         self.in_flight = None;
         self.nav = None;
         let was_loaded = std::mem::replace(&mut self.loaded, true);
+        let was_unreadable = self.unreadable.take().is_some();
+        if let Err(e) = &read.result {
+            if !was_loaded || was_unreadable {
+                self.unreadable = Some(e.is_denied());
+            }
+            if read.kind == ReadKind::Navigate {
+                self.refresh_due = true;
+            }
+        }
         match read.result {
             Ok((dir, snap)) if dir != self.dir => {
                 let (key, order) = self.listing.sort();
@@ -391,6 +428,7 @@ impl Controller {
             }
             Ok((_, snap)) => {
                 if was_loaded
+                    && !was_unreadable
                     && snap.entries == self.listing.entries()
                     && snap.counts == self.counts
                 {
@@ -470,6 +508,9 @@ impl Controller {
                 return Action::Redraw;
             }
             if ctrl_letter(text, 'v') {
+                if self.nav_pending() {
+                    return Action::None; // the destination is changing
+                }
                 return self.clip.paste(&self.dir).map_or(Action::None, Action::Run);
             }
         }
@@ -651,7 +692,7 @@ impl Controller {
                     return Action::Redraw;
                 };
                 match (drag.target, drag.op) {
-                    (Some(t), Some(op)) => {
+                    (Some(t), Some(op)) if !self.nav_pending() => {
                         let dest = self
                             .dir
                             .join(self.row_name(t).map(|r| r.0).unwrap_or_default());
@@ -1091,8 +1132,8 @@ fn debounce() -> crate::model::Debounce {
 /// Dropped paths waiting for a dialog to close, grouped into jobs per
 /// destination frozen at drop time.
 fn flush_drops(ui: &AppWindow, st: &Shared) {
-    if st.borrow().ctl.dialog.is_some() {
-        return; // keep them queued until the dialog closes
+    if st.borrow().ctl.dialog.is_some() || st.borrow().ctl.nav_pending() {
+        return; // keep them queued until the dialog closes or the folder lands
     }
     let dropped = std::mem::take(&mut *st.borrow().dropped.borrow_mut());
     if dropped.is_empty() {
@@ -1226,6 +1267,9 @@ fn landed(ui: &AppWindow, st: &Shared, read: ReadResult) {
                 }
                 s.read_error = Some(text.clone());
             }
+            if s.ctl.take_refresh_due() {
+                start_read(s.ctl.begin_refresh());
+            }
             drop(s);
             show_toast(ui, st, "danger", text, Vec::new(), false, "");
         }
@@ -1296,6 +1340,18 @@ fn redraw(ui: &AppWindow, s: &State) {
     ui.set_crumbs(crumbs.join("  ›  ").into());
     ui.set_path_text(ctl.crumb_dir().display().to_string().into());
     ui.set_nav_busy(ctl.nav_pending());
+    if let Some(denied) = ctl.unreadable {
+        let name = crumbs.join("/");
+        ui.set_state_title(
+            if denied {
+                format!("No permission to open {name}")
+            } else {
+                format!("Can't open {name}")
+            }
+            .into(),
+        );
+        ui.set_state_note("".into());
+    }
     let n = ctl.listing.view().len();
     let sel = ctl.listing.selection().len();
     let mut left = ops::count(n);
@@ -1314,6 +1370,8 @@ fn redraw(ui: &AppWindow, s: &State) {
     ui.set_state(
         if !ctl.loaded {
             "loading"
+        } else if ctl.unreadable.is_some() {
+            "denied"
         } else if n == 0 {
             "empty"
         } else {
@@ -1372,6 +1430,7 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
         }
         Action::Navigate(dir) => {
             let ticket = st.borrow_mut().ctl.begin_navigate(dir);
+            let gen = ticket.gen();
             let retargeted = st.borrow().ctl.nav_pending();
             if retargeted {
                 redraw(ui, &st.borrow());
@@ -1382,7 +1441,7 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
             slint::Timer::single_shot(NAV_PENDING_AFTER, move || {
                 let Some(ui) = ui.upgrade() else { return };
                 let mut s = st.borrow_mut();
-                if s.ctl.tick_nav(std::time::Instant::now()) {
+                if s.ctl.tick_nav(gen, std::time::Instant::now()) {
                     redraw(&ui, &s);
                 }
             });
@@ -2552,11 +2611,12 @@ mod tests {
         let old = c.dir.clone();
         let t0 = std::time::Instant::now();
         let ticket = c.begin_navigate_at(old.join("raw-exports"), t0);
-        assert!(!c.tick_nav(t0 + Duration::from_millis(149)));
+        let g = ticket.gen;
+        assert!(!c.tick_nav(g, t0 + Duration::from_millis(149)));
         assert_eq!(c.crumb_dir(), old, "a quick read never moves the crumb");
         assert!(!c.nav_pending());
-        assert!(c.tick_nav(t0 + NAV_PENDING_AFTER));
-        assert!(!c.tick_nav(t0 + Duration::from_millis(400)), "once");
+        assert!(c.tick_nav(g, t0 + NAV_PENDING_AFTER));
+        assert!(!c.tick_nav(g, t0 + Duration::from_millis(400)), "once");
         assert_eq!(c.crumb_dir(), old.join("raw-exports"));
         assert_eq!(c.dir, old, "listing not swapped yet");
         assert!(c.nav_pending());
@@ -2571,7 +2631,7 @@ mod tests {
         let old = c.dir.clone();
         let t0 = std::time::Instant::now();
         let ticket = c.begin_navigate_at(old.join("missing"), t0);
-        c.tick_nav(t0 + NAV_PENDING_AFTER);
+        c.tick_nav(ticket.gen, t0 + NAV_PENDING_AFTER);
         assert_eq!(c.crumb_dir(), old.join("missing"));
         assert!(matches!(c.land(ticket.perform()), Landed::Failed(_)));
         assert_eq!(c.crumb_dir(), old);
@@ -2584,7 +2644,7 @@ mod tests {
         let old = c.dir.clone();
         let t0 = std::time::Instant::now();
         let first = c.begin_navigate_at(old.join("raw-exports"), t0);
-        c.tick_nav(t0 + NAV_PENDING_AFTER);
+        c.tick_nav(first.gen, t0 + NAV_PENDING_AFTER);
         let up = old.parent().unwrap().to_path_buf();
         let second = c.begin_navigate_at(up.clone(), t0 + Duration::from_millis(200));
         assert_eq!(c.crumb_dir(), up, "retargeted at once");
@@ -2594,6 +2654,86 @@ mod tests {
         c.land(second.perform());
         assert!(!c.nav_pending());
         assert_eq!(c.dir, up);
+    }
+
+    #[test]
+    fn a_superseded_navigations_timer_does_nothing() {
+        let mut c = setup("nav-timer-stale");
+        let old = c.dir.clone();
+        let t0 = std::time::Instant::now();
+        let first = c.begin_navigate_at(old.join("raw-exports"), t0);
+        let second = c.begin_navigate_at(old.join("raw-exports"), t0 + Duration::from_millis(100));
+        assert!(!c.tick_nav(first.gen, t0 + NAV_PENDING_AFTER), "old timer");
+        assert!(!c.nav_pending());
+        let g2 = second.gen;
+        assert!(c.tick_nav(g2, t0 + Duration::from_millis(250)));
+        c.land(second.perform());
+        assert!(!c.tick_nav(g2, t0 + Duration::from_secs(1)), "landed");
+        assert!(!c.nav_pending());
+    }
+
+    #[test]
+    fn a_pending_navigation_blocks_paste_and_drops_onto_folders() {
+        let mut c = setup("nav-block");
+        let old = c.dir.clone();
+        select(&mut c, "a.jpg");
+        c.key("c", true, false);
+        let t0 = std::time::Instant::now();
+        let ticket = c.begin_navigate_at(old.parent().unwrap().to_path_buf(), t0);
+        assert!(
+            matches!(c.key("v", true, false), Action::Run(_)),
+            "not yet pending"
+        );
+        c.tick_nav(ticket.gen, t0 + NAV_PENDING_AFTER);
+        assert_eq!(c.key("v", true, false), Action::None);
+        let rows = c.rows();
+        let a = rows.iter().position(|r| r.name == "a.jpg").unwrap();
+        let raw = rows.iter().position(|r| r.name == "raw-exports").unwrap();
+        c.pointer(a, 0, 0, false, Mods::default());
+        c.pointer(a, 1, raw as i32 - a as i32, true, Mods::default());
+        assert!(!matches!(
+            c.pointer(raw, 2, 0, true, Mods::default()),
+            Action::Run(_)
+        ));
+        c.land(ticket.perform());
+        assert!(matches!(c.key("v", true, false), Action::Run(_)));
+    }
+
+    #[test]
+    fn a_failed_navigation_queues_a_reread_of_the_old_folder() {
+        let mut c = setup("nav-reread");
+        let ticket = c.begin_navigate(c.dir.join("missing"));
+        assert!(!c.take_refresh_due());
+        c.land(ticket.perform());
+        assert!(c.take_refresh_due());
+        assert!(!c.take_refresh_due(), "once");
+        let ticket = c.begin_refresh().expect("nothing in flight");
+        assert_eq!(ticket.dir, c.dir);
+    }
+
+    #[test]
+    fn an_unreadable_startup_folder_shows_why_not_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut c = setup("start-denied");
+        let locked = c.dir.join("raw-exports");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            return; // running as root
+        }
+        let mut s = Controller::new(locked.clone(), c.env.clone());
+        s.loaded = false;
+        let t = s.begin_refresh().unwrap();
+        let Landed::Failed(e) = s.land(t.perform()) else {
+            panic!("EACCES should fail")
+        };
+        assert!(e.is_denied());
+        assert_eq!(s.unreadable, Some(true));
+        assert_eq!(s.dir, locked, "no fallback on EACCES");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let t = s.begin_refresh().unwrap();
+        assert!(matches!(s.land(t.perform()), Landed::Shown { .. }));
+        assert_eq!(s.unreadable, None, "a later read clears it");
+        c.dir = locked;
     }
 
     #[test]
