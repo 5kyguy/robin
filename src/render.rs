@@ -223,9 +223,20 @@ fn paint_in(
 /// Click the row named `name`, as a person would.
 fn select_row(ui: &AppWindow, name: &str) {
     use slint::Model;
+    // The grid leaves the list model empty, so look in its lines too.
     let rows = ui.get_files();
-    let i = (0..rows.row_count())
-        .find(|&i| rows.row_data(i).is_some_and(|r| r.name == name))
+    let in_list = (0..rows.row_count()).find(|&i| rows.row_data(i).is_some_and(|r| r.name == name));
+    let lines = ui.get_grid_rows();
+    let in_grid = || {
+        lines.iter().find_map(|l| {
+            [&l.n0, &l.n1, &l.n2, &l.n3, &l.n4, &l.n5]
+                .iter()
+                .position(|n| n.as_str() == name)
+                .map(|k| l.first as usize + k)
+        })
+    };
+    let i = in_list
+        .or_else(in_grid)
         .unwrap_or_else(|| panic!("no row {name}")) as i32;
     ui.invoke_row_pointer(i, 0, 0, false, false, false);
     ui.invoke_row_pointer(i, 2, 0, false, false, false);

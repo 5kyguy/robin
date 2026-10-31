@@ -746,8 +746,7 @@ impl Controller {
     }
 
     /// The grid as lines of up to `columns` tiles.
-    pub fn grid_lines(&self) -> Vec<GridLine> {
-        let rows = self.rows();
+    pub fn grid_lines(&self, rows: &[Row]) -> Vec<GridLine> {
         let columns = self.columns.get().max(1);
         rows.chunks(columns)
             .enumerate()
@@ -2036,7 +2035,8 @@ fn redraw(ui: &AppWindow, s: &State) {
     let ctl = &s.ctl;
     sync_drop_dest(s);
     remember_prefs(s);
-    ui.set_files(ModelRc::new(Rc::new(VecModel::from(ctl.rows()))));
+    // Built once per redraw: in a 100k-entry folder each pass is costly.
+    let rows = ctl.rows();
     ui.set_grid(ctl.grid);
     ui.set_compact(ctl.compact);
     ui.set_hidden_on(ctl.listing.show_hidden());
@@ -2051,9 +2051,9 @@ fn redraw(ui: &AppWindow, s: &State) {
     } else {
         usize::MAX
     };
-    let labels: Vec<SharedString> = ctl
-        .rows()
+    let labels: Vec<SharedString> = rows
         .iter()
+        .take(if ctl.grid { 0 } else { usize::MAX })
         .map(|r| {
             let cut = elide_middle(&r.name, budget);
             if cut == r.name.as_str() {
@@ -2063,12 +2063,16 @@ fn redraw(ui: &AppWindow, s: &State) {
             }
         })
         .collect();
-    ui.set_labels(ModelRc::new(Rc::new(VecModel::from(labels))));
-    ui.set_grid_rows(ModelRc::new(Rc::new(VecModel::from(if ctl.grid {
-        ctl.grid_lines()
+    // Only the visible mode gets a model; the other stays empty.
+    if ctl.grid {
+        ui.set_files(ModelRc::default());
+        ui.set_labels(ModelRc::default());
+        ui.set_grid_rows(ModelRc::new(Rc::new(VecModel::from(ctl.grid_lines(&rows)))));
     } else {
-        Vec::new()
-    }))));
+        ui.set_labels(ModelRc::new(Rc::new(VecModel::from(labels))));
+        ui.set_files(ModelRc::new(Rc::new(VecModel::from(rows))));
+        ui.set_grid_rows(ModelRc::default());
+    }
     let (column, desc) = ctl.sort_header();
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
@@ -2738,7 +2742,7 @@ mod tests {
         assert_eq!(c.set_grid(true), Action::Redraw);
         assert_eq!(c.set_grid(true), Action::None);
         assert!(c.fit(32.0 + 152.0 * 2.0 + 8.0));
-        let lines = c.grid_lines();
+        let lines = c.grid_lines(&c.rows());
         assert_eq!(lines.len(), 2);
         assert_eq!((lines[0].n, lines[0].first), (2, 0));
         assert_eq!((lines[1].n, lines[1].first), (1, 2));
