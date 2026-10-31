@@ -229,6 +229,38 @@ mod tests {
     }
 
     #[test]
+    fn render_refuses_an_unmarked_folder_with_files() {
+        let dir = std::env::temp_dir().join(format!("robin-cli-unmarked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Pictures")).unwrap();
+        std::fs::write(dir.join("Pictures/keep.jpg"), b"mine").unwrap();
+        let out = dir.join("never.png");
+        let fixture = dir.to_string_lossy().into_owned();
+        let png = out.to_string_lossy().into_owned();
+        let err = run([
+            "--render",
+            "browser-list",
+            "--fixture",
+            fixture.as_str(),
+            "--out",
+            png.as_str(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(".robin-fixture"), "{err}");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["Pictures"], "nothing seeded, no png");
+        assert_eq!(
+            std::fs::read(dir.join("Pictures/keep.jpg")).unwrap(),
+            b"mine"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn harness_png_matches_the_theme() {
         if !have_display() {
             return;

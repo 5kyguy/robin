@@ -152,7 +152,8 @@ pub fn freeze_times(root: &Path, secs: i64) -> Result<()> {
 /// Delete a fixture, reopening its unreadable folder first.
 pub fn remove(root: &Path) -> Result<()> {
     let secret = root.join("secret");
-    if secret.is_dir() || secret.symlink_metadata().is_ok() {
+    // Only a real folder: chmod follows links, and a link could point out.
+    if secret.symlink_metadata().is_ok_and(|m| m.is_dir()) {
         set_mode(&secret, 0o755)?;
     }
     match fs::remove_dir_all(root) {

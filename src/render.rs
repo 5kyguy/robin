@@ -36,41 +36,100 @@ pub struct Options<'a> {
     pub out: &'a Path,
 }
 
+/// Where a render seeds its home when `--fixture` isn't given: private to
+/// this user, under `$XDG_RUNTIME_DIR` or `/tmp/robin-render-$UID`.
+pub fn default_home() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(run) => PathBuf::from(run).join("robin-render"),
+        None => std::env::temp_dir().join(format!(
+            "robin-render-{}",
+            rustix::process::getuid().as_raw()
+        )),
+    }
+}
+
+/// Refuse to seed a folder that has things in it and isn't a fixture, so
+/// `--fixture ~/Pictures` can never write into a real folder.
+pub fn check_fixture(root: &Path) -> Result<()> {
+    let marked = crate::fixture::mounts_dir(root).is_dir();
+    let empty = match std::fs::read_dir(root) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => return Err(Error::io(root, e)),
+    };
+    if marked || empty {
+        Ok(())
+    } else {
+        Err(Error::Message(format!(
+            "{} has files and no .robin-fixture marker; refusing to seed a real folder",
+            root.display()
+        )))
+    }
+}
+
 /// The fixture home to use: seeded (again) and with frozen times.
-pub fn seed(fixture: Option<PathBuf>) -> Result<PathBuf> {
-    let root = fixture.unwrap_or_else(|| std::env::temp_dir().join("robin-render"));
-    crate::fixture::materialize(&root)?;
-    crate::fixture::freeze_times(&root, FIXTURE_MTIME)?;
-    Ok(root)
+pub fn seed(root: &Path) -> Result<()> {
+    check_fixture(root)?;
+    crate::fixture::materialize(root)?;
+    crate::fixture::freeze_times(root, FIXTURE_MTIME)
 }
 
 pub fn paint(opts: Options<'_>) -> Result<()> {
+    if let Some(dir) = &opts.fixture {
+        check_fixture(dir)?;
+    }
     std::env::set_var("SLINT_SCALE_FACTOR", "1");
     let _ = slint::BackendSelector::new()
         .renderer_name("software".into())
         .select();
     let _ = slint::set_xdg_app_id("dev.skyguy.robin");
-    let home = seed(opts.fixture)?;
-    let start = match opts.view {
+    // A home this render made is removed after; a given --fixture is kept.
+    let made = opts.fixture.is_none();
+    let home = opts.fixture.unwrap_or_else(default_home);
+    let result = seed(&home).and_then(|()| {
+        paint_in(
+            opts.view,
+            opts.theme,
+            opts.size,
+            opts.compact,
+            &home,
+            opts.out,
+        )
+    });
+    if made {
+        let _ = crate::fixture::remove(&home);
+    }
+    result
+}
+
+fn paint_in(
+    view: &str,
+    theme: Theme,
+    size: (u32, u32),
+    compact: bool,
+    home: &Path,
+    out: &Path,
+) -> Result<()> {
+    let start = match view {
         "start-denied" => home.join("secret"),
         _ => home.join("Pictures"),
     };
-    let mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(&home))?;
+    let mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(home))?;
     let ui = app::build_scripted(Launch {
         dir: start,
-        env: crate::ops::Env::for_home(&home),
-        theme: opts.theme,
-        compact: opts.compact,
+        env: crate::ops::Env::for_home(home),
+        theme,
+        compact,
         clock: Some((FROZEN_NOW, FROZEN_OFFSET)),
         mounts: Arc::new(mounts),
     })?;
     app::land_reads();
-    if opts.view == "nav-pending" {
+    if view == "nav-pending" {
         // A slow navigation into raw-exports whose read hasn't landed.
         let t0 = std::time::Instant::now();
         app::navigate_pending(home.join("Pictures/raw-exports"), t0, 0.45);
     }
-    snapshot(&ui, opts.size, opts.out)
+    snapshot(&ui, size, out)
 }
 
 /// Size, show and capture a window to `out`.
@@ -96,4 +155,45 @@ pub fn snapshot(ui: &AppWindow, size: (u32, u32), out: &Path) -> Result<()> {
     )
     .map_err(|e| Error::Message(format!("write {}: {e}", out.display())))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_real_folder_is_never_seeded() {
+        let dir = std::env::temp_dir().join(format!("robin-unmarked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("taxes.txt"), b"real").unwrap();
+        let before = listing(&dir);
+        let err = seed(&dir).unwrap_err().to_string();
+        assert!(err.contains("refusing"), "{err}");
+        assert_eq!(listing(&dir), before, "nothing written");
+        assert_eq!(std::fs::read(dir.join("taxes.txt")).unwrap(), b"real");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_or_marked_folder_is_seeded() {
+        let dir = std::env::temp_dir().join(format!("robin-marked-{}", std::process::id()));
+        let _ = crate::fixture::remove(&dir);
+        seed(&dir).unwrap();
+        assert!(
+            crate::fixture::mounts_dir(&dir).is_dir(),
+            "seeding writes the marker"
+        );
+        seed(&dir).unwrap();
+        crate::fixture::remove(&dir).unwrap();
+    }
+
+    fn listing(dir: &Path) -> Vec<std::ffi::OsString> {
+        let mut v: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        v.sort();
+        v
+    }
 }
