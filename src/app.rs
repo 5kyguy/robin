@@ -576,9 +576,11 @@ impl Controller {
         match read.result {
             Ok((dir, snap)) if dir != self.dir => {
                 let (key, order) = self.listing.sort();
+                let hidden = self.listing.show_hidden();
                 self.dir = dir;
                 self.listing = Listing::default();
                 self.listing.set_sort(key, order);
+                self.listing.set_show_hidden(hidden);
                 self.apply_snapshot(snap);
                 Landed::Shown { moved: true }
             }
@@ -2652,6 +2654,18 @@ mod tests {
         c.toggle_hidden();
         assert!(c.rows().iter().all(|r| r.name != ".secret"));
         assert!(c.listing.selection().is_empty());
+    }
+
+    #[test]
+    fn shown_hidden_files_stay_shown_after_navigating() {
+        let mut c = setup("hidden-nav");
+        c.toggle_hidden();
+        let sub = c.dir.join("raw-exports");
+        fs::write(sub.join(".x"), b"x").unwrap();
+        let ticket = c.begin_navigate(sub);
+        c.land(ticket.perform());
+        assert!(c.listing.show_hidden());
+        assert!(c.rows().iter().any(|r| r.name == ".x"));
     }
 
     fn select(c: &mut Controller, name: &str) {
