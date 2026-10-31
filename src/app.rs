@@ -356,6 +356,11 @@ impl Controller {
         }
     }
 
+    /// Whether a navigation's read is still in flight, slow or not.
+    pub fn nav_in_flight(&self) -> bool {
+        self.nav.is_some()
+    }
+
     /// Whether a slow navigation is showing its progress bar.
     pub fn nav_pending(&self) -> bool {
         self.nav.as_ref().is_some_and(|n| n.shown)
@@ -657,7 +662,8 @@ impl Controller {
                     is_dir.then_some((t, name))
                 });
                 let mut refused = None;
-                let op = folder.as_ref().and_then(|(t, name)| {
+                let blocked = self.nav_pending();
+                let op = folder.as_ref().filter(|_| !blocked).and_then(|(t, name)| {
                     if names.contains(name) {
                         refused = Some(*t);
                         return None;
@@ -712,6 +718,9 @@ impl Controller {
 
     pub fn drag_label(&self) -> Option<(String, &'static str)> {
         let drag = self.drag.as_ref()?;
+        if self.nav_pending() {
+            return Some(("Wait for the folder to open".into(), "󰜺"));
+        }
         if drag.refused.is_some() {
             return Some(("Can't drop into itself".into(), "󰜺"));
         }
@@ -961,9 +970,11 @@ struct State {
     read_error: Option<String>,
     /// Paths another app dropped on the window, each with the folder that
     /// was open when it arrived.
-    dropped: Rc<RefCell<Vec<(PathBuf, PathBuf)>>>,
-    /// The open folder as the drop handler sees it.
-    drop_dest: Rc<RefCell<PathBuf>>,
+    /// `None` while a navigation is in flight: resolved when it lands.
+    dropped: Rc<RefCell<Vec<DroppedPath>>>,
+    /// The open folder as the drop handler sees it; `None` while a
+    /// navigation is in flight.
+    drop_dest: Rc<RefCell<Option<PathBuf>>>,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -1012,7 +1023,8 @@ pub fn run(dir: PathBuf) -> Result<i32> {
             .on_winit_window_event(move |_, event| match event {
                 WindowEvent::DroppedFile(path) => {
                     // Freeze the destination now: a navigation before the
-                    // batch is flushed must not redirect it.
+                    // batch is flushed must not redirect it. During one,
+                    // leave it open until the read lands.
                     dropped
                         .borrow_mut()
                         .push((path.clone(), dest.borrow().clone()));
@@ -1138,20 +1150,14 @@ fn debounce() -> crate::model::Debounce {
 /// Dropped paths waiting for a dialog to close, grouped into jobs per
 /// destination frozen at drop time.
 fn flush_drops(ui: &AppWindow, st: &Shared) {
-    if st.borrow().ctl.dialog.is_some() || st.borrow().ctl.nav_pending() {
+    if st.borrow().ctl.dialog.is_some() || st.borrow().ctl.nav_in_flight() {
         return; // keep them queued until the dialog closes or the folder lands
     }
     let dropped = std::mem::take(&mut *st.borrow().dropped.borrow_mut());
     if dropped.is_empty() {
         return;
     }
-    let mut by_dest: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
-    for (path, dest) in dropped {
-        match by_dest.iter_mut().find(|(d, _)| *d == dest) {
-            Some((_, paths)) => paths.push(path),
-            None => by_dest.push((dest, vec![path])),
-        }
-    }
+    let by_dest = group_drops(dropped, &st.borrow().ctl.dir);
     let (mut here, mut jobs) = (0, 0);
     for (dest, paths) in by_dest {
         let plan = ops::external_drop(&paths, &dest);
@@ -1164,6 +1170,24 @@ fn flush_drops(ui: &AppWindow, st: &Shared) {
     if let Some((text, details)) = drop_notice(jobs, here) {
         show_toast(ui, st, "", text, details, false, "");
     }
+}
+
+/// A path another app dropped, with its frozen destination if any.
+pub type DroppedPath = (PathBuf, Option<PathBuf>);
+
+/// Group dropped paths into one batch per destination. A path dropped
+/// during a navigation has none yet and goes to `open`: the new folder if
+/// the read landed, the old one if it failed.
+pub fn group_drops(dropped: Vec<DroppedPath>, open: &Path) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    let mut by_dest: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+    for (path, dest) in dropped {
+        let dest = dest.unwrap_or_else(|| open.to_path_buf());
+        match by_dest.iter_mut().find(|(d, _)| *d == dest) {
+            Some((_, paths)) => paths.push(path),
+            None => by_dest.push((dest, vec![path])),
+        }
+    }
+    by_dest
 }
 
 /// The neutral notice after a drop that copied nothing because
@@ -1250,7 +1274,9 @@ fn start_read(ticket: Option<ReadTicket>) {
 fn landed(ui: &AppWindow, st: &Shared, read: ReadResult) {
     let kind = read.kind;
     let mut s = st.borrow_mut();
-    match s.ctl.land(read) {
+    let landed = s.ctl.land(read);
+    sync_drop_dest(&s);
+    match landed {
         Landed::Stale | Landed::Unchanged => {}
         Landed::Shown { moved } => {
             s.read_error = None;
@@ -1332,11 +1358,18 @@ fn arm_watch(st: &Shared, now: std::time::Instant) -> Option<PathBuf> {
     }
 }
 
+/// Point inbound drops at the open folder, or at nothing yet while a
+/// navigation is in flight.
+fn sync_drop_dest(s: &State) {
+    let want = (!s.ctl.nav_in_flight()).then(|| s.ctl.dir.clone());
+    if *s.drop_dest.borrow() != want {
+        *s.drop_dest.borrow_mut() = want;
+    }
+}
+
 fn redraw(ui: &AppWindow, s: &State) {
     let ctl = &s.ctl;
-    if *s.drop_dest.borrow() != ctl.dir {
-        *s.drop_dest.borrow_mut() = ctl.dir.clone();
-    }
+    sync_drop_dest(s);
     ui.set_files(ModelRc::new(Rc::new(VecModel::from(ctl.rows()))));
     let (column, desc) = ctl.sort_header();
     ui.set_sort_column(column);
@@ -1439,6 +1472,7 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
         }
         Action::Navigate(dir) => {
             let ticket = st.borrow_mut().ctl.begin_navigate(dir);
+            sync_drop_dest(&st.borrow());
             let gen = ticket.gen();
             let retargeted = st.borrow().ctl.nav_pending();
             if retargeted {
@@ -2714,6 +2748,64 @@ mod tests {
         ));
         c.land(ticket.perform());
         assert!(matches!(c.key("v", true, false), Action::Run(_)));
+    }
+
+    #[test]
+    fn a_drop_during_navigation_goes_where_the_read_lands() {
+        for (target, lands_in) in [("raw-exports", "raw-exports"), ("missing", "")] {
+            let mut c = setup(&format!("nav-drop-{target}"));
+            let old = c.dir.clone();
+            let src = old.parent().unwrap().to_path_buf();
+            let paths: Vec<_> = ["x1", "x2", "x3"].map(|n| src.join(n)).into();
+            for p in &paths {
+                std::fs::write(p, b"x").unwrap();
+            }
+            let ticket = c.begin_navigate(old.join(target));
+            assert!(c.nav_in_flight(), "even before the bar shows");
+            let dropped: Vec<_> = paths.iter().map(|p| (p.clone(), None)).collect();
+            c.land(ticket.perform());
+            assert!(!c.nav_in_flight());
+            let by_dest = group_drops(dropped, &c.dir);
+            let want = if lands_in.is_empty() {
+                old.clone()
+            } else {
+                old.join(lands_in)
+            };
+            assert_eq!(by_dest.len(), 1);
+            assert_eq!(by_dest[0].0, want);
+            let plan = ops::external_drop(&by_dest[0].1, &by_dest[0].0);
+            let name = want.file_name().unwrap().to_string_lossy().into_owned();
+            assert_eq!(plan.jobs[0].label(), format!("Copying 3 items to {name}"));
+        }
+    }
+
+    #[test]
+    fn a_drop_frozen_before_navigation_keeps_its_folder() {
+        let by_dest = group_drops(
+            vec![
+                (PathBuf::from("/a/x"), Some(PathBuf::from("/old"))),
+                (PathBuf::from("/a/y"), None),
+            ],
+            Path::new("/new"),
+        );
+        assert_eq!(by_dest[0].0, PathBuf::from("/old"));
+        assert_eq!(by_dest[1].0, PathBuf::from("/new"));
+    }
+
+    #[test]
+    fn row_drags_are_blocked_while_a_navigation_is_pending() {
+        let mut c = setup("nav-drag");
+        let t0 = std::time::Instant::now();
+        let ticket = c.begin_navigate_at(c.dir.join("raw-exports"), t0);
+        c.tick_nav(ticket.gen, t0 + NAV_PENDING_AFTER);
+        let none = Mods::default();
+        c.pointer(1, 0, 0, false, none);
+        c.pointer(1, 1, 5, true, none); // past the rows: empty background
+        assert_eq!(c.drag_label().unwrap().0, "Wait for the folder to open");
+        c.pointer(1, 1, -1, true, none); // over raw-exports
+        assert!(c.rows().iter().all(|r| !r.drop));
+        assert_eq!(c.pointer(1, 2, 5, true, none), Action::Redraw, "no job");
+        assert!(c.drag.is_none());
     }
 
     #[test]
