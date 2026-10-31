@@ -1010,7 +1010,7 @@ thread_local! {
     /// Set by the render harness: reads wait in `PENDING_READS` until the
     /// script lands them, instead of running on a worker thread.
     static SCRIPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static PENDING_READS: RefCell<Vec<ReadTicket>> = const { RefCell::new(Vec::new()) };
+    static PENDING_READS: RefCell<VecDeque<ReadTicket>> = const { RefCell::new(VecDeque::new()) };
 }
 
 /// `build` for the render harness: the same window and callbacks, with
@@ -1021,9 +1021,10 @@ pub fn build_scripted(launch: Launch) -> Result<AppWindow> {
     build(launch)
 }
 
-/// Perform and land every held read, including rereads they queue.
+/// Perform and land every held read in the order it was started,
+/// including rereads they queue.
 pub fn land_reads() {
-    while let Some(ticket) = PENDING_READS.with(|p| p.borrow_mut().pop()) {
+    while let Some(ticket) = PENDING_READS.with(|p| p.borrow_mut().pop_front()) {
         let read = ticket.perform();
         with_state(|ui, st| landed(&ui, st, read));
     }
@@ -1372,7 +1373,7 @@ fn poll_watch(ui: &AppWindow, st: &Shared) {
 fn start_read(ticket: Option<ReadTicket>) {
     let Some(ticket) = ticket else { return };
     if SCRIPTED.with(|s| s.get()) {
-        PENDING_READS.with(|p| p.borrow_mut().push(ticket));
+        PENDING_READS.with(|p| p.borrow_mut().push_back(ticket));
         return;
     }
     std::thread::spawn(move || {
