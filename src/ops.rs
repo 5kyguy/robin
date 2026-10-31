@@ -754,13 +754,32 @@ pub fn run_asking(
 /// The `info/` beside `dir` when `dir` is a trash's `files/`.
 fn trash_info_dir(dir: &Path, env: &Env) -> Option<DirFd> {
     let trash = dir.parent()?;
-    let named = trash.file_name()?.to_string_lossy();
-    let is_trash = trash == env.home_trash || named == "Trash" || named.starts_with(".Trash");
-    if dir.file_name()? != "files" || !is_trash {
+    let uid = rustix::process::getuid().as_raw();
+    if dir.file_name()? != "files" || !is_trash_dir(trash, &env.home_trash, uid) {
         return None;
     }
     let parent = DirFd::open(trash).ok()?;
     parent.open_dir_nofollow(OsStr::new("info")).ok()
+}
+
+/// Only the home trash and the spec's per-device trashes,
+/// `$topdir/.Trash/$uid` and `$topdir/.Trash-$uid`. A user's own folder
+/// called `Trash` is just a folder.
+fn is_trash_dir(trash: &Path, home_trash: &Path, uid: u32) -> bool {
+    if trash == home_trash {
+        return true;
+    }
+    let Some(name) = trash.file_name() else {
+        return false;
+    };
+    if name.to_str() == Some(&format!(".Trash-{uid}")) {
+        return true;
+    }
+    name.to_str() == Some(&uid.to_string())
+        && trash
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|p| p == ".Trash")
 }
 
 fn keep_both(_: &fsops::ConflictPrompt) -> Result<ConflictChoice> {
@@ -1271,6 +1290,36 @@ mod tests {
         );
         assert!(root.join("proj/info/a.trashinfo").exists());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_projects_trash_folder_is_not_a_trash() {
+        let root = scratch("projects-trash");
+        fs::create_dir_all(root.join("Projects/Trash/files")).unwrap();
+        fs::create_dir_all(root.join("Projects/Trash/info")).unwrap();
+        fs::write(root.join("Projects/Trash/files/a"), "x").unwrap();
+        fs::write(root.join("Projects/Trash/info/a.trashinfo"), "mine").unwrap();
+        let files = root.join("Projects/Trash/files");
+        run(
+            &Job::new(JobKind::Delete, &files, names(&["a"]), &files),
+            &env(&root),
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        assert!(root.join("Projects/Trash/info/a.trashinfo").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn only_the_spec_trashes_count() {
+        let home = Path::new("/h/.local/share/Trash");
+        assert!(is_trash_dir(home, home, 1000));
+        assert!(is_trash_dir(Path::new("/mnt/d/.Trash-1000"), home, 1000));
+        assert!(is_trash_dir(Path::new("/mnt/d/.Trash/1000"), home, 1000));
+        assert!(!is_trash_dir(Path::new("/mnt/d/.Trash-1001"), home, 1000));
+        assert!(!is_trash_dir(Path::new("/mnt/d/.Trash/1001"), home, 1000));
+        assert!(!is_trash_dir(Path::new("/h/Projects/Trash"), home, 1000));
+        assert!(!is_trash_dir(Path::new("/h/.Trashy"), home, 1000));
     }
 
     #[test]
