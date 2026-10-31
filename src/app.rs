@@ -1001,6 +1001,11 @@ struct State {
     /// The open folder as the drop handler sees it; `None` while a
     /// navigation is in flight.
     drop_dest: Rc<RefCell<Option<PathBuf>>>,
+    /// The sidebar rows and status-right, as the last side job read them.
+    side: crate::sidebar::SideData,
+    side_gate: crate::sidebar::SideGate,
+    /// statvfs with a timeout, shared by every side job.
+    probe: Arc<crate::sidebar::SpaceProbe>,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -1011,6 +1016,7 @@ thread_local! {
     /// script lands them, instead of running on a worker thread.
     static SCRIPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PENDING_READS: RefCell<VecDeque<ReadTicket>> = const { RefCell::new(VecDeque::new()) };
+    static PENDING_SIDE: RefCell<VecDeque<(u64, crate::sidebar::SideJob)>> = const { RefCell::new(VecDeque::new()) };
 }
 
 /// `build` for the render harness: the same window and callbacks, with
@@ -1024,10 +1030,154 @@ pub fn build_scripted(launch: Launch) -> Result<AppWindow> {
 /// Perform and land every held read in the order it was started,
 /// including rereads they queue.
 pub fn land_reads() {
-    while let Some(ticket) = PENDING_READS.with(|p| p.borrow_mut().pop_front()) {
-        let read = ticket.perform();
-        with_state(|ui, st| landed(&ui, st, read));
+    loop {
+        if let Some(ticket) = PENDING_READS.with(|p| p.borrow_mut().pop_front()) {
+            let read = ticket.perform();
+            with_state(|ui, st| landed(&ui, st, read));
+        } else if let Some((gen, job)) = PENDING_SIDE.with(|p| p.borrow_mut().pop_front()) {
+            let data = job.perform();
+            with_state(|ui, st| side_landed(&ui, st, gen, data));
+        } else {
+            break;
+        }
     }
+}
+
+/// Reread the sidebar and the open folder's free space on a worker:
+/// item counts and statvfs can block on a slow or dead mount.
+/// One job runs at a time; a request meanwhile reruns it once it lands.
+fn start_side(s: &mut State) {
+    let Some(gen) = s.side_gate.start() else {
+        return;
+    };
+    let job = crate::sidebar::SideJob {
+        env: s.ctl.env.clone(),
+        mounts: s.ctl.mounts.clone(),
+        dir: s.ctl.dir.clone(),
+        probe: s.probe.clone(),
+    };
+    if SCRIPTED.with(|s| s.get()) {
+        PENDING_SIDE.with(|p| p.borrow_mut().push_back((gen, job)));
+        return;
+    }
+    std::thread::spawn(move || {
+        // Freed on any path that doesn't land: a panic in perform, or a
+        // failed post. If the post itself fails the loop is gone and this
+        // one fails too, which is fine: there is no window left to free.
+        let guard = crate::sidebar::SideGuard::new(move || {
+            let _ = slint::invoke_from_event_loop(move || {
+                with_state(|ui, st| side_abandoned(&ui, st, gen));
+            });
+        });
+        let data = job.perform();
+        if slint::invoke_from_event_loop(move || {
+            with_state(|ui, st| side_landed(&ui, st, gen, data));
+        })
+        .is_ok()
+        {
+            guard.disarm();
+        }
+    });
+}
+
+fn side_abandoned(_ui: &AppWindow, st: &Shared, gen: u64) {
+    let rerun = {
+        let mut s = st.borrow_mut();
+        s.side_gate.abandon(gen) == crate::sidebar::SideLanding::Rerun
+    };
+    if rerun {
+        start_side(&mut st.borrow_mut());
+    }
+}
+
+/// The breadcrumb, rooted at a device's label when the folder is on one.
+fn draw_crumbs(ui: &AppWindow, s: &State) -> Vec<String> {
+    let user = std::env::var("USER").ok();
+    let home = s.ctl.env.home.as_deref();
+    let crumbs: Vec<String> = crumbs_for(s.ctl.crumb_dir(), home, &s.side.devices, user.as_deref())
+        .iter()
+        .map(|c| c.label.clone())
+        .collect();
+    ui.set_crumbs(crumbs.join("  ›  ").into());
+    crumbs
+}
+
+/// The breadcrumb parts. Removable devices come from the side job, but a
+/// desktop automount is known from its path alone, so its crumb starts at
+/// the device name from the first frame instead of `/ › run › media`.
+fn crumbs_for(
+    dir: &Path,
+    home: Option<&Path>,
+    side: &[crate::sidebar::SideEntry],
+    user: Option<&str>,
+) -> Vec<crate::model::Crumb> {
+    let mut devices: Vec<(PathBuf, String)> = side
+        .iter()
+        .filter(|d| d.removable && !home.is_some_and(|h| h.starts_with(&d.path)))
+        .map(|d| (d.path.clone(), d.name.clone()))
+        .collect();
+    if let Some(auto) = crate::mounts::automount_of(dir, user) {
+        if !devices.iter().any(|(p, _)| *p == auto.0) {
+            devices.push(auto);
+        }
+    }
+    crate::model::breadcrumbs_on(dir, home, &devices)
+}
+
+/// A folder's name for a message, rebuilt from its crumbs: the root as
+/// shown (`/`, `~`, a device), then the rest joined with `/`.
+fn crumb_name(crumbs: &[String]) -> String {
+    let Some((root, rest)) = crumbs.split_first() else {
+        return String::new();
+    };
+    if rest.is_empty() {
+        return root.clone();
+    }
+    let sep = if root.ends_with('/') { "" } else { "/" };
+    format!("{root}{sep}{}", rest.join("/"))
+}
+
+fn side_landed(ui: &AppWindow, st: &Shared, gen: u64, data: crate::sidebar::SideData) {
+    use crate::sidebar::SideLanding;
+    let mut s = st.borrow_mut();
+    match s.side_gate.land(gen) {
+        SideLanding::Apply => {}
+        SideLanding::Drop => return,
+        SideLanding::Rerun => {
+            start_side(&mut s);
+            return;
+        }
+    }
+    s.side = data;
+    draw_side(ui, &s);
+    draw_crumbs(ui, &s);
+}
+
+/// The sidebar sections and status-right from the last side job, with
+/// the open folder's row lit.
+fn draw_side(ui: &AppWindow, s: &State) {
+    let side = &s.side;
+    let lit = crate::sidebar::picked(side, &s.ctl.dir);
+    let rows = |section: usize, entries: &[crate::sidebar::SideEntry]| {
+        let places: Vec<crate::Place> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| crate::Place {
+                glyph: e.glyph.into(),
+                name: e.name.clone().into(),
+                count: e.count.clone().into(),
+                selected: lit == Some((section, i)),
+                usage: e.usage.unwrap_or(-1.0),
+                level: e.usage.map(crate::sidebar::level).unwrap_or(0),
+                section: section as i32,
+            })
+            .collect();
+        ModelRc::new(Rc::new(VecModel::from(places)))
+    };
+    ui.set_pinned_places(rows(0, &side.pinned));
+    ui.set_device_places(rows(1, &side.devices));
+    ui.set_trash_places(rows(2, &side.trash));
+    ui.set_status_right(side.space.clone().into());
 }
 
 /// Start a navigation to `target` at `t0` and hold its read, then move the
@@ -1122,10 +1272,14 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         read_error: None,
         dropped: Rc::default(),
         drop_dest: Rc::default(),
+        side: Default::default(),
+        side_gate: Default::default(),
+        probe: crate::sidebar::SpaceProbe::new(std::time::Duration::from_millis(400)),
     }));
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
     redraw(&ui, &state.borrow());
     start_read(startup);
+    start_side(&mut state.borrow_mut());
     {
         // Inbound drops from other apps. winit reports one DroppedFile per
         // path (X11 only in winit 0.30) and no pointer position, so they
@@ -1178,6 +1332,22 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
                 .pointer(index.max(0) as usize, kind, dy, far, Mods { ctrl, shift });
         if let Some(ui) = w.upgrade() {
             apply(&ui, &st, action);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_place_open(move |section, index| {
+        let target = {
+            let s = st.borrow();
+            let rows = match section {
+                0 => &s.side.pinned,
+                1 => &s.side.devices,
+                _ => &s.side.trash,
+            };
+            rows.get(index.max(0) as usize).map(|e| e.path.clone())
+        };
+        if let (Some(ui), Some(t)) = (w.upgrade(), target) {
+            apply(&ui, &st, Action::Navigate(t));
         }
     });
     let w = ui.as_weak();
@@ -1395,6 +1565,7 @@ fn landed(ui: &AppWindow, st: &Shared, read: ReadResult) {
         Landed::Stale | Landed::Unchanged => {}
         Landed::Shown { moved } => {
             s.read_error = None;
+            start_side(&mut s);
             let (list_y, grid_y) = (ui.get_list_scroll(), ui.get_grid_scroll());
             redraw(ui, &s);
             if moved {
@@ -1489,16 +1660,12 @@ fn redraw(ui: &AppWindow, s: &State) {
     let (column, desc) = ctl.sort_header();
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
-    let home = ctl.env.home.clone();
-    let crumbs: Vec<String> = crate::model::breadcrumbs(ctl.crumb_dir(), home.as_deref())
-        .iter()
-        .map(|c| c.label.clone())
-        .collect();
-    ui.set_crumbs(crumbs.join("  ›  ").into());
+    let crumbs = draw_crumbs(ui, s);
     ui.set_path_text(ctl.crumb_dir().display().to_string().into());
     ui.set_nav_busy(ctl.nav_pending());
+    draw_side(ui, s);
     if let Some(denied) = ctl.unreadable {
-        let name = crumbs.join("/");
+        let name = crumb_name(&crumbs);
         ui.set_state_title(
             if denied {
                 format!("No permission to open {name}")
@@ -2062,6 +2229,40 @@ pub fn start_dir(arg: Option<&Path>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_automount_crumb_starts_at_the_device_before_the_side_job() {
+        let dir = Path::new("/run/media/sky/CARD/DCIM");
+        let labels = |side: &[crate::sidebar::SideEntry]| -> Vec<String> {
+            super::crumbs_for(dir, Some(Path::new("/home/sky")), side, Some("sky"))
+                .into_iter()
+                .map(|c| c.label)
+                .collect()
+        };
+        assert_eq!(labels(&[]), ["CARD", "DCIM"], "first frame, no devices yet");
+        let named = crate::sidebar::SideEntry {
+            glyph: "",
+            name: "Camera card".into(),
+            path: "/run/media/sky/CARD".into(),
+            count: String::new(),
+            usage: None,
+            removable: true,
+        };
+        assert_eq!(
+            labels(&[named]),
+            ["Camera card", "DCIM"],
+            "the side job's label wins"
+        );
+    }
+
+    #[test]
+    fn a_crumb_name_is_built_from_its_parts() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(super::crumb_name(&v(&["/", "srv", "x"])), "/srv/x");
+        assert_eq!(super::crumb_name(&v(&["~", "Documents"])), "~/Documents");
+        assert_eq!(super::crumb_name(&v(&["CARD", "a//b"])), "CARD/a//b");
+        assert_eq!(super::crumb_name(&v(&["/"])), "/");
+    }
+
     use super::*;
     use std::fs;
 
@@ -2075,6 +2276,7 @@ mod tests {
         let env = Env {
             home: Some(root.clone()),
             home_trash: root.join("trash"),
+            config_home: None,
         };
         let mut c = Controller::new(dir, env);
         c.reload().unwrap();

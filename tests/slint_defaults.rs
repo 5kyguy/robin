@@ -64,14 +64,34 @@ fn strip_comments(src: &str) -> String {
 /// The live code only: `#[cfg(test)]` modules set properties too, and a
 /// setter there doesn't make the window show real data.
 fn live_rust(src: &str) -> String {
-    let src = strip_comments(src);
+    let mut src = strip_comments(src);
     let mut from = 0;
     while let Some(at) = src[from..].find("#[cfg(test)]") {
         let i = from + at;
         let rest = src[i + "#[cfg(test)]".len()..].trim_start();
         let rest = rest.strip_prefix("pub ").unwrap_or(rest).trim_start();
         if rest.starts_with("mod ") || rest.starts_with("mod\t") {
-            return src[..i].to_string();
+            // Cut just this module's block, matched by brace depth, so
+            // code after it is still checked. Strings holding braces are
+            // rare enough in app.rs that depth counting is good enough.
+            let open = src[i..].find('{').map(|o| i + o);
+            let close = open.and_then(|o| {
+                let mut depth = 0i32;
+                src[o..].char_indices().find_map(|(k, c)| {
+                    depth += match c {
+                        '{' => 1,
+                        '}' => -1,
+                        _ => 0,
+                    };
+                    (depth == 0).then_some(o + k + 1)
+                })
+            });
+            match close {
+                Some(end) => src.replace_range(i..end, ""),
+                None => src.truncate(i),
+            }
+            from = i;
+            continue;
         }
         from = i + 1;
     }
@@ -178,4 +198,10 @@ fn the_parser_rejects_what_it_cannot_read() {
     let kept = live_rust("#[cfg(test)]\nfn helper() {}\nfn a() { x.set_a(1); }");
     assert!(kept.contains("set_a"), "a cfg(test) fn isn't a test module");
     assert!(live.contains("set_a(") && !live.contains("set_b("));
+    let after =
+        live_rust("#[cfg(test)]\nmod tests { fn t() { x.set_b(2); } }\nfn c() { x.set_c(3); }");
+    assert!(
+        after.contains("set_c(") && !after.contains("set_b("),
+        "code after the module is kept"
+    );
 }

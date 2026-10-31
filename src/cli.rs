@@ -70,7 +70,7 @@ fn demo<'a>(mut iter: impl Iterator<Item = &'a std::ffi::OsString>) -> Result<i3
         }
     }
     fixture::materialize(&out)?;
-    println!("{}", out.display());
+    println!("{}", fixture::home(&out).display());
     Ok(0)
 }
 
@@ -207,7 +207,9 @@ mod tests {
             .unwrap(),
             0
         );
-        assert!(dir.join("Pictures/palette.toml").is_file());
+        assert!(crate::fixture::home(&dir)
+            .join("Pictures/palette.toml")
+            .is_file());
         let _ = crate::fixture::remove(&dir);
     }
 

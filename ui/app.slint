@@ -94,8 +94,10 @@ component SideRow inherits Rectangle {
     in property <color> muted;
     in property <color> accent;
     in property <color> selected-bg;
+    callback clicked;
     height: side-row;
     border-radius: 6px;
+    TouchArea { clicked => { root.clicked(); } }
     background: picked ? selected-bg : transparent;
     border-width: picked ? 1px : 0px;
     border-color: accent;
@@ -618,6 +620,8 @@ export component AppWindow inherits Window {
     // far enough to be a drag, Ctrl, Shift.
     callback row-pointer(int, int, int, bool, bool, bool);
     callback row-open(int);
+    /// A sidebar row: section 0 pinned, 1 devices, 2 trash.
+    callback place-open(int, int);
     callback dialog-button(int);
     callback job-cancel();
     callback toast-link();
@@ -678,7 +682,7 @@ export component AppWindow inherits Window {
                 padding-top: 8px;
                 padding-bottom: 8px;
                 spacing: 0px;
-                if !collapsed: HorizontalLayout {
+                if !collapsed && pinned-places.length > 0: HorizontalLayout {
                     Rectangle { width: 12px; }
                     Text {
                         text: "PINNED";
@@ -690,7 +694,8 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                     }
                 }
-                for place in pinned-places: SideRow {
+                for place[i] in pinned-places: SideRow {
+                    clicked => { root.place-open(0, i); }
                     glyph: place.glyph;
                     name: place.name;
                     count: place.count;
@@ -703,7 +708,7 @@ export component AppWindow inherits Window {
                     selected-bg: root.selected;
                 }
                 Rectangle { height: 8px; }
-                if !collapsed: HorizontalLayout {
+                if !collapsed && device-places.length > 0: HorizontalLayout {
                     Rectangle { width: 12px; }
                     Text {
                         text: "DEVICES";
@@ -715,9 +720,18 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                     }
                 }
-                for place in device-places: VerticalLayout {
+                // The highlight wraps the label and its usage bar together.
+                for place[i] in device-places: Rectangle {
+                    border-radius: 6px;
+                    background: place.selected ? root.selected : transparent;
+                    border-width: place.selected ? 1px : 0px;
+                    border-color: root.accent;
+                    TouchArea { clicked => { root.place-open(1, i); } }
+                    VerticalLayout {
+                    padding-bottom: !root.collapsed && place.usage >= 0 ? 4px : 0px;
                     spacing: 1px;
                     SideRow {
+                        clicked => { root.place-open(1, i); }
                         glyph: place.glyph;
                         name: place.name;
                         count: place.count;
@@ -749,8 +763,9 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                    }
                 Rectangle { height: 8px; }
-                if !collapsed: HorizontalLayout {
+                if !collapsed && trash-places.length > 0: HorizontalLayout {
                     Rectangle { width: 12px; }
                     Text {
                         text: "TRASH";
@@ -762,11 +777,12 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                     }
                 }
-                for place in trash-places: SideRow {
+                for place[i] in trash-places: SideRow {
+                    clicked => { root.place-open(2, i); }
                     glyph: place.glyph;
                     name: place.name;
                     count: place.count;
-                    picked: false;
+                    picked: place.selected;
                     rail: root.collapsed;
                     side-row: root.side-row;
                     ink: root.text;

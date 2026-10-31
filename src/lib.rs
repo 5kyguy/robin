@@ -16,6 +16,7 @@ pub mod ops;
 pub mod render;
 pub mod safety;
 pub mod shots;
+pub mod sidebar;
 pub mod stats;
 pub mod theme;
 pub mod thumbs;

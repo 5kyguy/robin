@@ -12,7 +12,13 @@ fn scripted_views_render_through_the_real_app() {
         return;
     }
     let dir = std::env::temp_dir().join(format!("robin-real-render-{}", std::process::id()));
-    for view in ["browser-list", "nav-pending", "start-denied"] {
+    for view in [
+        "browser-list",
+        "nav-pending",
+        "start-denied",
+        "sidebar-device",
+        "sidebar-trash",
+    ] {
         let out = dir.join(format!("{view}.png"));
         let fixture = dir.join(format!("home-{view}"));
         let status = Command::new(env!("CARGO_BIN_EXE_robin"))

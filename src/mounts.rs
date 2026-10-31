@@ -15,6 +15,9 @@ pub struct Volume {
     pub mount_point: String,
     pub fs_type: String,
     pub source: String,
+    /// The subtree of the source this mount shows (`/` for a whole
+    /// filesystem, `/@home` for a btrfs subvolume).
+    pub root: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,7 +40,7 @@ pub fn volumes_from_mountinfo(text: &str) -> Vec<Volume> {
         let _id = fields.next();
         let _parent = fields.next();
         let _dev = fields.next();
-        let _root = fields.next();
+        let root = fields.next().unwrap_or("/");
         let Some(mount_point) = fields.next() else {
             continue;
         };
@@ -54,6 +57,7 @@ pub fn volumes_from_mountinfo(text: &str) -> Vec<Volume> {
             mount_point: unescape(mount_point),
             fs_type: fs_type.to_string(),
             source: unescape(source),
+            root: unescape(root),
         });
     }
     out
@@ -147,6 +151,51 @@ pub struct Space {
 pub trait MountSource: Send + Sync {
     fn volumes(&self) -> Result<Vec<Volume>>;
     fn space(&self, mount_point: &Path) -> Result<Space>;
+    /// A drive meant to be unplugged: a USB stick, an SD card.
+    fn removable(&self, volume: &Volume) -> bool;
+}
+
+/// The desktop automount a path sits on, as (mount point, label), read
+/// from the path alone: `/media/$USER/X` or `/run/media/$USER/X`. Lets
+/// the breadcrumb start at the device before the mount table is read.
+pub fn automount_of(path: &Path, user: Option<&str>) -> Option<(PathBuf, String)> {
+    let user = user.filter(|u| !u.is_empty() && !u.contains('/'))?;
+    [
+        Path::new("/media").join(user),
+        Path::new("/run/media").join(user),
+    ]
+    .into_iter()
+    .find_map(|base| {
+        let name = path.strip_prefix(&base).ok()?.components().next()?;
+        let name = name.as_os_str();
+        Some((base.join(name), name.to_string_lossy().into_owned()))
+    })
+}
+
+/// True when the kernel marks the block device (or the disk a partition
+/// belongs to) removable, or the desktop automounted it under
+/// `/media/$USER` or `/run/media/$USER`.
+pub fn system_removable(volume: &Volume, user: Option<&str>) -> bool {
+    if let Some(user) = user.filter(|u| !u.is_empty()) {
+        let mount = Path::new(&volume.mount_point);
+        if mount.starts_with(Path::new("/media").join(user))
+            || mount.starts_with(Path::new("/run/media").join(user))
+        {
+            return true;
+        }
+    }
+    let Some(name) = volume.source.strip_prefix("/dev/") else {
+        return false;
+    };
+    let block = Path::new("/sys/class/block").join(name);
+    let flag =
+        |dir: &Path| std::fs::read_to_string(dir.join("removable")).is_ok_and(|t| t.trim() == "1");
+    // A partition's flag lives on its disk, one folder up.
+    flag(&block)
+        || std::fs::canonicalize(&block)
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .is_some_and(|disk| flag(&disk))
 }
 
 /// `/proc/self/mountinfo` and `statvfs(3)`.
@@ -167,6 +216,11 @@ impl MountSource for SystemMounts {
             free: st.f_bavail * st.f_frsize,
         })
     }
+
+    fn removable(&self, volume: &Volume) -> bool {
+        let user = std::env::var("USER").ok();
+        system_removable(volume, user.as_deref())
+    }
 }
 
 /// A seeded mount table: `mountinfo` in the kernel's format and `space`
@@ -174,6 +228,8 @@ impl MountSource for SystemMounts {
 pub struct FixtureMounts {
     mountinfo: String,
     space: Vec<(PathBuf, Space)>,
+    /// Sources listed in `removable`, one per line.
+    removable: Vec<String>,
 }
 
 impl FixtureMounts {
@@ -192,7 +248,16 @@ impl FixtureMounts {
                 Some((PathBuf::from(f.next()?), Space { total, free }))
             })
             .collect();
-        Ok(Self { mountinfo, space })
+        let removable = read("removable")
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        Ok(Self {
+            mountinfo,
+            space,
+            removable,
+        })
     }
 }
 
@@ -207,6 +272,10 @@ impl MountSource for FixtureMounts {
             .find(|(p, _)| p == mount_point)
             .map(|(_, s)| *s)
             .ok_or_else(|| Error::Message(format!("no space seeded for {}", mount_point.display())))
+    }
+
+    fn removable(&self, volume: &Volume) -> bool {
+        self.removable.contains(&volume.source)
     }
 }
 
@@ -265,14 +334,51 @@ mod tests {
         crate::fixture::materialize(&root).unwrap();
         let m = FixtureMounts::load(&crate::fixture::mounts_dir(&root)).unwrap();
         let vols = m.volumes().unwrap();
-        let sandisk = root.join("media/SANDISK");
+        let sandisk = root.join("media/sky/SANDISK");
         assert!(vols
             .iter()
             .any(|v| Path::new(&v.mount_point) == sandisk && v.fs_type == "exfat"));
         let s = m.space(&sandisk).unwrap();
         assert!(s.free < s.total);
         assert!(m.space(Path::new("/nowhere")).is_err());
+        let stick = vols.iter().find(|v| v.source == "/dev/sda1").unwrap();
+        assert!(m.removable(stick));
+        assert!(!m.removable(&vols[0]));
         crate::fixture::remove(&root).unwrap();
+    }
+
+    #[test]
+    fn media_user_mounts_are_removable() {
+        let v = |mount: &str| Volume {
+            mount_point: mount.into(),
+            fs_type: "ext4".into(),
+            source: "/dev/robin-none".into(),
+            root: "/".into(),
+        };
+        assert!(system_removable(&v("/media/sky/STICK"), Some("sky")));
+        assert_eq!(
+            automount_of(Path::new("/run/media/sky/CARD/DCIM"), Some("sky")),
+            Some((PathBuf::from("/run/media/sky/CARD"), "CARD".into()))
+        );
+        assert_eq!(
+            automount_of(Path::new("/media/sky/STICK"), Some("sky")),
+            Some((PathBuf::from("/media/sky/STICK"), "STICK".into()))
+        );
+        assert_eq!(automount_of(Path::new("/run/media/sky"), Some("sky")), None);
+        assert_eq!(automount_of(Path::new("/media/ann/X"), Some("sky")), None);
+        assert_eq!(automount_of(Path::new("/media/sky/X"), None), None);
+        assert!(system_removable(&v("/run/media/sky/CARD"), Some("sky")));
+        assert!(!system_removable(&v("/srv/media/disk"), Some("sky")));
+        assert!(!system_removable(&v("/media/other/STICK"), Some("sky")));
+        assert!(!system_removable(&v("/home/sky/media/x"), Some("sky")));
+    }
+
+    #[test]
+    fn mountinfo_keeps_the_subvolume_root() {
+        let v = volumes_from_mountinfo(
+            "30 1 0:40 /@ / rw - btrfs /dev/sda2 rw\n31 1 0:40 /@home /home rw - btrfs /dev/sda2 rw\n",
+        );
+        assert_eq!((v[0].root.as_str(), v[1].root.as_str()), ("/@", "/@home"));
     }
 
     #[test]
