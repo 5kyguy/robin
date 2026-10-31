@@ -50,6 +50,7 @@ pub fn scripted(view: &str) -> bool {
             | "view-pan"
             | "view-wake"
             | "view-strip-video"
+            | "stats-real"
     )
 }
 
@@ -179,6 +180,9 @@ fn paint_in(
         crate::fixture::freeze_times(root, FIXTURE_MTIME)?;
     }
     let mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(root))?;
+    if view == "stats-real" {
+        seed_cache(home)?;
+    }
     let mut env = crate::ops::Env::for_home(home);
     if view == "trash-empty" {
         env.home_trash = crate::fixture::empty_trash(root);
@@ -287,6 +291,11 @@ fn paint_in(
             app::land_reads();
         }
         "trash-empty-confirm" => ui.invoke_trash_empty(),
+        // The sidebar's Statistics row; the scan lands like any read.
+        "stats-real" => {
+            ui.invoke_stats_open();
+            app::land_reads();
+        }
         // Select the item with no trashinfo; the banner explains it.
         "trash-noinfo" => select_row(&ui, "mystery.bin"),
         // Restore into ~/Documents/Finance, which no longer exists.
@@ -325,6 +334,23 @@ fn seed_strip_videos(home: &Path) -> Result<()> {
         frame.width(),
         frame.height(),
     )?;
+    Ok(())
+}
+
+/// A thumbnail cache and an app cache, so the Cache card has parts to name.
+fn seed_cache(home: &Path) -> Result<()> {
+    for (rel, len) in [
+        (".cache/thumbnails/normal/0a1b.png", 48_000),
+        (".cache/thumbnails/large/0a1b.png", 160_000),
+        (".cache/robin/state.bin", 12_000),
+        (".cache/fontconfig/cache-9", 90_000),
+    ] {
+        let path = home.join(rel);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+        }
+        std::fs::write(&path, vec![0u8; len]).map_err(|e| Error::io(&path, e))?;
+    }
     Ok(())
 }
 

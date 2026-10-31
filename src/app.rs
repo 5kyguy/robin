@@ -1640,6 +1640,11 @@ struct State {
     /// The sidebar rows and status-right, as the last side job read them.
     side: crate::sidebar::SideData,
     side_gate: crate::sidebar::SideGate,
+    /// Statistics: the latest report, and the newest scan's number so an
+    /// older scan landing late is dropped.
+    stats: Option<crate::stats::Report>,
+    stats_gen: u64,
+    stats_at: i64,
     /// statvfs with a timeout, shared by every side job.
     probe: Arc<crate::sidebar::SpaceProbe>,
     /// Where view settings are remembered, and what was last written.
@@ -1659,6 +1664,7 @@ thread_local! {
     static PENDING_READS: RefCell<VecDeque<ReadTicket>> = const { RefCell::new(VecDeque::new()) };
     static PENDING_DECODES: RefCell<VecDeque<DecodeJob>> = const { RefCell::new(VecDeque::new()) };
     static LAUNCHED: RefCell<Vec<Vec<OsString>>> = const { RefCell::new(Vec::new()) };
+    static PENDING_STATS: RefCell<VecDeque<(u64, crate::stats::StatsJob)>> = const { RefCell::new(VecDeque::new()) };
     static PENDING_SIDE: RefCell<VecDeque<(u64, crate::sidebar::SideJob)>> = const { RefCell::new(VecDeque::new()) };
 }
 
@@ -1680,6 +1686,9 @@ pub fn land_reads() {
         } else if let Some(job) = PENDING_DECODES.with(|p| p.borrow_mut().pop_front()) {
             let done = job.perform();
             with_state(|ui, st| decode_landed(&ui, st, done));
+        } else if let Some((gen, job)) = PENDING_STATS.with(|p| p.borrow_mut().pop_front()) {
+            let report = job.perform();
+            with_state(|ui, st| stats_landed(&ui, st, gen, report));
         } else if let Some((gen, job)) = PENDING_SIDE.with(|p| p.borrow_mut().pop_front()) {
             let data = job.perform();
             with_state(|ui, st| side_landed(&ui, st, gen, data));
@@ -1724,6 +1733,192 @@ fn start_side(s: &mut State) {
             guard.disarm();
         }
     });
+}
+
+/// Where the cache lives: `$XDG_CACHE_HOME` when absolute, else
+/// `~/.cache`. Renders and tests always use the fixture's `~/.cache`.
+fn cache_home(home: &Path) -> PathBuf {
+    if !SCRIPTED.with(|s| s.get()) {
+        if let Some(dir) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
+            if dir.is_absolute() {
+                return dir;
+            }
+        }
+    }
+    home.join(".cache")
+}
+
+/// Open the Statistics view and (re)scan on a worker: a home walk can
+/// take seconds. The last report shows meanwhile.
+fn open_stats(ui: &AppWindow, st: &Shared) {
+    ui.set_stats_mode("overview".into());
+    let job = {
+        let mut s = st.borrow_mut();
+        s.stats_gen += 1;
+        match &s.stats {
+            Some(r) => show_stats(ui, r, &scanned_line(&s.ctl, s.stats_at, true)),
+            None => ui.set_stat_scanned("Scanning…".into()),
+        }
+        let Some(home) = s.ctl.env.home.clone() else {
+            ui.set_stat_scanned("No home folder to scan".into());
+            return;
+        };
+        (
+            s.stats_gen,
+            crate::stats::StatsJob {
+                cache: cache_home(&home),
+                home,
+                trash: s.ctl.env.home_trash.clone(),
+                mounts: s.ctl.mounts.clone(),
+            },
+        )
+    };
+    if SCRIPTED.with(|s| s.get()) {
+        PENDING_STATS.with(|p| p.borrow_mut().push_back(job));
+        return;
+    }
+    std::thread::spawn(move || {
+        let (gen, job) = job;
+        let report = job.perform();
+        let _ = slint::invoke_from_event_loop(move || {
+            with_state(|ui, st| stats_landed(&ui, st, gen, report));
+        });
+    });
+}
+
+fn stats_landed(ui: &AppWindow, st: &Shared, gen: u64, report: crate::stats::Report) {
+    let mut s = st.borrow_mut();
+    if gen != s.stats_gen {
+        return;
+    }
+    s.stats_at = ctl_now(&s.ctl);
+    if ui.get_stats_mode() != "" {
+        show_stats(ui, &report, &scanned_line(&s.ctl, s.stats_at, false));
+    }
+    s.stats = Some(report);
+}
+
+/// Fill the Statistics view from a report. `stale` marks a rescan running.
+pub fn show_stats(ui: &AppWindow, r: &crate::stats::Report, scanned: &str) {
+    use crate::stats::UsageLevel;
+    let disks: Vec<crate::StatDisk> = r
+        .disks
+        .iter()
+        .map(|d| {
+            let ratio = d.used_ratio();
+            crate::StatDisk {
+                name: d.name.clone().into(),
+                mount: d.mount.clone().into(),
+                amount: ratio,
+                level: match crate::stats::usage_level(ratio) {
+                    UsageLevel::Accent => 0,
+                    UsageLevel::Warning => 1,
+                    UsageLevel::Danger => 2,
+                },
+                pct: format!("{:.0}%", ratio * 100.0).into(),
+                free: format!("{} free of {}", human(d.free), human(d.total)).into(),
+            }
+        })
+        .collect();
+    ui.set_stat_disks(ModelRc::new(VecModel::from(disks)));
+    let total: u64 = r.home.kinds.iter().map(|k| k.1).sum();
+    let mut start = 0.0;
+    let types: Vec<crate::StatType> = crate::stats::KINDS
+        .iter()
+        .zip(r.home.kinds.iter())
+        .enumerate()
+        .map(|(i, (kind, (files, bytes)))| {
+            let share = if total == 0 {
+                0.0
+            } else {
+                *bytes as f32 / total as f32
+            };
+            let t = crate::StatType {
+                name: kind.name().into(),
+                count: crate::stats::group_digits(*files).into(),
+                size: human(*bytes).into(),
+                start,
+                share,
+                alpha: [1.0, 0.8, 0.6, 0.45, 0.32, 0.2, 0.1][i],
+            };
+            start += share;
+            t
+        })
+        .collect();
+    ui.set_stat_types(ModelRc::new(VecModel::from(types)));
+    let weights = crate::stats::treemap_weights(&r.home.top, 9);
+    ui.set_map_cells(ModelRc::new(VecModel::from(map_cells(
+        &weights, 623.0, 300.0,
+    ))));
+    ui.set_stat_tree_title(
+        format!(
+            "LARGEST FOLDERS   ·   {} in home",
+            human(r.home.total_bytes)
+        )
+        .into(),
+    );
+    ui.set_stat_cache_total(human(r.cache_bytes).into());
+    ui.set_stat_cache_detail(
+        if r.cache_parts.is_empty() {
+            "Nothing cached".to_string()
+        } else {
+            r.cache_parts
+                .iter()
+                .map(|(n, b)| format!("{} {n}", human(*b)))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        }
+        .into(),
+    );
+    ui.set_stat_trash_size(human(r.trash_bytes).into());
+    ui.set_stat_trash_count(crate::ops::count(r.trash_items as usize).into());
+    ui.set_stat_scanned(scanned.into());
+}
+
+/// "Scanned 16:10  ·  Rescan", or "Rescanning…" while a rescan runs.
+fn scanned_line(ctl: &Controller, at: i64, stale: bool) -> String {
+    let offset = |t| {
+        ctl.clock
+            .map_or_else(|| crate::model::local_offset(t), |c| c.1)
+    };
+    let when = crate::model::format_modified(at, ctl_now(ctl), offset);
+    let tail = if stale { "Rescanning…" } else { "Rescan" };
+    format!("Scanned {when}  ·  {tail}")
+}
+
+fn ctl_now(ctl: &Controller) -> i64 {
+    ctl.clock
+        .map_or_else(|| secs(std::time::SystemTime::now()), |c| c.0)
+}
+
+/// Treemap cells for (name, bytes) weights in a `w` by `h` box: the
+/// largest is full accent and each lower rank, or deeper row, is darker.
+pub fn map_cells(weights: &[(String, u64)], w: f32, h: f32) -> Vec<crate::MapCell> {
+    let rank_of: std::collections::HashMap<&str, usize> = weights
+        .iter()
+        .enumerate()
+        .map(|(i, (n, _))| (n.as_str(), i))
+        .collect();
+    let bytes: std::collections::HashMap<&str, u64> =
+        weights.iter().map(|(n, b)| (n.as_str(), *b)).collect();
+    // 1px off each shared edge is a 2px surface gutter.
+    const GUTTER: f32 = 1.0;
+    crate::stats::squarify(weights, w, h)
+        .into_iter()
+        .map(|rect| {
+            let rank = rank_of.get(rect.name.as_str()).copied().unwrap_or(0) as f32;
+            let shade = (1.0 - rank * 0.08 - rect.depth as f32 * 0.15).clamp(0.18, 1.0);
+            crate::MapCell {
+                x: rect.x + GUTTER,
+                y: rect.y + GUTTER,
+                w: (rect.w - 2.0 * GUTTER).max(0.0),
+                h: (rect.h - 2.0 * GUTTER).max(0.0),
+                detail: human(bytes.get(rect.name.as_str()).copied().unwrap_or(0)).into(),
+                name: rect.name.into(),
+                shade,
+            }
+        })
+        .collect()
 }
 
 fn side_abandoned(_ui: &AppWindow, st: &Shared, gen: u64) {
@@ -1937,6 +2132,9 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         drop_dest: Rc::default(),
         side: Default::default(),
         side_gate: Default::default(),
+        stats: None,
+        stats_gen: 0,
+        stats_at: 0,
         probe: crate::sidebar::SpaceProbe::new(std::time::Duration::from_millis(400)),
         prefs_saved: std::cell::Cell::new(saved.unwrap_or_else(crate::prefs::ViewPrefs::fresh)),
         prefs_path: launch.prefs,
@@ -2131,6 +2329,18 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
                 .pointer(index.max(0) as usize, kind, dy, far, Mods { ctrl, shift });
         if let Some(ui) = w.upgrade() {
             apply(&ui, &st, action);
+        }
+    });
+    let (w_so, st_so) = (ui.as_weak(), state.clone());
+    ui.on_stats_open(move || {
+        if let Some(ui) = w_so.upgrade() {
+            open_stats(&ui, &st_so);
+        }
+    });
+    let (w_sr, st_sr) = (ui.as_weak(), state.clone());
+    ui.on_stats_rescan(move || {
+        if let Some(ui) = w_sr.upgrade() {
+            open_stats(&ui, &st_sr);
         }
     });
     let w = ui.as_weak();
@@ -3037,6 +3247,7 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
             }
         }
         Action::Navigate(dir) => {
+            ui.set_stats_mode("".into());
             let ticket = st.borrow_mut().ctl.begin_navigate(dir);
             sync_drop_dest(&st.borrow());
             let gen = ticket.gen();

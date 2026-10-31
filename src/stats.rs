@@ -168,18 +168,106 @@ fn worst_ratio(row: &[(String, f32)], side: f32) -> f32 {
     worst
 }
 
+/// File kinds the overview counts, in display order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Video,
+    Images,
+    Code,
+    Archives,
+    Audio,
+    Docs,
+    Other,
+}
+
+pub const KINDS: [Kind; 7] = [
+    Kind::Video,
+    Kind::Images,
+    Kind::Code,
+    Kind::Archives,
+    Kind::Audio,
+    Kind::Docs,
+    Kind::Other,
+];
+
+impl Kind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Video => "Video",
+            Kind::Images => "Images",
+            Kind::Code => "Code",
+            Kind::Archives => "Archives",
+            Kind::Audio => "Audio",
+            Kind::Docs => "Docs",
+            Kind::Other => "Other",
+        }
+    }
+
+    /// The kind of a file, by its extension.
+    pub fn of(name: &std::ffi::OsStr) -> Kind {
+        let ext = Path::new(name)
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v" | "wmv" | "flv" | "mpg" | "mpeg"
+            | "ts" => Kind::Video,
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "heic" | "heif"
+            | "avif" | "svg" | "raw" | "cr2" | "nef" | "dng" | "xcf" | "psd" => Kind::Images,
+            "rs" | "c" | "h" | "cpp" | "hpp" | "py" | "js" | "tsx" | "jsx" | "go" | "java"
+            | "kt" | "rb" | "sh" | "toml" | "json" | "yaml" | "yml" | "html" | "css" | "slint"
+            | "lua" | "zig" | "swift" | "o" | "rlib" | "a" | "so" => Kind::Code,
+            "zip" | "tar" | "gz" | "tgz" | "xz" | "zst" | "bz2" | "7z" | "rar" | "iso" | "deb"
+            | "rpm" => Kind::Archives,
+            "mp3" | "flac" | "ogg" | "opus" | "wav" | "m4a" | "aac" | "wma" => Kind::Audio,
+            "pdf" | "txt" | "md" | "doc" | "docx" | "odt" | "ods" | "odp" | "xls" | "xlsx"
+            | "ppt" | "pptx" | "epub" | "rtf" | "csv" => Kind::Docs,
+            _ => Kind::Other,
+        }
+    }
+
+    fn index(self) -> usize {
+        KINDS.iter().position(|k| *k == self).unwrap_or(6)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scan {
     pub total_bytes: u64,
     pub file_count: u64,
     pub largest: Vec<(PathBuf, u64)>,
+    /// Every folder under the root with its total, deepest first.
     pub children: Vec<(String, u64)>,
+    /// The root's own entries (folders and files) with their totals.
+    pub top: Vec<(String, u64)>,
+    /// (files, bytes) per kind, in `KINDS` order.
+    pub kinds: [(u64, u64); 7],
 }
 
 pub fn scan_dir(root: &Path, largest_limit: usize) -> Result<Scan> {
     let dir = DirFd::open(root)?;
     let mut scan = Scan::default();
-    walk(&dir, root, &mut scan, largest_limit)?;
+    for entry in dir.list()? {
+        if entry.is_symlink {
+            continue;
+        }
+        let before = scan.total_bytes;
+        if entry.is_dir {
+            if let Ok(child) = dir.open_dir_nofollow(&entry.name) {
+                walk(&child, &root.join(&entry.name), &mut scan, largest_limit)?;
+                let used = scan.total_bytes - before;
+                scan.children
+                    .push((entry.name.to_string_lossy().into_owned(), used));
+            }
+        } else {
+            file(&mut scan, root, &entry, largest_limit);
+        }
+        scan.top.push((
+            entry.name.to_string_lossy().into_owned(),
+            scan.total_bytes - before,
+        ));
+    }
+    scan.top.sort_by_key(|item| std::cmp::Reverse(item.1));
     scan.children.sort_by_key(|item| std::cmp::Reverse(item.1));
     scan.largest.sort_by_key(|item| std::cmp::Reverse(item.1));
     scan.largest.truncate(largest_limit);
@@ -201,18 +289,143 @@ fn walk(dir: &DirFd, path: &Path, scan: &mut Scan, limit: usize) -> Result<()> {
                     .push((entry.name.to_string_lossy().into_owned(), used));
             }
         } else {
-            scan.total_bytes += entry.len;
-            scan.file_count += 1;
-            if scan.largest.len() < limit
-                || scan.largest.last().is_some_and(|(_, n)| entry.len > *n)
-            {
-                scan.largest.push((path.join(&entry.name), entry.len));
-                scan.largest.sort_by_key(|item| std::cmp::Reverse(item.1));
-                scan.largest.truncate(limit);
-            }
+            file(scan, path, &entry, limit);
         }
     }
     Ok(())
+}
+
+fn file(scan: &mut Scan, path: &Path, entry: &crate::safety::Dirent, limit: usize) {
+    scan.total_bytes += entry.len;
+    scan.file_count += 1;
+    let k = &mut scan.kinds[Kind::of(&entry.name).index()];
+    k.0 += 1;
+    k.1 += entry.len;
+    if scan.largest.len() < limit || scan.largest.last().is_some_and(|(_, n)| entry.len > *n) {
+        scan.largest.push((path.join(&entry.name), entry.len));
+        scan.largest.sort_by_key(|item| std::cmp::Reverse(item.1));
+        scan.largest.truncate(limit);
+    }
+}
+
+/// `1234567` as `1 234 567`, the way the overview prints counts.
+pub fn group_digits(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// The `keep` largest entries, the rest folded into one "other" cell.
+pub fn treemap_weights(top: &[(String, u64)], keep: usize) -> Vec<(String, u64)> {
+    let mut sorted: Vec<(String, u64)> = top.iter().filter(|e| e.1 > 0).cloned().collect();
+    sorted.sort_by_key(|e| std::cmp::Reverse(e.1));
+    let rest: u64 = sorted.iter().skip(keep).map(|e| e.1).sum();
+    sorted.truncate(keep);
+    if rest > 0 {
+        sorted.push(("other".into(), rest));
+    }
+    sorted
+}
+
+/// One mounted disk: its name, where it's mounted, and its space.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Disk {
+    pub name: String,
+    pub mount: String,
+    pub total: u64,
+    pub free: u64,
+}
+
+impl Disk {
+    pub fn used_ratio(&self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.total - self.free.min(self.total)) as f32 / self.total as f32
+        }
+    }
+}
+
+/// Everything the Statistics view shows, gathered in one pass off the UI
+/// thread.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Report {
+    pub disks: Vec<Disk>,
+    pub home: Scan,
+    pub trash_bytes: u64,
+    pub trash_items: u64,
+    pub cache_bytes: u64,
+    /// Named parts of the cache worth calling out (thumbnails, mpv, robin).
+    pub cache_parts: Vec<(String, u64)>,
+}
+
+/// What a stats scan reads. Sent to a worker thread.
+pub struct StatsJob {
+    pub home: PathBuf,
+    pub trash: PathBuf,
+    pub cache: PathBuf,
+    pub mounts: std::sync::Arc<dyn crate::mounts::MountSource>,
+}
+
+impl StatsJob {
+    pub fn perform(self) -> Report {
+        let home = scan_dir(&self.home, 0).unwrap_or_default();
+        let trash = scan_dir(&self.trash.join("files"), 0).unwrap_or_default();
+        let cache = scan_dir(&self.cache, 0).unwrap_or_default();
+        let cache_parts = ["thumbnails", "mpv", "robin"]
+            .iter()
+            .filter_map(|name| {
+                cache
+                    .top
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(n, b)| (n.clone(), *b))
+            })
+            .collect();
+        Report {
+            disks: disks(self.mounts.as_ref()),
+            trash_bytes: trash.total_bytes,
+            trash_items: trash.top.len() as u64,
+            cache_bytes: cache.total_bytes,
+            cache_parts,
+            home,
+        }
+    }
+}
+
+/// Block-device mounts, one per device, with their space. Pseudo
+/// filesystems are already gone from the mount list.
+pub fn disks(mounts: &dyn crate::mounts::MountSource) -> Vec<Disk> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for v in mounts.volumes().unwrap_or_default() {
+        if !v.source.starts_with("/dev/") || !seen.insert(v.source.clone()) {
+            continue;
+        }
+        let Ok(space) = mounts.space(Path::new(&v.mount_point)) else {
+            continue;
+        };
+        if space.total == 0 {
+            continue;
+        }
+        let name = match Path::new(&v.mount_point).file_name() {
+            Some(n) => n.to_string_lossy().into_owned(),
+            None => "System".into(),
+        };
+        out.push(Disk {
+            name,
+            mount: v.mount_point,
+            total: space.total,
+            free: space.free,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -251,6 +464,102 @@ mod tests {
             }
         }
         assert!(cells.iter().any(|c| c.depth > cells[0].depth));
+    }
+
+    struct OneDisk;
+    impl crate::mounts::MountSource for OneDisk {
+        fn volumes(&self) -> Result<Vec<crate::mounts::Volume>> {
+            let v = |mount: &str, source: &str| crate::mounts::Volume {
+                mount_point: mount.into(),
+                fs_type: "ext4".into(),
+                source: source.into(),
+                root: "/".into(),
+            };
+            Ok(vec![
+                v("/", "/dev/nvme0n1p2"),
+                v("/home", "/dev/nvme0n1p2"),
+                v("/mnt/archive", "/dev/sda1"),
+                v("/run/user/1000/doc", "portal"),
+            ])
+        }
+        fn space(&self, mount: &Path) -> Result<crate::mounts::Space> {
+            Ok(match mount.to_str() {
+                Some("/") => crate::mounts::Space {
+                    total: 1000,
+                    free: 420,
+                },
+                _ => crate::mounts::Space {
+                    total: 4000,
+                    free: 360,
+                },
+            })
+        }
+        fn removable(&self, _: &crate::mounts::Volume) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_report_totals_home_trash_cache_and_disks() {
+        let root = std::env::temp_dir().join(format!("robin-report-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let w = |rel: &str, n: usize| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, vec![0u8; n]).unwrap();
+        };
+        w("home/Videos/a.mp4", 700);
+        w("home/Videos/deep/b.MKV", 300);
+        w("home/Pictures/c.jpg", 200);
+        w("home/notes.md", 40);
+        w("home/.cache/thumbnails/normal/t.png", 30);
+        w("home/.cache/mpv/w", 20);
+        w("home/.cache/other/z", 5);
+        w("home/.local/share/Trash/files/old.txt", 11);
+        w("home/.local/share/Trash/files/dir/x", 9);
+        w("home/.local/share/Trash/info/old.txt.trashinfo", 1);
+        let home = root.join("home");
+        let r = StatsJob {
+            trash: home.join(".local/share/Trash"),
+            cache: home.join(".cache"),
+            home: home.clone(),
+            mounts: std::sync::Arc::new(OneDisk),
+        }
+        .perform();
+        assert_eq!(r.home.top[0], ("Videos".into(), 1000));
+        assert_eq!(r.home.kinds[0], (2, 1000), "mp4 and MKV are video");
+        assert_eq!(
+            r.home.kinds[1],
+            (2, 230),
+            "the cached thumbnail is an image too"
+        );
+        assert_eq!(r.trash_bytes, 20);
+        assert_eq!(r.trash_items, 2, "top-level trashed items, not files");
+        assert_eq!(r.cache_bytes, 55);
+        assert_eq!(
+            r.cache_parts,
+            vec![("thumbnails".into(), 30), ("mpv".into(), 20)]
+        );
+        let names: Vec<_> = r.disks.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["System", "archive"],
+            "one row per device, no portal"
+        );
+        assert!((r.disks[0].used_ratio() - 0.58).abs() < 1e-6);
+        assert_eq!(usage_level(r.disks[1].used_ratio()), UsageLevel::Warning);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn counts_group_and_small_folders_fold_into_other() {
+        assert_eq!(group_digits(312_064), "312 064");
+        assert_eq!(group_digits(1_840), "1 840");
+        assert_eq!(group_digits(612), "612");
+        let top: Vec<(String, u64)> = (1..=5).map(|i| (format!("d{i}"), i * 10)).collect();
+        let w = treemap_weights(&top, 3);
+        assert_eq!(w.last().unwrap(), &("other".to_string(), 30));
+        assert_eq!(w[0].0, "d5");
     }
 
     #[test]
