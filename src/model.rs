@@ -170,6 +170,15 @@ impl Listing {
         rows
     }
 
+    /// Drop selected names the view no longer shows.
+    pub fn drop_unseen(&mut self) {
+        let seen: BTreeSet<OsString> = self.view().iter().map(|e| e.name.clone()).collect();
+        self.selection.retain(|n| seen.contains(n));
+        if self.cursor.as_ref().is_some_and(|c| !seen.contains(c)) {
+            self.cursor = None;
+        }
+    }
+
     pub fn hidden_count(&self) -> usize {
         self.entries
             .iter()

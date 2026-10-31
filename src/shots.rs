@@ -820,9 +820,11 @@ fn grid_lines(view: &str) -> Vec<GridLine> {
     ];
     cells
         .chunks(cols)
-        .map(|chunk| {
+        .enumerate()
+        .map(|(i, chunk)| {
             let mut line = empty_line();
             line.n = chunk.len() as i32;
+            line.first = (i * cols) as i32;
             for (index, cell) in chunk.iter().enumerate() {
                 set_cell(
                     &mut line, index, cell.0, cell.1, cell.2, cell.3, cell.4, cell.5,
@@ -833,51 +835,58 @@ fn grid_lines(view: &str) -> Vec<GridLine> {
         .collect()
 }
 
-fn empty_line() -> GridLine {
+pub(crate) fn empty_line() -> GridLine {
     let blank = slint::SharedString::default();
     GridLine {
         n: 0,
+        first: 0,
         g0: blank.clone(),
         n0: blank.clone(),
         r0: 0,
         b0: blank.clone(),
         s0: false,
         h0: false,
+        f0: false,
         g1: blank.clone(),
         n1: blank.clone(),
         r1: 0,
         b1: blank.clone(),
         s1: false,
         h1: false,
+        f1: false,
         g2: blank.clone(),
         n2: blank.clone(),
         r2: 0,
         b2: blank.clone(),
         s2: false,
         h2: false,
+        f2: false,
         g3: blank.clone(),
         n3: blank.clone(),
         r3: 0,
         b3: blank.clone(),
         s3: false,
         h3: false,
+        f3: false,
         g4: blank.clone(),
         n4: blank.clone(),
         r4: 0,
         b4: blank.clone(),
         s4: false,
         h4: false,
+        f4: false,
         g5: blank.clone(),
         n5: blank.clone(),
         r5: 0,
         b5: blank,
         s5: false,
         h5: false,
+        f5: false,
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn set_cell(
+pub(crate) fn set_cell(
     line: &mut GridLine,
     index: usize,
     glyph: &str,

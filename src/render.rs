@@ -35,6 +35,9 @@ pub fn scripted(view: &str) -> bool {
             | "trash-empty"
             | "trash-noinfo"
             | "trash-restore-recreated"
+            | "grid-view"
+            | "grid-hidden"
+            | "list-density"
     )
 }
 
@@ -190,6 +193,18 @@ fn paint_in(
     match view {
         // Pick a restorable item, as a click would.
         "trash-view" => select_row(&ui, "q3-budget.ods"),
+        // The grid button, then a tile click.
+        "grid-view" => {
+            ui.invoke_set_grid(true);
+            select_row(&ui, "dune-sunset-0413.jpg");
+        }
+        // Grid with hidden files shown, from the status bar toggle.
+        "grid-hidden" => {
+            ui.invoke_set_grid(true);
+            ui.invoke_toggle_hidden();
+        }
+        // The density label flips Comfortable to Compact.
+        "list-density" => ui.invoke_toggle_density(),
         "trash-empty-confirm" => ui.invoke_trash_empty(),
         // Select the item with no trashinfo; the banner explains it.
         "trash-noinfo" => select_row(&ui, "mystery.bin"),

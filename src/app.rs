@@ -20,7 +20,7 @@ use crate::fsops::{
 use crate::model::{Listing, Nav, SortDir, SortKey};
 use crate::ops::{self, Clipboard, Env, Job, JobKind, Mods, Op, Outcome, Progress, Trashed};
 use crate::safety::DirFd;
-use crate::{AppWindow, Error, Result, Row};
+use crate::{AppWindow, Error, GridLine, Result, Row};
 
 /// What the trash/delete dialog is asking about.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,6 +196,26 @@ pub struct Controller {
     refresh_due: bool,
     /// The Trash view's trashinfo, by stored name; empty elsewhere.
     pub trash: TrashInfo,
+    /// Tiles instead of rows.
+    pub grid: bool,
+    /// Grid tile size: 0 small, 1 medium, 2 large.
+    pub tile_step: usize,
+    /// Compact density: shorter rows, bars and tiles.
+    pub compact: bool,
+    /// Tiles per grid line, refit to the content width on every redraw.
+    pub columns: std::cell::Cell<usize>,
+}
+
+/// Grid tile widths (S/M/L) per density, from the spec's density table.
+const TILES: [[f32; 3]; 2] = [[112.0, 152.0, 208.0], [96.0, 128.0, 176.0]];
+/// The most tiles a grid line holds; `GridLine` has six slots.
+pub const MAX_COLUMNS: usize = 6;
+
+/// How many tiles fit a content area `width` wide: 16 padding each
+/// side and an 8 gap between tiles.
+pub fn fit_columns(width: f32, tile: f32) -> usize {
+    let n = ((width - 32.0 + 8.0) / (tile + 8.0)).floor();
+    (n.max(1.0) as usize).min(MAX_COLUMNS)
 }
 
 /// How long a navigation read may take before the breadcrumb jumps to the
@@ -323,6 +343,10 @@ impl Controller {
         let n = self.listing.view().len();
         let sel = self.listing.selection().len();
         let mut left = ops::count(n);
+        let hidden = self.listing.hidden_count();
+        if !self.listing.show_hidden() && hidden > 0 {
+            left = format!("{left} · {hidden} hidden");
+        }
         if sel > 0 {
             left = format!("{left} · {sel} selected");
         }
@@ -359,6 +383,10 @@ impl Controller {
             unreadable: None,
             refresh_due: false,
             trash: TrashInfo::new(),
+            grid: false,
+            tile_step: 1,
+            compact: false,
+            columns: std::cell::Cell::new(1),
         }
     }
 
@@ -628,6 +656,81 @@ impl Controller {
         }
     }
 
+    /// Ctrl+H. Hidden items that disappear leave the selection, so a
+    /// later Del can't act on something no longer shown.
+    pub fn toggle_hidden(&mut self) {
+        let show = !self.listing.show_hidden();
+        self.listing.set_show_hidden(show);
+        if !show {
+            self.listing.drop_unseen();
+        }
+    }
+
+    pub fn set_grid(&mut self, grid: bool) -> Action {
+        if self.grid == grid {
+            return Action::None;
+        }
+        self.grid = grid;
+        Action::Redraw
+    }
+
+    /// Ctrl+= and Ctrl+- move between S, M and L, stopping at either end.
+    pub fn step_tile(&mut self, by: i32) -> Action {
+        let next = (self.tile_step as i32 + by).clamp(0, 2) as usize;
+        if next == self.tile_step {
+            return Action::None;
+        }
+        self.tile_step = next;
+        Action::Redraw
+    }
+
+    pub fn tile(&self) -> f32 {
+        TILES[usize::from(self.compact)][self.tile_step]
+    }
+
+    /// Fit the grid to a content area `width` wide. True when the
+    /// column count changed and the lines must be rebuilt.
+    pub fn fit(&self, width: f32) -> bool {
+        let columns = fit_columns(width, self.tile());
+        self.columns.replace(columns) != columns
+    }
+
+    /// The grid as lines of up to `columns` tiles.
+    pub fn grid_lines(&self) -> Vec<GridLine> {
+        let rows = self.rows();
+        let columns = self.columns.get().max(1);
+        rows.chunks(columns)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let mut line = crate::shots::empty_line();
+                line.n = chunk.len() as i32;
+                line.first = (i * columns) as i32;
+                for (k, row) in chunk.iter().enumerate() {
+                    crate::shots::set_cell(
+                        &mut line,
+                        k,
+                        &row.glyph,
+                        &row.name,
+                        row.role,
+                        &row.badge,
+                        row.selected || row.drop,
+                        false,
+                    );
+                    let faded = row.hidden || row.cut;
+                    match k {
+                        0 => line.f0 = faded,
+                        1 => line.f1 = faded,
+                        2 => line.f2 = faded,
+                        3 => line.f3 = faded,
+                        4 => line.f4 = faded,
+                        _ => line.f5 = faded,
+                    }
+                }
+                line
+            })
+            .collect()
+    }
+
     pub fn key(&mut self, text: &str, ctrl: bool, shift: bool) -> Action {
         if self.dialog.is_some() {
             return self.dialog_key(text, shift);
@@ -647,16 +750,30 @@ impl Controller {
                 }
                 return self.clip.paste(&self.dir).map_or(Action::None, Action::Run);
             }
+            if ctrl_letter(text, 'h') {
+                self.toggle_hidden();
+                return Action::Redraw;
+            }
+            match text {
+                "=" | "+" => return self.step_tile(1),
+                "-" | "_" => return self.step_tile(-1),
+                "1" => return self.set_grid(false),
+                "2" => return self.set_grid(true),
+                _ => {}
+            }
         }
+        let columns = if self.grid { self.columns.get() } else { 1 };
         let nav = match text {
             keys::UP => Some(Nav::Up),
             keys::DOWN => Some(Nav::Down),
+            keys::LEFT if self.grid => Some(Nav::Left),
+            keys::RIGHT if self.grid => Some(Nav::Right),
             keys::HOME => Some(Nav::Home),
             keys::END => Some(Nav::End),
             _ => None,
         };
         if let Some(nav) = nav {
-            self.listing.move_cursor(nav, shift, 1);
+            self.listing.move_cursor(nav, shift, columns);
             return Action::Redraw;
         }
         match text {
@@ -1379,6 +1496,7 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     ui.set_harness(false);
     ui.set_compact(launch.compact);
     let mut ctl = Controller::new(launch.dir, launch.env);
+    ctl.compact = launch.compact;
     ctl.clock = launch.clock;
     ctl.mounts = launch.mounts;
     ctl.loaded = false;
@@ -1442,6 +1560,43 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         },
     );
 
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_set_grid(move |grid| {
+        let action = st.borrow_mut().ctl.set_grid(grid);
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_toggle_hidden(move || {
+        st.borrow_mut().ctl.toggle_hidden();
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, Action::Redraw);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_toggle_density(move || {
+        {
+            let mut s = st.borrow_mut();
+            s.ctl.compact = !s.ctl.compact;
+        }
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, Action::Redraw);
+        }
+    });
+    // A resize can change how many tiles fit a grid line.
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_content_resized(move || {
+        let Some(ui) = w.upgrade() else { return };
+        let Ok(s) = st.try_borrow() else { return };
+        if s.ctl.grid && s.ctl.fit(ui.get_content_w()) {
+            redraw(&ui, &s);
+        }
+    });
     let w = ui.as_weak();
     let st = state.clone();
     ui.on_key(move |text, ctrl, shift, _alt| {
@@ -1802,6 +1957,16 @@ fn redraw(ui: &AppWindow, s: &State) {
     let ctl = &s.ctl;
     sync_drop_dest(s);
     ui.set_files(ModelRc::new(Rc::new(VecModel::from(ctl.rows()))));
+    ui.set_grid(ctl.grid);
+    ui.set_compact(ctl.compact);
+    ui.set_hidden_on(ctl.listing.show_hidden());
+    ui.set_tile(ctl.tile());
+    ctl.fit(ui.get_content_w());
+    ui.set_grid_rows(ModelRc::new(Rc::new(VecModel::from(if ctl.grid {
+        ctl.grid_lines()
+    } else {
+        Vec::new()
+    }))));
     let (column, desc) = ctl.sort_header();
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
@@ -2442,6 +2607,51 @@ mod tests {
         let mut c = Controller::new(dir, env);
         c.reload().unwrap();
         c
+    }
+
+    #[test]
+    fn grid_columns_fit_the_width_within_one_to_six() {
+        assert_eq!(fit_columns(100.0, 152.0), 1);
+        assert_eq!(fit_columns(32.0 + 152.0 * 3.0 + 16.0, 152.0), 3);
+        assert_eq!(fit_columns(5000.0, 96.0), MAX_COLUMNS);
+    }
+
+    #[test]
+    fn tile_size_steps_stop_at_either_end_and_follow_density() {
+        let mut c = setup("tiles");
+        assert_eq!(c.tile(), 152.0);
+        assert_eq!(c.step_tile(1), Action::Redraw);
+        assert_eq!(c.step_tile(1), Action::None);
+        assert_eq!(c.tile(), 208.0);
+        c.compact = true;
+        assert_eq!(c.tile(), 176.0);
+        c.step_tile(-5);
+        assert_eq!(c.tile(), 96.0);
+    }
+
+    #[test]
+    fn grid_lines_chunk_by_the_fitted_columns() {
+        let mut c = setup("lines");
+        assert_eq!(c.set_grid(true), Action::Redraw);
+        assert_eq!(c.set_grid(true), Action::None);
+        assert!(c.fit(32.0 + 152.0 * 2.0 + 8.0));
+        let lines = c.grid_lines();
+        assert_eq!(lines.len(), 2);
+        assert_eq!((lines[0].n, lines[0].first), (2, 0));
+        assert_eq!((lines[1].n, lines[1].first), (1, 2));
+        assert!(!c.fit(32.0 + 152.0 * 2.0 + 8.0), "same width, no rebuild");
+    }
+
+    #[test]
+    fn hiding_dotfiles_drops_them_from_the_selection() {
+        let mut c = setup("hidden");
+        fs::write(c.dir.join(".secret"), b"s").unwrap();
+        c.reload().unwrap();
+        c.toggle_hidden();
+        select(&mut c, ".secret");
+        c.toggle_hidden();
+        assert!(c.rows().iter().all(|r| r.name != ".secret"));
+        assert!(c.listing.selection().is_empty());
     }
 
     fn select(c: &mut Controller, name: &str) {
