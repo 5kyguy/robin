@@ -459,8 +459,29 @@ fn skipped_report() -> crate::fsops::TransferReport {
     }
 }
 
+/// The folder a view shows as open.
+fn open_folder(view: &str) -> &'static str {
+    match view {
+        "empty-folder" => "~/Pictures/empty",
+        "start-denied" => "~/secret",
+        _ => "~/Pictures",
+    }
+}
+
+/// The pinned sidebar entry that is the open folder itself, if any. A
+/// folder inside an entry (or outside all of them) highlights nothing.
+pub fn sidebar_entry(open: &str, pinned: &[&'static str]) -> Option<&'static str> {
+    pinned.iter().copied().find(|name| {
+        let path = if *name == "Home" {
+            "~".to_string()
+        } else {
+            format!("~/{name}")
+        };
+        path == open
+    })
+}
+
 fn places(view: &str) -> Vec<Place> {
-    let pictures = view != "empty-folder";
     let mut rows = vec![
         place(PlaceSpec {
             glyph: "󰋜",
@@ -503,7 +524,7 @@ fn places(view: &str) -> Vec<Place> {
             name: "Pictures",
             count: "1 204",
             section: 0,
-            selected: pictures,
+            selected: false,
             usage: -1.0,
             level: 0,
         }),
@@ -558,6 +579,19 @@ fn places(view: &str) -> Vec<Place> {
             disk.count = "—".into();
             disk.usage = 0.0;
         }
+    }
+    let pinned: Vec<&'static str> = [
+        "Home",
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Pictures",
+        "Videos",
+    ]
+    .to_vec();
+    let pick = sidebar_entry(open_folder(view), &pinned);
+    for r in rows.iter_mut().filter(|r| r.section == 0) {
+        r.selected = pick == Some(r.name.as_str());
     }
     rows
 }
@@ -1103,9 +1137,7 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
             ui.set_toast_tone("".into());
             ui.set_toast_text("Moved 3 items to trash".into());
             ui.set_toast_action("Undo".into());
-            ui.set_toast_details(ModelRc::new(Rc::new(VecModel::from(Vec::<
-                slint::SharedString,
-            >::new()))));
+            crate::app::set_toast_rows(ui, &crate::app::detail_rows(&[], false, false));
         }
         _ => return,
     }
@@ -1170,8 +1202,8 @@ fn list_scene(ui: &AppWindow, view: &str) {
     ui.set_sort_desc(desc);
     ui.set_status_left(crate::ops::count(ctl.listing.view().len()).into());
     if view == "start-denied" {
-        // The app started in a folder it can't read: the denied state and
-        // the error toast, as `landed` shows them.
+        // The app started in a folder it can't read: the denied state, which
+        // replaces the error toast, as `landed` shows it.
         ctl.unreadable = Some(true);
         ctl.listing.set_entries(Vec::new());
         ui.set_files(ModelRc::new(Rc::new(VecModel::from(ctl.rows()))));
@@ -1180,12 +1212,6 @@ fn list_scene(ui: &AppWindow, view: &str) {
         ui.set_state("denied".into());
         ui.set_state_title("No permission to open ~/secret".into());
         ui.set_state_note("".into());
-        ui.set_toast_tone("danger".into());
-        ui.set_toast_glyph(crate::app::toast_glyph("danger").into());
-        ui.set_toast_text("/home/sky/secret: Permission denied (os error 13)".into());
-        crate::app::set_toast_rows(ui, &crate::app::detail_rows(&[], false, false));
-        ui.set_toast_on(true);
-        ui.set_toast_open(true);
     }
     if view == "nav-pending" {
         // A slow navigation into raw-exports: the crumb names the target,
@@ -1224,6 +1250,21 @@ fn list_scene(ui: &AppWindow, view: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_sidebar_highlights_only_the_open_entry() {
+        let pinned = ["Home", "Pictures"];
+        assert_eq!(
+            super::sidebar_entry("~/Pictures", &pinned),
+            Some("Pictures")
+        );
+        assert_eq!(super::sidebar_entry("~", &pinned), Some("Home"));
+        assert_eq!(super::sidebar_entry("~/secret", &pinned), None);
+        assert_eq!(super::sidebar_entry("~/Pictures/raw", &pinned), None);
+        let picked = |view| super::places(view).iter().filter(|p| p.selected).count();
+        assert_eq!(picked("start-denied"), 0, "nothing lit in ~/secret");
+        assert_eq!(picked("browser-list"), 1);
+    }
+
     use super::*;
 
     #[test]

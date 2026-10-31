@@ -550,6 +550,13 @@ export component AppWindow inherits Window {
     in property <[string]> menu-labels;
     in property <string> toast-text: "";
     in property <[string]> toast-details;
+    /// Whether the toast has details or a pinned line under its headline;
+    /// set with them by `set_toast_rows`.
+    in property <bool> toast-has-details: true;
+    /// The hairline under an open toast's headline; only when it has
+    /// details to separate.
+    out property <bool> toast-divider: (overlay == "skipped-details" || overlay == "toast-details" || toast-open)
+        && toast-has-details;
     in property <string> toast-pin: "";
     in property <int> toast-more: 0;
     in property <bool> toast-expanded: false;
@@ -1301,7 +1308,7 @@ export component AppWindow inherits Window {
                 clicked => { root.toast-link(); }
             }
         }
-        if open: Rectangle {
+        if toast-divider: Rectangle {
             x: 16px;
             y: 52px;
             width: parent.width - 32px;

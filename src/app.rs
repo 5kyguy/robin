@@ -385,6 +385,12 @@ impl Controller {
         std::mem::take(&mut self.refresh_due)
     }
 
+    /// Whether a failed read of `kind` should toast: a reread of a folder
+    /// already showing the denied state says it there instead.
+    pub fn toasts_failure(&self, kind: ReadKind) -> bool {
+        !(kind == ReadKind::Refresh && self.unreadable.is_some())
+    }
+
     /// Whether no read is in flight.
     pub fn idle(&self) -> bool {
         self.in_flight.is_none()
@@ -1270,6 +1276,9 @@ fn landed(ui: &AppWindow, st: &Shared, read: ReadResult) {
             if s.ctl.take_refresh_due() {
                 start_read(s.ctl.begin_refresh());
             }
+            if !s.ctl.toasts_failure(kind) {
+                return;
+            }
             drop(s);
             show_toast(ui, st, "danger", text, Vec::new(), false, "");
         }
@@ -1886,7 +1895,15 @@ pub fn detail_rows(details: &[String], pinned: bool, expanded: bool) -> DetailRo
     }
 }
 
+impl DetailRows {
+    /// Whether anything sits under the headline, so the divider shows.
+    pub fn has_details(&self) -> bool {
+        !self.pin.is_empty() || !self.rows.is_empty() || self.more > 0
+    }
+}
+
 pub fn set_toast_rows(ui: &AppWindow, d: &DetailRows) {
+    ui.set_toast_has_details(d.has_details());
     ui.set_toast_pin(d.pin.as_str().into());
     ui.set_toast_more(d.more as i32);
     ui.set_toast_expanded(d.expanded);
@@ -2734,6 +2751,26 @@ mod tests {
         assert!(matches!(s.land(t.perform()), Landed::Shown { .. }));
         assert_eq!(s.unreadable, None, "a later read clears it");
         c.dir = locked;
+    }
+
+    #[test]
+    fn the_denied_startup_state_replaces_the_error_toast() {
+        let mut c = setup("start-denied-toast");
+        assert!(c.toasts_failure(ReadKind::Refresh));
+        c.unreadable = Some(true);
+        assert!(!c.toasts_failure(ReadKind::Refresh), "the state says it");
+        assert!(
+            c.toasts_failure(ReadKind::Navigate),
+            "a failed navigation still toasts"
+        );
+    }
+
+    #[test]
+    fn a_toast_without_details_has_no_divider() {
+        assert!(!detail_rows(&[], false, false).has_details());
+        assert!(!detail_rows(&[], true, true).has_details());
+        assert!(detail_rows(&["one".into()], false, false).has_details());
+        assert!(detail_rows(&["pinned".into()], true, false).has_details());
     }
 
     #[test]
