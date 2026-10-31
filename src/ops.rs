@@ -4,6 +4,7 @@
 //! directly.
 
 use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -239,6 +240,9 @@ pub struct Job {
     pub dest: PathBuf,
     /// What a Restore job puts back; empty otherwise.
     pub restore: Vec<Trashed>,
+    /// Empty Trash: after the deletes, prune orphan trashinfo and stale
+    /// directorysizes lines.
+    pub empty_trash: bool,
 }
 
 impl Job {
@@ -249,6 +253,7 @@ impl Job {
             names,
             dest: dest.to_path_buf(),
             restore: Vec::new(),
+            empty_trash: false,
         }
     }
 
@@ -269,6 +274,7 @@ impl Job {
             names,
             dest: first,
             restore: items,
+            empty_trash: false,
         }
     }
 
@@ -751,6 +757,13 @@ pub fn run_asking(
             Err(e) => out.failed.push(format!("{}: {e}", name.to_string_lossy())),
         }
     }
+    if job.empty_trash {
+        if let Some(trash) = job.src.parent().filter(|_| info_dir.is_some()) {
+            if let Err(e) = tidy_trash(trash) {
+                out.failed.push(format!("trash info: {e}"));
+            }
+        }
+    }
     if cancel.is_cancelled() && out.done + out.failed.len() + out.refused.len() < total {
         out.cancelled = true;
     }
@@ -771,6 +784,51 @@ fn trash_info_dir(dir: &Path, env: &Env) -> Option<DirFd> {
     }
     let parent = DirFd::open(trash).ok()?;
     parent.open_dir_nofollow(OsStr::new("info")).ok()
+}
+
+/// Drop trashinfo whose item is gone and directorysizes lines for
+/// folders no longer in files/, so nothing stale outlives Empty Trash.
+fn tidy_trash(trash: &Path) -> std::io::Result<()> {
+    let files = trash.join("files");
+    if let Ok(infos) = std::fs::read_dir(trash.join("info")) {
+        for entry in infos.flatten() {
+            let name = entry.file_name();
+            let Some(stem) = name.as_bytes().strip_suffix(b".trashinfo") else {
+                continue;
+            };
+            let item = files.join(OsStr::from_bytes(stem));
+            if std::fs::symlink_metadata(&item).is_err() {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+    }
+    let sizes = trash.join("directorysizes");
+    let Ok(text) = std::fs::read(&sizes) else {
+        return Ok(());
+    };
+    let kept: Vec<&[u8]> = text
+        .split(|b| *b == b'\n')
+        .filter(|line| {
+            let Some(enc) = line.rsplit(|b| *b == b' ').next() else {
+                return false;
+            };
+            std::str::from_utf8(enc)
+                .ok()
+                .and_then(crate::trash::unescape)
+                .filter(|n| !n.is_empty())
+                .is_some_and(|n| {
+                    std::fs::symlink_metadata(files.join(OsStr::from_bytes(&n))).is_ok()
+                })
+        })
+        .collect();
+    if kept.is_empty() {
+        return std::fs::remove_file(&sizes);
+    }
+    let mut out = kept.join(&b'\n');
+    out.push(b'\n');
+    let tmp = trash.join(".directorysizes.robin");
+    std::fs::write(&tmp, out)?;
+    std::fs::rename(tmp, sizes)
 }
 
 /// `~/…` under home, the full path elsewhere.
@@ -1358,6 +1416,58 @@ mod tests {
         assert_eq!(
             back.toast(JobKind::Restore).text,
             "Restored to ~/Documents/Finance (folder recreated)"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn empty_trash_prunes_orphans_and_reports_what_stayed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("empty-tidy");
+        let t = root.join("trash");
+        fs::create_dir_all(t.join("files/stuck/inner")).unwrap();
+        fs::create_dir_all(t.join("info")).unwrap();
+        fs::write(t.join("files/a"), "a").unwrap();
+        fs::write(t.join("files/stuck/inner/x"), "x").unwrap();
+        fs::write(t.join("info/a.trashinfo"), "i").unwrap();
+        fs::write(t.join("info/stuck.trashinfo"), "i").unwrap();
+        fs::write(t.join("info/ghost.trashinfo"), "orphan").unwrap();
+        fs::write(
+            t.join("directorysizes"),
+            "4096 1 stuck\n4096 1 gone%20dir\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            t.join("files/stuck/inner"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        let files = t.join("files");
+        let mut job = Job::new(JobKind::Delete, &files, names(&["a", "stuck"]), &files);
+        job.empty_trash = true;
+        let out = run(&job, &env(&root), &Cancel::new(), &mut |_| {});
+        fs::set_permissions(
+            t.join("files/stuck/inner"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert_eq!(out.done, 1);
+        let toast = out.toast(JobKind::Delete);
+        assert_eq!(toast.text, "Deleted 1 item, 1 failed");
+        assert!(
+            toast.details.iter().any(|d| d.starts_with("stuck: ")),
+            "{:?}",
+            toast.details
+        );
+        assert!(!t.join("info/ghost.trashinfo").exists());
+        assert!(!t.join("info/a.trashinfo").exists());
+        assert!(
+            t.join("info/stuck.trashinfo").exists(),
+            "kept with its item"
+        );
+        assert_eq!(
+            fs::read_to_string(t.join("directorysizes")).unwrap(),
+            "4096 1 stuck\n"
         );
         fs::remove_dir_all(&root).unwrap();
     }

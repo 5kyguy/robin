@@ -742,8 +742,13 @@ impl Controller {
             Dialog::Trash(names) => {
                 Action::Run(Job::new(JobKind::Trash, &self.dir, names, &self.dir))
             }
-            Dialog::TrashNo(names) | Dialog::Delete(names) | Dialog::EmptyTrash(names) => {
+            Dialog::TrashNo(names) | Dialog::Delete(names) => {
                 Action::Run(Job::new(JobKind::Delete, &self.dir, names, &self.dir))
+            }
+            Dialog::EmptyTrash(names) => {
+                let mut job = Job::new(JobKind::Delete, &self.dir, names, &self.dir);
+                job.empty_trash = true;
+                Action::Run(job)
             }
             Dialog::Refused {
                 job,
@@ -2701,6 +2706,10 @@ mod tests {
         assert_eq!(
             (job.kind, job.src.clone()),
             (JobKind::Delete, c.trash_files())
+        );
+        assert!(
+            job.empty_trash,
+            "Empty Trash tidies info and directorysizes"
         );
         ops::run(&job, &c.env, &Cancel::new(), &mut |_| {});
         c.reload().unwrap();
