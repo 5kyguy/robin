@@ -82,6 +82,12 @@ impl SideGate {
         Some(self.gen)
     }
 
+    /// A job that will never land (it panicked, or the event loop is
+    /// gone): free the gate, rerunning if a request came in meanwhile.
+    pub fn abandon(&mut self, gen: u64) -> SideLanding {
+        self.land(gen)
+    }
+
     pub fn land(&mut self, gen: u64) -> SideLanding {
         if gen != self.gen || !self.busy {
             return SideLanding::Drop;
@@ -91,6 +97,27 @@ impl SideGate {
             SideLanding::Rerun
         } else {
             SideLanding::Apply
+        }
+    }
+}
+
+/// Runs its callback on drop unless disarmed: a side job holds one so
+/// the gate is freed even when the job panics or can't post its result.
+pub struct SideGuard<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> SideGuard<F> {
+    pub fn new(on_abandon: F) -> Self {
+        Self(Some(on_abandon))
+    }
+    pub fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for SideGuard<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
         }
     }
 }
@@ -856,5 +883,29 @@ mod tests {
         assert_eq!(g.land(first), SideLanding::Drop, "an old generation");
         assert_eq!(g.land(second), SideLanding::Apply);
         assert_eq!(g.land(second), SideLanding::Drop, "landing twice");
+    }
+
+    #[test]
+    fn a_panicked_side_job_frees_the_gate() {
+        let gate = Arc::new(Mutex::new(SideGate::default()));
+        let gen = gate.lock().unwrap().start().unwrap();
+        let g = gate.clone();
+        let joined = std::thread::spawn(move || {
+            let _guard = SideGuard::new(move || {
+                g.lock().unwrap_or_else(|e| e.into_inner()).abandon(gen);
+            });
+            panic!("side job blew up");
+        })
+        .join();
+        assert!(joined.is_err());
+        let mut g = gate.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(g.start().is_some(), "busy was cleared");
+    }
+
+    #[test]
+    fn a_disarmed_guard_does_nothing() {
+        let hit = std::cell::Cell::new(false);
+        SideGuard::new(|| hit.set(true)).disarm();
+        assert!(!hit.get());
     }
 }

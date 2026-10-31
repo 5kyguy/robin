@@ -1061,11 +1061,33 @@ fn start_side(s: &mut State) {
         return;
     }
     std::thread::spawn(move || {
-        let data = job.perform();
-        let _ = slint::invoke_from_event_loop(move || {
-            with_state(|ui, st| side_landed(&ui, st, gen, data));
+        // Freed on any path that doesn't land: a panic in perform, or a
+        // failed post. If the post itself fails the loop is gone and this
+        // one fails too, which is fine: there is no window left to free.
+        let guard = crate::sidebar::SideGuard::new(move || {
+            let _ = slint::invoke_from_event_loop(move || {
+                with_state(|ui, st| side_abandoned(&ui, st, gen));
+            });
         });
+        let data = job.perform();
+        if slint::invoke_from_event_loop(move || {
+            with_state(|ui, st| side_landed(&ui, st, gen, data));
+        })
+        .is_ok()
+        {
+            guard.disarm();
+        }
     });
+}
+
+fn side_abandoned(_ui: &AppWindow, st: &Shared, gen: u64) {
+    let rerun = {
+        let mut s = st.borrow_mut();
+        s.side_gate.abandon(gen) == crate::sidebar::SideLanding::Rerun
+    };
+    if rerun {
+        start_side(&mut st.borrow_mut());
+    }
 }
 
 /// The breadcrumb, rooted at a device's label when the folder is on one.
