@@ -65,10 +65,17 @@ fn strip_comments(src: &str) -> String {
 /// setter there doesn't make the window show real data.
 fn live_rust(src: &str) -> String {
     let src = strip_comments(src);
-    match src.find("#[cfg(test)]\nmod tests") {
-        Some(i) => src[..i].to_string(),
-        None => src,
+    let mut from = 0;
+    while let Some(at) = src[from..].find("#[cfg(test)]") {
+        let i = from + at;
+        let rest = src[i + "#[cfg(test)]".len()..].trim_start();
+        let rest = rest.strip_prefix("pub ").unwrap_or(rest).trim_start();
+        if rest.starts_with("mod ") || rest.starts_with("mod\t") {
+            return src[..i].to_string();
+        }
+        from = i + 1;
     }
+    src
 }
 
 /// `(name, default)` for each in/in-out property of AppWindow; a property
@@ -160,5 +167,15 @@ fn the_parser_rejects_what_it_cannot_read() {
     assert!(properties(multi).is_err(), "a multi-line default fails");
     let live =
         live_rust("fn a() { x.set_a(1); }\n#[cfg(test)]\nmod tests { fn t() { x.set_b(2); } }");
+    for src in [
+        "fn a() {}\n#[cfg(test)]\n\nmod tests { x.set_b(2); }",
+        "fn a() {}\n#[cfg(test)]   mod tests { x.set_b(2); }",
+        "fn a() {}\n#[cfg(test)]\npub mod tests { x.set_b(2); }",
+        "fn a() {}\n#[cfg(test)]\nmod unit { x.set_b(2); }",
+    ] {
+        assert!(!live_rust(src).contains("set_b"), "{src}");
+    }
+    let kept = live_rust("#[cfg(test)]\nfn helper() {}\nfn a() { x.set_a(1); }");
+    assert!(kept.contains("set_a"), "a cfg(test) fn isn't a test module");
     assert!(live.contains("set_a(") && !live.contains("set_b("));
 }

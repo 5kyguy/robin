@@ -504,7 +504,10 @@ impl Env {
 
     /// `from_system` with the variables passed in.
     pub fn from_vars(home: Option<std::ffi::OsString>, data: Option<std::ffi::OsString>) -> Self {
-        let home = home.filter(|v| !v.is_empty()).map(PathBuf::from);
+        // `/` as home would show every path as `~`: treat it as unset.
+        let home = home
+            .filter(|v| !v.is_empty() && Path::new(v) != Path::new("/"))
+            .map(PathBuf::from);
         let data = data
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
@@ -933,6 +936,8 @@ mod tests {
         let env = Env::from_vars(Some("".into()), Some("/x/data".into()));
         assert_eq!(env.home, None);
         assert_eq!(env.home_trash, PathBuf::from("/x/data/Trash"));
+        let env = Env::from_vars(Some("/".into()), None);
+        assert_eq!(env.home, None, "HOME=/ is no home");
         let env = Env::from_vars(Some("/home/sky".into()), None);
         assert_eq!(env.home.as_deref(), Some(Path::new("/home/sky")));
     }
