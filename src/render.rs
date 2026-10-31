@@ -41,6 +41,15 @@ pub fn scripted(view: &str) -> bool {
             | "search-results"
             | "search-letters"
             | "search-nosearch"
+            | "view-image"
+            | "view-zoom"
+            | "view-info"
+            | "view-turn"
+            | "view-video"
+            | "view-loading"
+            | "view-pan"
+            | "view-wake"
+            | "view-strip-video"
     )
 }
 
@@ -157,8 +166,18 @@ fn paint_in(
     let home = &crate::fixture::home(root);
     let start = match view {
         "start-denied" => home.join("secret"),
+        "view-video" => home.join("Videos"),
         _ => home.join("Pictures"),
     };
+    if view.starts_with("view-") {
+        // The fixture's stills are 1px placeholders; the viewer needs
+        // real pictures to show.
+        crate::thumbs::write_fixture_stills(&home.join("Pictures"))?;
+        if view == "view-strip-video" {
+            seed_strip_videos(home)?;
+        }
+        crate::fixture::freeze_times(root, FIXTURE_MTIME)?;
+    }
     let mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(root))?;
     let mut env = crate::ops::Env::for_home(home);
     if view == "trash-empty" {
@@ -173,6 +192,9 @@ fn paint_in(
         mounts: Arc::new(mounts),
         prefs: None,
     })?;
+    // Size the window before any keys: the viewer fits and zooms to it.
+    ui.window()
+        .set_size(slint::PhysicalSize::new(size.0, size.1));
     app::land_reads();
     if view == "nav-pending" {
         // A slow navigation into raw-exports whose read hasn't landed.
@@ -223,6 +245,47 @@ fn paint_in(
         "search-nosearch" => type_keys(&ui, "/kotlin"),
         // Not contiguous anywhere: only the d and the j light up.
         "search-letters" => type_keys(&ui, "/dj"),
+        // Return on a photo opens it; the scene's keys then act in the viewer.
+        // The decode is held: the stand-in box shows.
+        "view-loading" => {
+            select_row(&ui, "dune-sunset-0412.jpg");
+            type_keys(&ui, "\n");
+        }
+        "view-image" | "view-zoom" | "view-info" | "view-turn" | "view-pan" | "view-wake"
+        | "view-strip-video" => {
+            select_row(&ui, "dune-sunset-0412.jpg");
+            type_keys(&ui, "\n");
+            // Land the decode (and tiles) before zooming: zoom steps
+            // need the picture's size.
+            app::land_reads();
+            match view {
+                "view-zoom" => {
+                    type_keys(&ui, "l");
+                    app::land_reads();
+                    type_keys(&ui, "++++");
+                }
+                // Zoomed past fit, the arrows pan: down twice, right once.
+                "view-pan" => {
+                    type_keys(&ui, "++++++");
+                    for k in [app::keys::DOWN, app::keys::DOWN, app::keys::RIGHT] {
+                        type_keys(&ui, k);
+                    }
+                }
+                // Zoomed (chrome hidden), then the mouse moves.
+                "view-wake" => {
+                    type_keys(&ui, "++++++");
+                    ui.invoke_view_wake();
+                }
+                "view-info" => type_keys(&ui, "i"),
+                "view-turn" => type_keys(&ui, "r"),
+                _ => {}
+            }
+        }
+        "view-video" => {
+            select_row(&ui, "speeder-run.mp4");
+            type_keys(&ui, "\n");
+            app::land_reads();
+        }
         "trash-empty-confirm" => ui.invoke_trash_empty(),
         // Select the item with no trashinfo; the banner explains it.
         "trash-noinfo" => select_row(&ui, "mystery.bin"),
@@ -235,6 +298,34 @@ fn paint_in(
         _ => {}
     }
     snapshot(&ui, size, out)
+}
+
+/// Two videos beside the dune photos: one with a frame already in the
+/// freedesktop thumbnail cache, one without (the filmstrip's icon case).
+fn seed_strip_videos(home: &Path) -> Result<()> {
+    let pics = home.join("Pictures");
+    let io = |p: &Path, e| crate::Error::io(p, e);
+    let cached = pics.join("dune-flyover.mp4");
+    std::fs::write(&cached, b"video").map_err(|e| io(&cached, e))?;
+    let bare = pics.join("dune-timelapse.mp4");
+    std::fs::write(&bare, b"video").map_err(|e| io(&bare, e))?;
+    // Stamped with the time freeze_times gives the video, so it's fresh.
+    let src = pics.join("speeder-frame.png");
+    let frame = image::open(&src)
+        .map_err(|e| crate::Error::Message(format!("{}: {e}", src.display())))?
+        .to_rgba8();
+    crate::thumbs::store_rgba(
+        &crate::thumbs::ThumbRequest {
+            source: &cached,
+            cache_home: &home.join(".cache"),
+            size: crate::thumbs::ThumbSize::Normal,
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(FIXTURE_MTIME as u64),
+        },
+        frame.as_raw(),
+        frame.width(),
+        frame.height(),
+    )?;
+    Ok(())
 }
 
 /// Click the row named `name`, as a person would.

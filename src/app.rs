@@ -103,6 +103,8 @@ pub enum Action {
     CancelJob,
     /// Reply to the job thread's conflict question; `None` cancels the job.
     Answer(Option<ConflictChoice>),
+    /// Start a program detached, e.g. xdg-open on a video.
+    Launch(Vec<OsString>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,6 +177,9 @@ pub struct Controller {
     /// Mounts and free space; the system's, or a fixture's in renders.
     pub mounts: std::sync::Arc<dyn crate::mounts::MountSource>,
     pressed: Option<usize>,
+    /// A Ctrl-press on an already selected item: it is toggled off on
+    /// release, and only if no drag started, so Ctrl-drag can carry it.
+    ctrl_untoggle: Option<OsString>,
     pub job_running: bool,
     /// A fixed (now, UTC offset) for tests and renders; the system clock
     /// and zone otherwise.
@@ -208,6 +213,11 @@ pub struct Controller {
     pub columns: std::cell::Cell<usize>,
     /// The list's middle-cut name budget the rows were last built for.
     pub name_budget: std::cell::Cell<usize>,
+    /// The media viewer, while it is open over the browser.
+    pub viewer: Option<crate::viewer::Viewer>,
+    /// The open image's pixel size and the viewer's canvas size, from the
+    /// last redraw; zoom steps are taken against them.
+    pub view_geom: std::cell::Cell<((f32, f32), (f32, f32))>,
 }
 
 /// Grid tile widths (S/M/L) per density, from the spec's density table.
@@ -431,6 +441,92 @@ fn ctrl_letter(text: &str, letter: char) -> bool {
 }
 
 impl Controller {
+    /// Open the viewer on `name` if it is media, browsing the folder's
+    /// media in view order.
+    pub fn open_viewer(&mut self, name: &OsString) -> Action {
+        let names: Vec<OsString> = self
+            .listing
+            .view()
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| e.name.clone())
+            .collect();
+        match crate::viewer::Viewer::open(&names, name) {
+            Some(v) => {
+                self.viewer = Some(v);
+                Action::Redraw
+            }
+            None => Action::None,
+        }
+    }
+
+    /// Jump to the filmstrip's `tile`th tile.
+    pub fn viewer_go(&mut self, tile: usize) -> Action {
+        match self.viewer.as_mut() {
+            Some(v) => {
+                let index = v.strip_window(STRIP_TILES).start + tile;
+                v.go(index);
+                Action::Redraw
+            }
+            None => Action::None,
+        }
+    }
+
+    /// Hand the open item to the desktop's default app (xdg-open): the
+    /// way out for videos and for pictures Robin can't show.
+    pub fn viewer_external(&self) -> Action {
+        match self.viewer.as_ref() {
+            Some(v) => Action::Launch(crate::delegate::argv(
+                crate::delegate::Handoff::Default,
+                &self.dir.join(v.current()),
+            )),
+            None => Action::None,
+        }
+    }
+
+    /// A drag on the picture moved (`dx`, `dy`) screen pixels.
+    pub fn viewer_pan(&mut self, dx: f32, dy: f32) -> Action {
+        let (image, view) = self.view_geom.get();
+        match self.viewer.as_mut() {
+            Some(v) if v.zoomed(image, view) => {
+                v.pan_by((dx, dy), image, view);
+                Action::Redraw
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// The mouse moved over the viewer: bring the chrome back.
+    pub fn viewer_wake(&mut self) -> Action {
+        match self.viewer.as_mut() {
+            Some(v) if v.chrome_hidden => {
+                v.chrome_hidden = false;
+                Action::Redraw
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// The chrome's idle timer ran out: hide it again if still zoomed.
+    pub fn viewer_idle(&mut self) -> Action {
+        let (image, view) = self.view_geom.get();
+        match self.viewer.as_mut() {
+            Some(v) if !v.chrome_hidden && v.zoomed(image, view) => {
+                v.chrome_hidden = true;
+                Action::Redraw
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// Close the viewer; the browser's selection lands on the last item
+    /// viewed, so Esc after browsing ten photos leaves you on the tenth.
+    pub fn close_viewer(&mut self) {
+        if let Some(v) = self.viewer.take() {
+            self.listing.select_only(v.current().clone());
+        }
+    }
+
     /// The item, selection and clipboard summary. Blank when the folder
     /// can't be read: "0 items" would claim it is empty.
     pub fn status_left(&self) -> String {
@@ -475,6 +571,7 @@ impl Controller {
             drag: None,
             mounts: std::sync::Arc::new(crate::mounts::SystemMounts),
             pressed: None,
+            ctrl_untoggle: None,
             job_running: false,
             clock: None,
             counts: Default::default(),
@@ -491,6 +588,8 @@ impl Controller {
             compact: false,
             columns: std::cell::Cell::new(1),
             name_budget: std::cell::Cell::new(0),
+            viewer: None,
+            view_geom: std::cell::Cell::new(((0.0, 0.0), (0.0, 0.0))),
         }
     }
 
@@ -688,6 +787,8 @@ impl Controller {
                 self.listing.set_sort(key, order);
                 self.listing.set_show_hidden(hidden);
                 self.apply_snapshot(snap);
+                // The viewer browses one folder; leaving it closes it.
+                self.viewer = None;
                 Landed::Shown { moved: true }
             }
             Ok((_, snap)) => {
@@ -699,6 +800,7 @@ impl Controller {
                     return Landed::Unchanged;
                 }
                 self.apply_snapshot(snap);
+                self.prune_viewer();
                 Landed::Shown { moved: false }
             }
             Err(e) => Landed::Failed(e),
@@ -712,6 +814,19 @@ impl Controller {
         match self.land(ticket.perform()) {
             Landed::Failed(e) => Err(e),
             _ => Ok(()),
+        }
+    }
+
+    /// After a reread: drop viewer items that are gone, closing the
+    /// viewer when none are left.
+    fn prune_viewer(&mut self) {
+        let Some(v) = self.viewer.as_mut() else {
+            return;
+        };
+        let present: std::collections::HashSet<&OsString> =
+            self.listing.entries().iter().map(|e| &e.name).collect();
+        if !v.retain(|n| present.contains(n)) {
+            self.viewer = None;
         }
     }
 
@@ -869,6 +984,28 @@ impl Controller {
         if self.dialog.is_some() {
             return self.dialog_key(text, shift);
         }
+        if let Some(v) = self.viewer.as_mut() {
+            if ctrl {
+                // Ctrl+R, Ctrl+Q and friends are the app's, not the viewer's.
+                return Action::None;
+            }
+            let video =
+                crate::viewer::media(Path::new(v.current())) == Some(crate::viewer::Media::Video);
+            if video && text == keys::RETURN {
+                return self.viewer_external();
+            }
+            // Shift+Space steps back, as Space steps on.
+            let text = if shift && text == " " { "h" } else { text };
+            let (image, view) = self.view_geom.get();
+            return match v.key(text, image, view) {
+                crate::viewer::Step::Ignored => Action::None,
+                crate::viewer::Step::Close => {
+                    self.close_viewer();
+                    Action::Redraw
+                }
+                _ => Action::Redraw,
+            };
+        }
         if let Some(action) = self.search_key(text, ctrl) {
             return action;
         }
@@ -925,7 +1062,8 @@ impl Controller {
                 Some(name) if self.dir.join(&name).is_dir() => {
                     Action::Navigate(self.dir.join(name))
                 }
-                _ => Action::None,
+                Some(name) => self.open_viewer(&name),
+                None => Action::None,
             },
             keys::BACKSPACE => match self.dir.parent() {
                 Some(p) => Action::Navigate(p.to_path_buf()),
@@ -1125,10 +1263,13 @@ impl Controller {
         match kind {
             0 => {
                 self.pressed = Some(index);
+                self.ctrl_untoggle = None;
                 // Modifier clicks act on press, as in Thunar and Nautilus,
                 // so the selection is right before any drag starts.
                 if let Some((name, _)) = self.row_name(index) {
-                    if mods.ctrl {
+                    if mods.ctrl && self.listing.selection().contains(&name) {
+                        self.ctrl_untoggle = Some(name);
+                    } else if mods.ctrl {
                         self.listing.toggle(name);
                     } else if mods.shift {
                         self.listing.select_range_to(name);
@@ -1188,8 +1329,11 @@ impl Controller {
             }
             _ => {
                 self.pressed = None;
+                let untoggle = self.ctrl_untoggle.take();
                 let Some(drag) = self.drag.take() else {
-                    if !far && !mods.ctrl && !mods.shift {
+                    if let Some(name) = untoggle {
+                        self.listing.toggle(name);
+                    } else if !far && !mods.ctrl && !mods.shift {
                         if let Some((name, _)) = self.row_name(index) {
                             self.listing.select_only(name);
                         }
@@ -1476,6 +1620,8 @@ struct State {
     toast_all: Vec<String>,
     toast_pinned: bool,
     arm_timer: slint::Timer,
+    /// Hides the viewer's chrome again after the mouse stops, when zoomed.
+    chrome_timer: slint::Timer,
     /// Live refresh: the watch on `ctl.dir`, its debounce and poll timer.
     watch: Option<crate::watch::Watch>,
     /// Set while the open folder can't be watched.
@@ -1499,6 +1645,8 @@ struct State {
     /// Where view settings are remembered, and what was last written.
     prefs_path: Option<PathBuf>,
     prefs_saved: std::cell::Cell<crate::prefs::ViewPrefs>,
+    /// Decoded viewer images and filmstrip thumbnails, by path.
+    pics: RefCell<Pics>,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -1509,6 +1657,8 @@ thread_local! {
     /// script lands them, instead of running on a worker thread.
     static SCRIPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PENDING_READS: RefCell<VecDeque<ReadTicket>> = const { RefCell::new(VecDeque::new()) };
+    static PENDING_DECODES: RefCell<VecDeque<DecodeJob>> = const { RefCell::new(VecDeque::new()) };
+    static LAUNCHED: RefCell<Vec<Vec<OsString>>> = const { RefCell::new(Vec::new()) };
     static PENDING_SIDE: RefCell<VecDeque<(u64, crate::sidebar::SideJob)>> = const { RefCell::new(VecDeque::new()) };
 }
 
@@ -1527,6 +1677,9 @@ pub fn land_reads() {
         if let Some(ticket) = PENDING_READS.with(|p| p.borrow_mut().pop_front()) {
             let read = ticket.perform();
             with_state(|ui, st| landed(&ui, st, read));
+        } else if let Some(job) = PENDING_DECODES.with(|p| p.borrow_mut().pop_front()) {
+            let done = job.perform();
+            with_state(|ui, st| decode_landed(&ui, st, done));
         } else if let Some((gen, job)) = PENDING_SIDE.with(|p| p.borrow_mut().pop_front()) {
             let data = job.perform();
             with_state(|ui, st| side_landed(&ui, st, gen, data));
@@ -1774,6 +1927,7 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         toast_all: Vec::new(),
         toast_pinned: false,
         arm_timer: slint::Timer::default(),
+        chrome_timer: slint::Timer::default(),
         watch: None,
         fallback: None,
         debounce: debounce(),
@@ -1786,6 +1940,7 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         probe: crate::sidebar::SpaceProbe::new(std::time::Duration::from_millis(400)),
         prefs_saved: std::cell::Cell::new(saved.unwrap_or_else(crate::prefs::ViewPrefs::fresh)),
         prefs_path: launch.prefs,
+        pics: RefCell::default(),
     }));
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
     redraw(&ui, &state.borrow());
@@ -1888,6 +2043,62 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     });
     let w = ui.as_weak();
     let st = state.clone();
+    let (w_vc, st_vc) = (ui.as_weak(), state.clone());
+    let (w_vg, st_vg) = (ui.as_weak(), state.clone());
+    let (w_vk, st_vk) = (ui.as_weak(), state.clone());
+    ui.on_view_close(move || {
+        st_vc.borrow_mut().ctl.close_viewer();
+        if let Some(ui) = w_vc.upgrade() {
+            apply(&ui, &st_vc, Action::Redraw);
+        }
+    });
+    ui.on_view_go(move |tile| {
+        let action = st_vg.borrow_mut().ctl.viewer_go(tile.max(0) as usize);
+        if let Some(ui) = w_vg.upgrade() {
+            apply(&ui, &st_vg, action);
+        }
+    });
+    ui.on_view_key(move |text| {
+        let action = st_vk.borrow_mut().ctl.key(&text, false, false);
+        if let Some(ui) = w_vk.upgrade() {
+            apply(&ui, &st_vk, action);
+        }
+    });
+    let (w_ve, st_ve) = (ui.as_weak(), state.clone());
+    let (w_vp, st_vp) = (ui.as_weak(), state.clone());
+    let (w_vw, st_vw) = (ui.as_weak(), state.clone());
+    ui.on_view_pan(move |dx, dy| {
+        let action = st_vp.borrow_mut().ctl.viewer_pan(dx, dy);
+        if let Some(ui) = w_vp.upgrade() {
+            apply(&ui, &st_vp, action);
+        }
+    });
+    ui.on_view_wake(move || {
+        let action = st_vw.borrow_mut().ctl.viewer_wake();
+        if let Some(ui) = w_vw.upgrade() {
+            if action != Action::None {
+                apply(&ui, &st_vw, action);
+            }
+            // Each move restarts the idle clock.
+            let (w, st) = (ui.as_weak(), st_vw.clone());
+            st_vw.borrow().chrome_timer.start(
+                slint::TimerMode::SingleShot,
+                Duration::from_millis(2500),
+                move || {
+                    let action = st.borrow_mut().ctl.viewer_idle();
+                    if let Some(ui) = w.upgrade() {
+                        apply(&ui, &st, action);
+                    }
+                },
+            );
+        }
+    });
+    ui.on_view_external(move || {
+        let action = st_ve.borrow().ctl.viewer_external();
+        if let Some(ui) = w_ve.upgrade() {
+            apply(&ui, &st_ve, action);
+        }
+    });
     ui.on_key(move |text, ctrl, shift, _alt| {
         let action = st.borrow_mut().ctl.key(&text, ctrl, shift);
         let handled = action != Action::None;
@@ -1941,15 +2152,14 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     let w = ui.as_weak();
     let st = state.clone();
     ui.on_row_open(move |index| {
-        let target = {
-            let s = st.borrow();
-            s.ctl
-                .row_name(index.max(0) as usize)
-                .filter(|r| r.1)
-                .map(|r| s.ctl.dir.join(r.0))
+        let row = st.borrow().ctl.row_name(index.max(0) as usize);
+        let action = match row {
+            Some((name, true)) => Action::Navigate(st.borrow().ctl.dir.join(name)),
+            Some((name, false)) => st.borrow_mut().ctl.open_viewer(&name),
+            None => Action::None,
         };
-        if let (Some(ui), Some(t)) = (w.upgrade(), target) {
-            apply(&ui, &st, Action::Navigate(t));
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
         }
     });
     let w = ui.as_weak();
@@ -2268,7 +2478,388 @@ fn remember_prefs(s: &State) {
     }
 }
 
+/// Filmstrip tiles shown at once (DESIGN §5).
+pub const STRIP_TILES: usize = 11;
+
+/// A decoded picture, or why there is none.
+type Decoded = std::result::Result<Rc<image::RgbaImage>, crate::picture::Why>;
+
+/// Filmstrip tiles kept decoded; older ones are dropped past this.
+const TILE_CACHE: usize = 64;
+/// Longest side of a filmstrip tile's pixels.
+const TILE_SIDE: u32 = 144;
+
+/// A tile: its pixels (for the blurred stand-in) and them as shown, or
+/// `None` when it has no picture (videos without a cached frame).
+type Tile = Option<(Rc<image::RgbaImage>, slint::Image)>;
+
+#[derive(Default)]
+struct Pics {
+    /// The last picture decoded; kept on screen while the next loads.
+    full: Option<(PathBuf, Decoded)>,
+    /// It as shown, turned: (path, turns, image).
+    shown: Option<(PathBuf, u8, slint::Image)>,
+    /// The picture asked for, while it decodes.
+    want: Option<PathBuf>,
+    decodes: crate::picture::Decodes<PathBuf>,
+    tiles: std::collections::HashMap<PathBuf, Tile>,
+    /// Tile paths, oldest first, for evicting.
+    tile_order: VecDeque<PathBuf>,
+    /// Tiles being made now (one batch at a time).
+    tiles_pending: std::collections::HashSet<PathBuf>,
+    spinner: Option<slint::Timer>,
+}
+
+/// Work for a decode thread.
+enum DecodeJob {
+    Full {
+        ticket: u64,
+        path: PathBuf,
+    },
+    Tiles {
+        paths: Vec<PathBuf>,
+        cache: Option<PathBuf>,
+    },
+}
+
+/// A finished [`DecodeJob`], sent back to the UI thread. Plain pixels:
+/// Slint images are made on the UI thread.
+enum DecodeDone {
+    Full {
+        ticket: u64,
+        path: PathBuf,
+        pic: std::result::Result<image::RgbaImage, crate::picture::Why>,
+    },
+    Tiles(Vec<(PathBuf, Option<image::RgbaImage>)>),
+}
+
+impl DecodeJob {
+    fn perform(self) -> DecodeDone {
+        match self {
+            DecodeJob::Full { ticket, path } => {
+                let pic = crate::picture::full(&path);
+                DecodeDone::Full { ticket, path, pic }
+            }
+            DecodeJob::Tiles { paths, cache } => DecodeDone::Tiles(
+                paths
+                    .into_iter()
+                    .map(|p| {
+                        let t = crate::picture::tile(&p, TILE_SIDE, cache.as_deref()).ok();
+                        (p, t)
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Run a decode on a worker thread (or hold it for the render harness).
+fn start_decode(job: DecodeJob) {
+    if SCRIPTED.with(|s| s.get()) {
+        PENDING_DECODES.with(|p| p.borrow_mut().push_back(job));
+        return;
+    }
+    std::thread::spawn(move || {
+        let done = job.perform();
+        let _ = slint::invoke_from_event_loop(move || {
+            with_state(|ui, st| decode_landed(&ui, st, done));
+        });
+    });
+}
+
+/// A decode finished: keep it if it is still wanted, start what waited.
+fn decode_landed(ui: &AppWindow, st: &Shared, done: DecodeDone) {
+    let s = st.borrow();
+    {
+        let mut pics = s.pics.borrow_mut();
+        match done {
+            DecodeDone::Full { ticket, path, pic } => {
+                let (wanted, next) = pics.decodes.finish(ticket);
+                if let Some((ticket, path)) = next {
+                    start_decode(DecodeJob::Full { ticket, path });
+                }
+                if !wanted || pics.want.as_ref() != Some(&path) {
+                    return;
+                }
+                pics.want = None;
+                pics.spinner = None;
+                pics.full = Some((path, pic.map(Rc::new)));
+            }
+            DecodeDone::Tiles(done) => {
+                for (path, pic) in done {
+                    pics.tiles_pending.remove(&path);
+                    let tile = pic.map(|p| {
+                        let shown = to_slint(&p, 0);
+                        (Rc::new(p), shown)
+                    });
+                    if pics.tiles.insert(path.clone(), tile).is_none() {
+                        pics.tile_order.push_back(path);
+                    }
+                }
+                while pics.tiles.len() > TILE_CACHE {
+                    let Some(old) = pics.tile_order.pop_front() else {
+                        break;
+                    };
+                    pics.tiles.remove(&old);
+                }
+            }
+        }
+    }
+    sync_viewer(ui, &s);
+}
+
+/// Start a program detached from Robin: no shared stdio, and a thread
+/// reaps it so it never lingers as a zombie. Renders and tests record
+/// the argv instead of running anything.
+fn launch(ui: &AppWindow, st: &Shared, argv: Vec<OsString>) {
+    if SCRIPTED.with(|s| s.get()) {
+        LAUNCHED.with(|l| l.borrow_mut().push(argv));
+        return;
+    }
+    use std::process::{Command, Stdio};
+    let Some((program, args)) = argv.split_first() else {
+        return;
+    };
+    match Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+        }
+        Err(e) => {
+            let text = format!("Couldn't start {}: {e}", program.to_string_lossy());
+            show_toast(ui, st, "", text, Vec::new(), false, "");
+        }
+    }
+}
+
+/// What the render harness was asked to launch, oldest first.
+pub fn launched() -> Vec<Vec<OsString>> {
+    LAUNCHED.with(|l| l.borrow().clone())
+}
+
+/// `img` turned `turns` quarter turns clockwise, as a Slint image.
+fn to_slint(img: &image::RgbaImage, turns: u8) -> slint::Image {
+    let turned;
+    let img = match turns % 4 {
+        0 => img,
+        1 => {
+            turned = image::imageops::rotate90(img);
+            &turned
+        }
+        2 => {
+            turned = image::imageops::rotate180(img);
+            &turned
+        }
+        _ => {
+            turned = image::imageops::rotate270(img);
+            &turned
+        }
+    };
+    let (w, h) = img.dimensions();
+    let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(img.as_raw(), w, h);
+    slint::Image::from_rgba8(buf)
+}
+
+/// `path` with the home folder written as `~`.
+pub fn tilde(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// The FILE section of the info panel.
+pub fn file_facts(
+    name: &str,
+    len: u64,
+    dims: Option<(u32, u32)>,
+    modified: String,
+) -> Vec<(String, String)> {
+    let ext = Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut facts = vec![
+        ("Size".into(), human(len)),
+        ("Type".into(), kind_name(&ext)),
+    ];
+    if let Some((w, h)) = dims {
+        facts.push(("Dimensions".into(), format!("{w} × {h}")));
+    }
+    facts.push(("Modified".into(), modified));
+    facts
+}
+
+fn sync_viewer(ui: &AppWindow, s: &State) {
+    let ctl = &s.ctl;
+    let Some(v) = ctl.viewer.as_ref() else {
+        ui.set_view_on(false);
+        *s.pics.borrow_mut() = Pics::default();
+        return;
+    };
+    let path = ctl.dir.join(v.current());
+    let mut pics = s.pics.borrow_mut();
+    let ready = pics.full.as_ref().map(|f| &f.0) == Some(&path);
+    if !ready && pics.want.as_ref() != Some(&path) {
+        pics.want = Some(path.clone());
+        if let Some((ticket, path)) = pics.decodes.request(path.clone()) {
+            start_decode(DecodeJob::Full { ticket, path });
+        }
+        // A spinner only for a slow decode.
+        let w = ui.as_weak();
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::SingleShot,
+            Duration::from_millis(300),
+            move || {
+                if let Some(ui) = w.upgrade() {
+                    ui.set_view_spinner(true);
+                }
+            },
+        );
+        pics.spinner = Some(timer);
+    }
+    if pics.want.is_none() {
+        ui.set_view_spinner(false);
+    }
+    // Until the new picture lands, the last one stays on screen; on a
+    // first open, a blurred tile (or a plain box) stands in.
+    let loading_first = !ready && pics.full.is_none();
+    let placeholder = if loading_first {
+        pics.tiles
+            .get(&path)
+            .and_then(|t| t.as_ref())
+            .map(|(px, _)| to_slint(&image::imageops::blur(px.as_ref(), 4.0), 0))
+            .unwrap_or_default()
+    } else {
+        slint::Image::default()
+    };
+    ui.set_view_loading(loading_first);
+    ui.set_view_placeholder(placeholder);
+    let shown_path = pics.full.as_ref().map(|f| f.0.clone()).unwrap_or_default();
+    let turns = if ready { v.turns } else { 0 };
+    let pic = pics.full.as_ref().map(|f| f.1.clone());
+    if let Some(Ok(img)) = &pic {
+        if pics.shown.as_ref().map(|s| (&s.0, s.1)) != Some((&shown_path, turns)) {
+            pics.shown = Some((shown_path.clone(), turns, to_slint(img, turns)));
+        }
+    }
+    // A picture still loading shows nothing for zoom and facts yet.
+    let pic = match pic {
+        Some(p) if ready || p.is_ok() => p,
+        _ => Err(crate::picture::Why::Unreadable),
+    };
+    let quiet = !ready;
+    let size = ui.window().size().to_logical(ui.window().scale_factor());
+    let view_w = size.width - if v.info { 332.0 } else { 0.0 };
+    let view = (view_w.max(1.0), size.height.max(1.0));
+    let name = v.current().to_string_lossy().into_owned();
+    ui.set_view_on(true);
+    ui.set_view_name(name.clone().into());
+    ui.set_view_counter(v.counter().into());
+    ui.set_view_info(v.info);
+    ui.set_view_strip(v.strip);
+    ui.set_view_video(crate::viewer::media(&path) == Some(crate::viewer::Media::Video));
+    ui.set_view_chrome(!v.chrome_hidden);
+    ui.set_view_pan_x(v.pan.0);
+    ui.set_view_pan_y(v.pan.1);
+    let dims = match &pic {
+        Ok(img) => {
+            let (w, h) = img.dimensions();
+            ctl.view_geom.set(((w as f32, h as f32), view));
+            let (dw, dh) = if turns % 2 == 1 { (h, w) } else { (w, h) };
+            ui.set_view_image(pics.shown.as_ref().map(|s| s.2.clone()).unwrap_or_default());
+            ui.set_view_px_w(dw as f32);
+            ui.set_view_px_h(dh as f32);
+            // Fit is left to the UI, so it follows window resizes.
+            ui.set_view_scale(match v.zoom {
+                crate::viewer::Zoom::Fit => 0.0,
+                crate::viewer::Zoom::Scale(z) => z,
+            });
+            ui.set_view_note(SharedString::new());
+            ui.set_view_zoom(match v.zoom {
+                crate::viewer::Zoom::Fit => SharedString::new(),
+                crate::viewer::Zoom::Scale(z) => crate::viewer::percent(z).into(),
+            });
+            Some((w, h))
+        }
+        Err(why) => {
+            ctl.view_geom.set(((0.0, 0.0), view));
+            ui.set_view_image(slint::Image::default());
+            ui.set_view_px_w(0.0);
+            ui.set_view_px_h(0.0);
+            ui.set_view_note(if quiet {
+                SharedString::new()
+            } else {
+                why.line().into()
+            });
+            ui.set_view_zoom(SharedString::new());
+            None
+        }
+    };
+    let window = v.strip_window(STRIP_TILES);
+    let mut tiles = Vec::new();
+    let mut missing = Vec::new();
+    for i in window {
+        let p = ctl.dir.join(&v.items[i]);
+        let shot = match pics.tiles.get(&p) {
+            Some(t) => t.as_ref().map(|t| t.1.clone()).unwrap_or_default(),
+            None => {
+                if !pics.tiles_pending.contains(&p) {
+                    missing.push(p.clone());
+                }
+                slint::Image::default()
+            }
+        };
+        tiles.push(crate::ViewTile {
+            shot,
+            current: i == v.index,
+            video: crate::viewer::media(&p) == Some(crate::viewer::Media::Video),
+        });
+    }
+    // One batch of tiles at a time, so scrubbing can't pile them up.
+    if pics.tiles_pending.is_empty() && !missing.is_empty() {
+        pics.tiles_pending.extend(missing.iter().cloned());
+        start_decode(DecodeJob::Tiles {
+            paths: missing,
+            cache: ctl.env.cache_dir(),
+        });
+    }
+    ui.set_view_tiles(Rc::new(VecModel::from(tiles)).into());
+    let entry = ctl
+        .listing
+        .entries()
+        .iter()
+        .find(|e| &e.name == v.current());
+    let now = ctl
+        .clock
+        .map_or_else(|| secs(std::time::SystemTime::now()), |c| c.0);
+    let modified = entry.map_or_else(String::new, |e| {
+        let off = |t| {
+            ctl.clock
+                .map_or_else(|| crate::model::local_offset(t), |c| c.1)
+        };
+        crate::model::format_modified(secs(e.mtime), now, off)
+    });
+    let facts: Vec<crate::Fact> = file_facts(&name, entry.map_or(0, |e| e.len), dims, modified)
+        .into_iter()
+        .map(|(key, value)| crate::Fact {
+            key: key.into(),
+            value: value.into(),
+        })
+        .collect();
+    ui.set_view_facts(Rc::new(VecModel::from(facts)).into());
+    ui.set_view_dir(tilde(ctl.crumb_dir(), ctl.env.home.as_deref()).into());
+}
+
 fn redraw(ui: &AppWindow, s: &State) {
+    sync_viewer(ui, s);
     let ctl = &s.ctl;
     sync_drop_dest(s);
     remember_prefs(s);
@@ -2464,6 +3055,7 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
                 }
             });
         }
+        Action::Launch(argv) => launch(ui, st, argv),
         Action::Answer(choice) => {
             if let Some(tx) = st.borrow_mut().reply.take() {
                 let _ = tx.send(choice);
@@ -2990,6 +3582,7 @@ mod tests {
             home: Some(root.clone()),
             home_trash: root.join("trash"),
             config_home: None,
+            cache_home: None,
         };
         let mut c = Controller::new(dir, env);
         c.reload().unwrap();
@@ -3414,7 +4007,9 @@ mod tests {
         c.pointer(b, 2, 0, false, ctrl);
         assert_eq!(c.listing.selection().len(), 2, "release keeps it");
         c.pointer(b, 0, 0, false, ctrl);
-        assert_eq!(c.listing.selection().len(), 1, "ctrl press toggles off");
+        assert_eq!(c.listing.selection().len(), 2, "off waits for release");
+        c.pointer(b, 2, 0, false, ctrl);
+        assert_eq!(c.listing.selection().len(), 1, "ctrl release toggles off");
         let first = at(&c, "raw-exports");
         let shift = Mods {
             ctrl: false,
@@ -3560,12 +4155,204 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_on_a_selected_item_unselects_on_release_unless_it_dragged() {
+        let ctrl = Mods {
+            ctrl: true,
+            shift: false,
+        };
+        let mut c = setup("ctrl-untoggle");
+        let sel = |c: &Controller| c.listing.selection().iter().cloned().collect::<Vec<_>>();
+        c.pointer(1, 0, 0, false, ctrl);
+        c.pointer(1, 2, 0, false, ctrl);
+        c.pointer(2, 0, 0, false, ctrl);
+        c.pointer(2, 2, 0, false, ctrl);
+        assert_eq!(sel(&c), [OsString::from("a.jpg"), "b.jpg".into()]);
+        // Ctrl-drag the selected a.jpg onto raw-exports: both go, and a.jpg
+        // stays selected.
+        c.pointer(1, 0, 0, false, ctrl);
+        assert_eq!(sel(&c).len(), 2, "not dropped on press");
+        c.pointer(1, 1, -1, true, ctrl);
+        let Action::Run(job) = c.pointer(1, 2, -1, true, ctrl) else {
+            panic!("the drag runs")
+        };
+        assert_eq!(job.kind, JobKind::Copy);
+        assert_eq!(job.names.len(), 2, "the Ctrl-pressed item went too");
+        assert_eq!(sel(&c).len(), 2);
+        // A plain Ctrl-click on it still unselects, on release.
+        c.pointer(1, 0, 0, false, ctrl);
+        assert_eq!(sel(&c).len(), 2);
+        c.pointer(1, 2, 0, false, ctrl);
+        assert_eq!(sel(&c), [OsString::from("b.jpg")]);
+    }
+
+    #[test]
     fn dropping_on_a_file_does_nothing() {
         let mut c = setup("dnd-file");
         c.pointer(1, 0, 0, false, Mods::default());
         c.pointer(1, 1, 1, true, Mods::default());
         assert!(c.rows().iter().all(|r| !r.drop));
         assert_eq!(c.pointer(1, 2, 1, true, Mods::default()), Action::Redraw);
+    }
+
+    #[test]
+    fn return_on_a_photo_opens_the_viewer_and_esc_lands_on_the_last_one() {
+        let mut c = setup("viewer-open");
+        fs::write(c.dir.join("notes.txt"), b"n").unwrap();
+        c.reload().unwrap();
+        select(&mut c, "notes.txt");
+        assert_eq!(c.key(keys::RETURN, false, false), Action::None, "not media");
+        assert!(c.viewer.is_none());
+        select(&mut c, "a.jpg");
+        assert_eq!(c.key(keys::RETURN, false, false), Action::Redraw);
+        let v = c.viewer.as_ref().unwrap();
+        assert_eq!(v.items, vec![OsString::from("a.jpg"), "b.jpg".into()]);
+        assert_eq!(c.key("l", false, false), Action::Redraw);
+        assert_eq!(
+            c.key(keys::DELETE, false, false),
+            Action::None,
+            "browser keys sleep"
+        );
+        assert_eq!(c.key("q", false, false), Action::Redraw);
+        assert!(c.viewer.is_none());
+        assert_eq!(c.listing.cursor(), Some(&OsString::from("b.jpg")));
+        assert!(c.listing.selection().contains(&OsString::from("b.jpg")));
+    }
+
+    #[test]
+    fn filmstrip_tiles_jump_to_their_item() {
+        let mut c = setup("viewer-strip");
+        select(&mut c, "a.jpg");
+        c.key(keys::RETURN, false, false);
+        assert_eq!(c.viewer_go(1), Action::Redraw);
+        assert_eq!(c.viewer.as_ref().unwrap().current(), "b.jpg");
+        assert_eq!(c.viewer_go(9), Action::Redraw, "past the end clamps");
+        assert_eq!(c.viewer.as_ref().unwrap().current(), "b.jpg");
+    }
+
+    #[test]
+    fn the_info_panel_lists_the_file_facts() {
+        let f = file_facts("a.jpg", 4_600, Some((320, 180)), "15:30".into());
+        let f: Vec<(&str, &str)> = f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            f,
+            [
+                ("Size", "4.6 KB"),
+                ("Type", "JPEG image"),
+                ("Dimensions", "320 × 180"),
+                ("Modified", "15:30")
+            ]
+        );
+        assert_eq!(file_facts("x.mp4", 0, None, String::new()).len(), 3);
+        let home = Path::new("/home/sky");
+        assert_eq!(
+            tilde(Path::new("/home/sky/Pictures"), Some(home)),
+            "~/Pictures"
+        );
+        assert_eq!(tilde(home, Some(home)), "~");
+        assert_eq!(tilde(Path::new("/media/x"), Some(home)), "/media/x");
+    }
+
+    #[test]
+    fn decode_reads_real_stills_and_explains_the_rest() {
+        use crate::picture::{full, tile, Why};
+        let dir = std::env::temp_dir().join(format!("robin-decode-{}", std::process::id()));
+        crate::thumbs::write_fixture_stills(&dir).unwrap();
+        let img = full(&dir.join("dune-sunset-0412.jpg")).unwrap();
+        assert_eq!(img.dimensions(), (320, 180));
+        let small = tile(&dir.join("speeder-frame.png"), 144, None).unwrap();
+        assert_eq!(small.dimensions(), (144, 81));
+        fs::write(dir.join("x.heic"), b"ftypheic").unwrap();
+        assert_eq!(full(&dir.join("x.heic")).unwrap_err(), Why::Unreadable);
+        fs::write(dir.join("x.mp4"), b"v").unwrap();
+        assert_eq!(full(&dir.join("x.mp4")).unwrap_err(), Why::Video);
+        assert_eq!(Why::Video.line(), "No built-in video player yet");
+        assert_eq!(Why::Unreadable.line(), "Can't read this file");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drags_pan_only_past_fit_and_the_chrome_hides_until_the_mouse_moves() {
+        let mut c = setup("viewer-pan");
+        select(&mut c, "a.jpg");
+        c.key(keys::RETURN, false, false);
+        c.view_geom.set(((1000.0, 800.0), (500.0, 400.0)));
+        assert_eq!(c.viewer_pan(30.0, 0.0), Action::None, "at fit");
+        assert!(!c.viewer.as_ref().unwrap().chrome_hidden);
+        for _ in 0..4 {
+            c.key("+", false, false);
+        }
+        assert!(c.viewer.as_ref().unwrap().chrome_hidden, "zoomed hides it");
+        assert_eq!(c.viewer_pan(30.0, -10.0), Action::Redraw);
+        assert_eq!(c.viewer.as_ref().unwrap().pan, (30.0, -10.0));
+        assert_eq!(c.viewer_wake(), Action::Redraw);
+        assert!(!c.viewer.as_ref().unwrap().chrome_hidden);
+        assert_eq!(c.viewer_wake(), Action::None, "already shown");
+        assert_eq!(c.viewer_idle(), Action::Redraw);
+        assert!(c.viewer.as_ref().unwrap().chrome_hidden);
+        c.key("0", false, false);
+        c.viewer_wake();
+        assert_eq!(c.viewer_idle(), Action::None, "at fit it stays");
+    }
+
+    #[test]
+    fn a_file_deleted_while_open_leaves_the_viewer() {
+        let mut c = setup("viewer-deleted");
+        select(&mut c, "a.jpg");
+        c.key(keys::RETURN, false, false);
+        fs::remove_file(c.dir.join("a.jpg")).unwrap();
+        c.refresh().unwrap();
+        let v = c.viewer.as_ref().unwrap();
+        assert_eq!(v.items, vec![OsString::from("b.jpg")], "not cached");
+        assert_eq!(v.current(), "b.jpg");
+        fs::remove_file(c.dir.join("b.jpg")).unwrap();
+        c.refresh().unwrap();
+        assert!(c.viewer.is_none(), "nothing left to show");
+    }
+
+    #[test]
+    fn viewer_keys_leave_ctrl_to_the_app_and_shift_space_goes_back() {
+        let mut c = setup("viewer-keys");
+        select(&mut c, "a.jpg");
+        c.key(keys::RETURN, false, false);
+        c.key(" ", false, false);
+        assert_eq!(c.viewer.as_ref().unwrap().current(), "b.jpg");
+        c.key(" ", false, true);
+        assert_eq!(c.viewer.as_ref().unwrap().current(), "a.jpg");
+        assert_eq!(
+            c.key("r", true, false),
+            Action::None,
+            "Ctrl+R falls through"
+        );
+        assert_eq!(
+            c.key("q", true, false),
+            Action::None,
+            "Ctrl+Q falls through"
+        );
+        assert_eq!(c.viewer.as_ref().unwrap().turns, 0);
+        assert!(c.viewer.is_some());
+    }
+
+    #[test]
+    fn navigating_away_closes_the_viewer() {
+        let mut c = setup("viewer-nav");
+        fs::create_dir(c.dir.join("sub")).unwrap();
+        select(&mut c, "a.jpg");
+        c.key(keys::RETURN, false, false);
+        let t = c.ticket(c.dir.join("sub"), ReadKind::Navigate);
+        c.land(t.perform());
+        assert!(c.viewer.is_none());
+    }
+
+    #[test]
+    fn return_on_a_video_hands_it_to_the_default_player() {
+        let mut c = setup("viewer-video");
+        fs::write(c.dir.join("clip.mp4"), b"v").unwrap();
+        c.reload().unwrap();
+        select(&mut c, "clip.mp4");
+        c.key(keys::RETURN, false, false);
+        let want = Action::Launch(vec!["xdg-open".into(), c.dir.join("clip.mp4").into()]);
+        assert_eq!(c.viewer_external(), want);
+        assert_eq!(c.key(keys::RETURN, false, false), want);
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod instance;
 pub mod model;
 pub mod mounts;
 pub mod ops;
+pub mod picture;
 pub mod prefs;
 pub mod render;
 pub mod safety;
@@ -23,6 +24,7 @@ pub mod theme;
 pub mod thumbs;
 pub mod trash;
 pub mod video;
+pub mod viewer;
 pub mod watch;
 
 pub use error::{Error, Result};

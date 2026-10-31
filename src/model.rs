@@ -85,6 +85,11 @@ pub struct Listing {
     /// reused until something it depends on changes: a search redraws
     /// per keystroke and a 100k-entry sort is not free.
     order: std::sync::OnceLock<Vec<usize>>,
+    /// Each entry's name as a search compares it (NFC, lowercased),
+    /// aligned with `entries`. Kept across queries, so a keystroke in a
+    /// 100k-entry folder doesn't re-normalise every name; dropped only
+    /// when the entries change.
+    folded: std::sync::OnceLock<Vec<Vec<char>>>,
 }
 
 impl Default for Listing {
@@ -100,6 +105,7 @@ impl Default for Listing {
             cursor: None,
             anchor: None,
             order: std::sync::OnceLock::new(),
+            folded: std::sync::OnceLock::new(),
         }
     }
 }
@@ -128,12 +134,24 @@ impl Listing {
             self.cursor = None;
         }
         self.entries = entries;
-        self.stale();
+        self.refold();
     }
 
     /// Forget the cached view order; the next `view()` rebuilds it.
     fn stale(&mut self) {
         self.order = std::sync::OnceLock::new();
+    }
+
+    /// The entries changed: forget their folded names and the order.
+    fn refold(&mut self) {
+        self.folded = std::sync::OnceLock::new();
+        self.stale();
+    }
+
+    /// Whether the folded names are cached; tests check this.
+    #[cfg(test)]
+    pub fn folded_cached(&self) -> bool {
+        self.folded.get().is_some()
     }
 
     /// Whether the view order is built and cached; tests check this.
@@ -198,9 +216,18 @@ impl Listing {
     pub fn view(&self) -> Vec<&Entry> {
         let order = self.order.get_or_init(|| {
             let query = fold(&self.query);
+            // Folded only once something is searched for.
+            let folded = (!query.is_empty()).then(|| {
+                self.folded.get_or_init(|| {
+                    self.entries
+                        .iter()
+                        .map(|e| fold(&e.name.to_string_lossy()))
+                        .collect()
+                })
+            });
             let mut rows: Vec<usize> = (0..self.entries.len())
                 .filter(|&i| self.show_hidden || !self.entries[i].is_hidden())
-                .filter(|&i| folded_match(&fold(&self.entries[i].name.to_string_lossy()), &query))
+                .filter(|&i| folded.is_none_or(|f| folded_match(&f[i], &query)))
                 .collect();
             rows.sort_by(|&a, &b| {
                 cmp_entries(
@@ -354,12 +381,12 @@ impl Listing {
         } else {
             self.entries.push(entry);
         }
-        self.stale();
+        self.refold();
     }
 
     pub fn remove_name(&mut self, name: &OsString) {
         self.entries.retain(|entry| &entry.name != name);
-        self.stale();
+        self.refold();
         self.selection.remove(name);
         if self.cursor.as_ref() == Some(name) {
             self.cursor = None;
@@ -513,28 +540,27 @@ pub fn match_runs(name: &str, query: &str) -> Option<Vec<(String, bool)>> {
     let shown: String = name.nfc().collect();
     let chars: Vec<char> = shown.chars().collect();
     let query = fold(query);
-    // Lowercasing can grow a char (İ); only a 1:1 fold lines up with `chars`.
-    let low: Vec<char> = chars
-        .iter()
-        .map(|c| {
-            let mut l = c.to_lowercase();
-            match (l.next(), l.next()) {
-                (Some(x), None) => x,
-                _ => *c,
-            }
-        })
-        .collect();
+    // Fold each char in full ("İ" lowercases to "i" + a combining dot)
+    // and remember which shown char every folded one came from.
+    let mut low: Vec<char> = Vec::new();
+    let mut from: Vec<usize> = Vec::new();
+    for (i, c) in chars.iter().enumerate() {
+        for l in c.to_lowercase() {
+            low.push(l);
+            from.push(i);
+        }
+    }
     if query.is_empty() || query.len() > low.len() {
         return None;
     }
     let mut hit = vec![false; chars.len()];
     match low.windows(query.len()).position(|w| w == query.as_slice()) {
-        Some(i) => hit[i..i + query.len()].iter_mut().for_each(|h| *h = true),
+        Some(i) => from[i..i + query.len()].iter().for_each(|&c| hit[c] = true),
         None => {
             let mut at = 0;
             for q in &query {
                 let i = at + low[at..].iter().position(|c| c == q)?;
-                hit[i] = true;
+                hit[from[i]] = true;
                 at = i + 1;
             }
         }
@@ -726,6 +752,47 @@ mod tests {
         listing.set_show_hidden(true);
         assert!(!listing.order_cached());
         assert_eq!(names(&listing), ["b"]);
+    }
+
+    #[test]
+    fn folded_names_outlive_queries_and_go_with_the_entries() {
+        let mut listing = Listing::default();
+        listing.set_entries(vec![entry("Été.jpg", false, 1, 1), entry("b", false, 1, 1)]);
+        assert_eq!(names(&listing).len(), 2);
+        assert!(!listing.folded_cached(), "no search, no folding");
+        listing.set_query("ét");
+        assert_eq!(names(&listing), ["Été.jpg"]);
+        assert!(listing.folded_cached());
+        listing.set_query("b");
+        listing.set_sort(SortKey::Name, SortDir::Desc);
+        assert!(
+            listing.folded_cached(),
+            "queries and sorts keep the folded names"
+        );
+        assert_eq!(names(&listing), ["b"]);
+        listing.upsert(entry("bb", false, 1, 1));
+        assert!(!listing.folded_cached(), "new entries refold");
+        assert_eq!(names(&listing), ["bb", "b"]);
+        listing.remove_name(&OsString::from("bb"));
+        assert!(!listing.folded_cached());
+        assert_eq!(names(&listing), ["b"]);
+    }
+
+    #[test]
+    fn letters_that_lowercase_to_two_still_light_up() {
+        let on = |runs: Vec<(String, bool)>| -> Vec<String> {
+            runs.into_iter().filter(|r| r.1).map(|r| r.0).collect()
+        };
+        // "İ" folds to "i" + U+0307; a plain "i" still lights the İ.
+        assert_eq!(on(match_runs("İstanbul.jpg", "ist").unwrap()), ["İst"]);
+        assert_eq!(on(match_runs("İstanbul.jpg", "İs").unwrap()), ["İs"]);
+        assert_eq!(
+            on(match_runs("xİy", "y").unwrap()),
+            ["y"],
+            "later letters stay aligned"
+        );
+        assert_eq!(on(match_runs("aİb", "ab").unwrap()), ["a", "b"]);
+        assert!(fuzzy_match("İstanbul", "istan"));
     }
 
     fn names(listing: &Listing) -> Vec<String> {
