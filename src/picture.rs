@@ -94,8 +94,8 @@ pub fn tile(path: &Path, side: u32, cache: Option<&Path>) -> Result<RgbaImage, W
 }
 
 /// The freedesktop thumbnail for `path`, if one is already on disk
-/// (written by Robin's grid or another file manager). Its mtime stamp is
-/// not checked: a stale tile is better than a slow one.
+/// (written by Robin's grid or another file manager), and only while its
+/// Thumb::MTime stamp still matches the file.
 pub fn cached_thumbnail(path: &Path, cache: &Path) -> Option<PathBuf> {
     let name = crate::thumbs::cache_name(&crate::thumbs::file_uri(path));
     let mtime = std::fs::metadata(path)
@@ -183,6 +183,17 @@ fn scaled_jpeg<R: std::io::Read>(r: R, side: u32) -> Result<RgbaImage, Why> {
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect(),
         PixelFormat::L8 => px.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        // Print-ready photos: undo the ink, as the full decoder does.
+        PixelFormat::CMYK32 => px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| {
+                let k = 255 - u16::from(p[3]);
+                let ink = |c: u8| ((255 - u16::from(c)) * k / 255) as u8;
+                [ink(p[0]), ink(p[1]), ink(p[2]), 255]
+            })
+            .collect(),
         _ => return Err(Why::Unreadable),
     };
     let img = RgbaImage::from_raw(sw, sh, rgba).ok_or(Why::Unreadable)?;
@@ -317,6 +328,25 @@ mod tests {
         std::fs::create_dir(dir.join("d.png")).unwrap();
         assert_eq!(full(&dir.join("d.png")).unwrap_err(), Why::Unreadable);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cmyk_jpeg_tiles_match_the_full_picture() {
+        let dir = tmp("cmyk");
+        let path = dir.join("print.jpg");
+        std::fs::write(&path, include_bytes!("testdata/cmyk.jpg")).unwrap();
+        let full = full(&path).unwrap();
+        let tile = tile(&path, 64, None).unwrap();
+        assert_eq!(tile.dimensions(), (64, 48));
+        // Left half blue, right half red, in both.
+        for (x, fx) in [(8, 40), (56, 280)] {
+            let a = tile.get_pixel(x, 24).0;
+            let b = full.get_pixel(fx, 120).0;
+            for i in 0..3 {
+                assert!(a[i].abs_diff(b[i]) < 24, "{a:?} vs {b:?}");
+            }
+        }
+        assert!(tile.get_pixel(56, 24).0[0] > 150, "red stays red");
     }
 
     #[test]

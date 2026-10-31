@@ -87,6 +87,14 @@ pub struct Dirent {
     pub len: u64,
     pub mtime_secs: i64,
     pub mode: u32,
+    /// Device and inode, for staying on one filesystem and counting a
+    /// hardlinked file once.
+    pub dev: u64,
+    pub ino: u64,
+    pub nlink: u64,
+    /// Space actually allocated (`st_blocks * 512`): sparse files count
+    /// what they use, not their apparent size.
+    pub allocated: u64,
 }
 
 /// An owned directory file descriptor.
@@ -127,6 +135,65 @@ impl DirFd {
         Ok(dir)
     }
 
+    /// Open `path` as a directory without following a symlink at the leaf.
+    pub fn open_nofollow(path: &Path) -> Result<Self> {
+        let fd = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| Error::from_errno(path, e))?;
+        let dir = Self { fd };
+        dir.reject_pseudo(path)?;
+        Ok(dir)
+    }
+
+    /// This directory's device, from `fstat`.
+    pub fn dev(&self) -> Result<u64> {
+        let st = rustix::fs::fstat(&self.fd).map_err(|e| Error::from_errno(".", e))?;
+        Ok(st.st_dev as u64)
+    }
+
+    /// Open a regular child file for reading, refusing symlinks and
+    /// anything that isn't a plain file. Returns it with its (dev, ino).
+    pub fn open_file_nofollow(&self, name: &OsStr) -> Result<(std::fs::File, (u64, u64))> {
+        let c = component(name)?;
+        let fd = rustix::fs::openat(
+            &self.fd,
+            c.as_c_str(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| Error::from_errno(name, e))?;
+        let st = rustix::fs::fstat(&fd).map_err(|e| Error::from_errno(name, e))?;
+        if (st.st_mode & libc_s_ifmt()) != libc::S_IFREG {
+            return Err(Error::Message(format!(
+                "{} is not a file",
+                name.to_string_lossy()
+            )));
+        }
+        Ok((
+            std::fs::File::from(fd),
+            (st.st_dev as u64, st.st_ino as u64),
+        ))
+    }
+
+    /// Unlink child `name` only if it is still the regular file `id`
+    /// (dev, ino) that was checked: a swap after the check is left alone.
+    pub fn unlink_if_same(&self, name: &OsStr, id: (u64, u64)) -> Result<bool> {
+        let c = component(name)?;
+        let st = rustix::fs::statat(&self.fd, c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| Error::from_errno(name, e))?;
+        let same = (st.st_mode & libc_s_ifmt()) == libc::S_IFREG
+            && (st.st_dev as u64, st.st_ino as u64) == id;
+        if !same {
+            return Ok(false);
+        }
+        rustix::fs::unlinkat(&self.fd, c.as_c_str(), AtFlags::empty())
+            .map_err(|e| Error::from_errno(name, e))?;
+        Ok(true)
+    }
+
     pub fn list(&self) -> Result<Vec<Dirent>> {
         let dup = rustix::io::dup(&self.fd).map_err(|e| Error::from_errno(".", e))?;
         let reader = Dir::read_from(dup).map_err(|e| Error::from_errno(".", e))?;
@@ -153,6 +220,10 @@ impl DirFd {
                 len: stat.st_size as u64,
                 mtime_secs: stat.st_mtime as i64,
                 mode,
+                dev: stat.st_dev as u64,
+                ino: stat.st_ino as u64,
+                nlink: stat.st_nlink as u64,
+                allocated: (stat.st_blocks as u64).saturating_mul(512),
             });
         }
         Ok(out)

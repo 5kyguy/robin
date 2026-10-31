@@ -11,7 +11,7 @@ use slint::{ModelRc, VecModel};
 
 use crate::error::{Error, Result};
 use crate::theme::Theme;
-use crate::{AppWindow, GridLine, MapCell, Place, RefusalLine, Row};
+use crate::{AppWindow, GridLine, Place, RefusalLine, Row};
 
 pub fn known(view: &str) -> bool {
     matches!(
@@ -303,62 +303,81 @@ fn apply_scene(ui: &AppWindow, view: &str) {
     };
     ui.set_stats_mode(stats_mode.into());
     if !stats_mode.is_empty() {
-        ui.set_map_cells(ModelRc::new(Rc::new(VecModel::from(stats_cells(
-            stats_mode == "drilled",
-        )))));
+        crate::app::show_stats(ui, &mock_report(), "Scanned 16:10  ·  Rescan", false);
+        if stats_mode == "drilled" {
+            let weights: Vec<(String, u64)> = vec![
+                ("raw-exports".into(), 180_000_000_000),
+                ("tatooine-trip".into(), 140_000_000_000),
+                ("speeder-run.mp4".into(), 52_000_000_000),
+                ("cantina-band.heic".into(), 40_000_000_000),
+            ];
+            ui.set_map_cells(ModelRc::new(Rc::new(VecModel::from(
+                crate::app::map_cells(&weights, 623.0, 300.0),
+            ))));
+            ui.set_stat_tree_title("LARGEST FOLDERS   ›   Videos".into());
+        }
     }
 }
 
-fn stats_cells(drilled: bool) -> Vec<MapCell> {
-    let weights: Vec<(String, u64)> = if drilled {
-        vec![
-            ("raw-exports".into(), 180),
-            ("tatooine-trip".into(), 140),
-            ("speeder-run.mp4".into(), 52),
-            ("cantina-band.heic".into(), 40),
-        ]
-    } else {
-        vec![
-            ("Videos".into(), 412),
-            ("Projects".into(), 188),
-            ("Pictures".into(), 141),
-            ("Downloads".into(), 96),
-            ("Games".into(), 61),
-            ("Music".into(), 58),
-            (".cache".into(), 22),
-            ("Documents".into(), 31),
-            ("Mail".into(), 9),
-            ("other".into(), 24),
-        ]
+/// The hand-filled overview the mock frames show.
+fn mock_report() -> crate::stats::Report {
+    const GB: u64 = 1_000_000_000;
+    let disk = |name: &str, mount: &str, total: u64, free: u64| crate::stats::Disk {
+        name: name.into(),
+        mount: mount.into(),
+        total,
+        free,
     };
-    let mut ranked = weights.clone();
-    ranked.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
-    let rank_of: std::collections::HashMap<String, usize> = ranked
-        .iter()
-        .enumerate()
-        .map(|(index, (name, _))| (name.clone(), index))
-        .collect();
-    let labels: std::collections::HashMap<_, _> = weights.iter().cloned().collect();
-    // 1px off each shared edge is a 2px surface gutter.
-    const GUTTER: f32 = 1.0;
-    crate::stats::squarify(&weights, 623.0, 300.0)
-        .into_iter()
-        .map(|rect| {
-            let rank = rank_of[&rect.name] as f32;
-            // Largest cell is full accent. Each lower rank steps down, and a
-            // deeper squarify row is clearly darker than the row above it.
-            let shade = (1.0 - rank * 0.08 - rect.depth as f32 * 0.15).clamp(0.18, 1.0);
-            MapCell {
-                x: rect.x + GUTTER,
-                y: rect.y + GUTTER,
-                w: (rect.w - GUTTER * 2.0).max(1.0),
-                h: (rect.h - GUTTER * 2.0).max(1.0),
-                name: rect.name.clone().into(),
-                detail: format!("{} GB", labels[&rect.name]).into(),
-                shade,
-            }
-        })
-        .collect()
+    let top = [
+        ("Videos", 412),
+        ("Projects", 188),
+        ("Pictures", 141),
+        ("Downloads", 96),
+        ("Games", 61),
+        ("Music", 58),
+        ("Documents", 31),
+        (".cache", 22),
+        ("Mail", 9),
+        ("notes", 14),
+        ("misc", 10),
+    ];
+    crate::stats::Report {
+        disks: vec![
+            disk("r2-root", "/", 1_800 * GB, 812 * GB),
+            disk("archive", "/mnt/archive", 4_000 * GB, 362 * GB),
+        ],
+        home: crate::stats::Scan {
+            total_bytes: 1_042 * GB,
+            top: top.iter().map(|(n, g)| (n.to_string(), g * GB)).collect(),
+            kinds: [
+                (1_840, 412 * GB),
+                (48_210, 163 * GB),
+                (312_064, 162 * GB),
+                (612, 88 * GB),
+                (6_120, 58 * GB),
+                (9_870, 31 * GB),
+                (21_400, 128 * GB),
+            ],
+            skipped: [
+                "/home/sky/.local/share/containers",
+                "/home/sky/Vault",
+                "/home/sky/.gnupg",
+            ]
+            .map(std::path::PathBuf::from)
+            .to_vec(),
+            other_drives: ["/home/sky/mnt/archive", "/home/sky/Games/ssd"]
+                .map(std::path::PathBuf::from)
+                .to_vec(),
+            ..Default::default()
+        },
+        trash_bytes: 4_700_000_000,
+        trash_items: 2_318,
+        cache_bytes: 1_400_000_000,
+        cache_parts: vec![
+            ("thumbnails".into(), 212_000_000),
+            ("mpv".into(), 38_000_000),
+        ],
+    }
 }
 
 /// Tone, line, and details for the transfer toasts.
@@ -1264,9 +1283,18 @@ mod tests {
 
     #[test]
     fn treemap_tiles_keep_a_surface_gutter() {
-        let cells = stats_cells(false);
+        let weights = crate::stats::treemap_weights(&mock_report().home.top, 9, false);
+        let cells = crate::app::map_cells(&weights, 623.0, 300.0);
         let videos = cells.iter().find(|c| c.name == "Videos").unwrap();
         assert!((videos.shade - 1.0).abs() < 0.001, "{}", videos.shade);
+        let full = cells.iter().filter(|c| c.shade > 0.999).count();
+        assert_eq!(full, 1, "only the largest tile is full accent");
+        assert!(cells.iter().all(|c| !c.outline));
+        let lone = crate::app::map_cells(&[("Videos".into(), 9)], 623.0, 300.0);
+        assert!(
+            lone[0].outline && lone[0].shade < 0.2,
+            "a lone tile is a tint"
+        );
         let mut gaps = Vec::new();
         for a in &cells {
             for b in &cells {
