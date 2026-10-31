@@ -690,6 +690,11 @@ pub fn run_asking(
         },
         _ => None,
     };
+    // Deleting inside a trash's files/ also drops each item's trashinfo.
+    let info_dir = match job.kind {
+        JobKind::Delete => trash_info_dir(&job.src, env),
+        _ => None,
+    };
     for (i, name) in job.names.iter().enumerate() {
         if cancel.is_cancelled() {
             out.cancelled = true;
@@ -717,7 +722,11 @@ pub fn run_asking(
                 }
             }
             JobKind::Trash => trash_one(job, &src, trash.as_ref().unwrap(), name, &mut out),
-            JobKind::Delete => fsops::remove_child(&src, name, &mut |_| {}, &item),
+            JobKind::Delete => fsops::remove_child(&src, name, &mut |_| {}, &item).and_then(|()| {
+                info_dir
+                    .as_ref()
+                    .map_or(Ok(()), |d| fsops::forget_trashinfo(d, name))
+            }),
             JobKind::Restore => unreachable!("handled above"),
         };
         match result {
@@ -740,6 +749,18 @@ pub fn run_asking(
         current: String::new(),
     });
     out
+}
+
+/// The `info/` beside `dir` when `dir` is a trash's `files/`.
+fn trash_info_dir(dir: &Path, env: &Env) -> Option<DirFd> {
+    let trash = dir.parent()?;
+    let named = trash.file_name()?.to_string_lossy();
+    let is_trash = trash == env.home_trash || named == "Trash" || named.starts_with(".Trash");
+    if dir.file_name()? != "files" || !is_trash {
+        return None;
+    }
+    let parent = DirFd::open(trash).ok()?;
+    parent.open_dir_nofollow(OsStr::new("info")).ok()
 }
 
 fn keep_both(_: &fsops::ConflictPrompt) -> Result<ConflictChoice> {
@@ -1208,6 +1229,48 @@ mod tests {
             },
         );
         (root, back, asked)
+    }
+
+    #[test]
+    fn deleting_in_the_trash_drops_the_trashinfo_too() {
+        let root = scratch("trash-delete");
+        fs::write(root.join("a"), "x").unwrap();
+        let e = env(&root);
+        run(
+            &Job::new(JobKind::Trash, &root, names(&["a"]), &root),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        let files = root.join("trash/files");
+        let out = run(
+            &Job::new(JobKind::Delete, &files, names(&["a"]), &files),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        assert_eq!(out.done, 1, "{out:?}");
+        assert!(!files.join("a").exists());
+        assert!(!root.join("trash/info/a.trashinfo").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn deleting_in_a_folder_merely_named_files_keeps_its_neighbours() {
+        let root = scratch("files-delete");
+        fs::create_dir_all(root.join("proj/files")).unwrap();
+        fs::create_dir_all(root.join("proj/info")).unwrap();
+        fs::write(root.join("proj/files/a"), "x").unwrap();
+        fs::write(root.join("proj/info/a.trashinfo"), "mine").unwrap();
+        let files = root.join("proj/files");
+        run(
+            &Job::new(JobKind::Delete, &files, names(&["a"]), &files),
+            &env(&root),
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        assert!(root.join("proj/info/a.trashinfo").exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

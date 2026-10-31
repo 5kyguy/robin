@@ -1640,7 +1640,13 @@ pub fn restore_from_trash(
         }
     })?;
     rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(name, e))?;
-    let info = std::ffi::OsString::from(format!("{}.trashinfo", stored.to_string_lossy()));
+    forget_trashinfo(&info_dir, stored)
+}
+
+/// Remove `info/<stored>.trashinfo` once its item has left the trash.
+pub fn forget_trashinfo(info_dir: &DirFd, stored: &std::ffi::OsStr) -> Result<()> {
+    let mut info = stored.to_os_string();
+    info.push(".trashinfo");
     let info_c = component(&info)?;
     match rustix::fs::unlinkat(info_dir.as_fd(), info_c.as_c_str(), AtFlags::empty()) {
         Ok(()) | Err(Errno::NOENT) => Ok(()),
