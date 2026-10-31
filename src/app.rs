@@ -220,10 +220,21 @@ pub fn fit_columns(width: f32, tile: f32) -> usize {
     (n.max(1.0) as usize).min(MAX_COLUMNS)
 }
 
+/// The list drops its Type column under this content width
+/// (`Columns.no-type` in app.slint).
+pub const TYPE_MIN_LIST: f32 = 560.0;
+/// ...or when keeping Type would leave Name narrower than this.
+pub const NAME_MIN_W: f32 = 220.0;
+
 /// How many characters the list's Name column holds at `width`,
 /// mirroring `Columns` in app.slint (monospace, ~7.3px a glyph at 12px).
 pub fn name_chars(width: f32) -> usize {
-    // Mirrors `Columns` in app.slint: Type goes below 680px.
+    ((name_w(width) / 7.3).floor().max(6.0)) as usize
+}
+
+/// The Name column's width in a list `width` px wide, and whether
+/// Type is dropped: mirrors `Columns` in app.slint.
+pub fn columns(width: f32) -> (f32, bool) {
     let (size, modified) = if width < 480.0 {
         (64.0, 92.0)
     } else if width < 640.0 {
@@ -231,9 +242,14 @@ pub fn name_chars(width: f32) -> usize {
     } else {
         (88.0, 140.0)
     };
-    let kind = if width < 680.0 { 0.0 } else { 120.0 + 16.0 };
-    let name_w = width - 12.0 - modified - 2.0 * 16.0 - kind - size - 40.0;
-    ((name_w / 7.3).floor().max(6.0)) as usize
+    let without = width - 12.0 - modified - 16.0 - size - 16.0 - 40.0;
+    let with = without - 120.0 - 16.0;
+    let no_type = width < TYPE_MIN_LIST || with < NAME_MIN_W;
+    (if no_type { without } else { with }, no_type)
+}
+
+fn name_w(width: f32) -> f32 {
+    columns(width).0
 }
 
 /// One printable character, as typed into a search: not a key name
@@ -2943,9 +2959,24 @@ mod tests {
 
     #[test]
     fn narrow_lists_give_names_the_type_columns_width() {
-        // At 667px (a 720px window with the rail) Type is gone, so a
-        // name gets more room than it had with Type at 680px.
-        assert!(name_chars(667.0) > name_chars(680.0));
+        // Just under the cut Type is gone and Name gets its 136px.
+        let (above, below) = (columns(668.0), columns(667.0));
+        assert!(!above.1 && below.1);
+        assert!(below.0 > above.0);
+    }
+
+    #[test]
+    fn type_hides_before_name_drops_below_220px() {
+        for w in 300..1400 {
+            let (name, no_type) = columns(w as f32);
+            if !no_type {
+                assert!(name >= NAME_MIN_W, "{w}px keeps Type with a {name}px Name");
+                assert!(w as f32 >= TYPE_MIN_LIST);
+            }
+        }
+        // 913px window with the full sidebar: Type shows.
+        assert!(!columns(913.0 - 232.0).1);
+        assert!(columns(500.0).1);
     }
 
     #[test]
