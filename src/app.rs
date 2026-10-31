@@ -1965,6 +1965,12 @@ fn pump(ui: &AppWindow, st: &Shared) {
     ui.set_job_label(job.label().into());
     ui.set_job_detail(format!("0 of {}", ops::count(job.names.len())).into());
     ui.set_job_amount(0.0);
+    // Renders have no event loop to post back to: run the job here.
+    if SCRIPTED.with(|s| s.get()) {
+        let outcome = ops::run(&job, &env, &cancel, &mut |_| {});
+        done(ui, st, job, outcome);
+        return;
+    }
     let dest = job.dest.file_name().map_or_else(
         || job.dest.display().to_string(),
         |n| n.to_string_lossy().into_owned(),

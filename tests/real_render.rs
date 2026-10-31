@@ -21,6 +21,8 @@ fn scripted_views_render_through_the_real_app() {
         "trash-view",
         "trash-empty-confirm",
         "trash-empty",
+        "trash-noinfo",
+        "trash-restore-recreated",
     ] {
         let out = dir.join(format!("{view}.png"));
         let fixture = dir.join(format!("home-{view}"));

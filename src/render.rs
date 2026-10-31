@@ -33,6 +33,8 @@ pub fn scripted(view: &str) -> bool {
             | "trash-view"
             | "trash-empty-confirm"
             | "trash-empty"
+            | "trash-noinfo"
+            | "trash-restore-recreated"
     )
 }
 
@@ -173,7 +175,12 @@ fn paint_in(
     // Click a sidebar row as a person would, then let its reads land.
     let click = match view {
         "sidebar-device" => Some((1, 2)), // SANDISK
-        "sidebar-trash" | "trash-view" | "trash-empty-confirm" | "trash-empty" => Some((2, 0)),
+        "sidebar-trash"
+        | "trash-view"
+        | "trash-empty-confirm"
+        | "trash-empty"
+        | "trash-noinfo"
+        | "trash-restore-recreated" => Some((2, 0)),
         _ => None,
     };
     if let Some((section, index)) = click {
@@ -181,15 +188,31 @@ fn paint_in(
         app::land_reads();
     }
     match view {
-        // Pick the second row, as a click would.
-        "trash-view" => {
-            ui.invoke_row_pointer(1, 0, 0, false, false, false);
-            ui.invoke_row_pointer(1, 2, 0, false, false, false);
-        }
+        // Pick a restorable item, as a click would.
+        "trash-view" => select_row(&ui, "q3-budget.ods"),
         "trash-empty-confirm" => ui.invoke_trash_empty(),
+        // Select the item with no trashinfo; the banner explains it.
+        "trash-noinfo" => select_row(&ui, "mystery.bin"),
+        // Restore into ~/Documents/Finance, which no longer exists.
+        "trash-restore-recreated" => {
+            select_row(&ui, "q3-budget.ods");
+            ui.invoke_trash_restore();
+            app::land_reads();
+        }
         _ => {}
     }
     snapshot(&ui, size, out)
+}
+
+/// Click the row named `name`, as a person would.
+fn select_row(ui: &AppWindow, name: &str) {
+    use slint::Model;
+    let rows = ui.get_files();
+    let i = (0..rows.row_count())
+        .find(|&i| rows.row_data(i).is_some_and(|r| r.name == name))
+        .unwrap_or_else(|| panic!("no row {name}")) as i32;
+    ui.invoke_row_pointer(i, 0, 0, false, false, false);
+    ui.invoke_row_pointer(i, 2, 0, false, false, false);
 }
 
 /// Size, show and capture a window to `out`.

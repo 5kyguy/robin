@@ -170,6 +170,8 @@ fn seed_home(top: &Path, root: &Path) -> Result<()> {
             info.as_bytes(),
         )?;
     }
+    // And one with no trashinfo: the view says Unknown and Restore skips it.
+    write(root, ".local/share/Trash/files/mystery.bin", b"?\n")?;
     // An empty trash for the Trash view's empty state. It sits on the
     // home mount like the real trash, so status-right reads the same disk.
     let empty = empty_trash(top).join("files");
