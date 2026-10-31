@@ -33,6 +33,13 @@ pub fn parse(text: &str, top: Option<&Path>) -> Option<Info> {
         }
     }
     let path = path?;
+    // A crafted Path=../../x must not restore outside where it claims.
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return None;
+    }
     let original = match (path.is_absolute(), top) {
         (true, _) => path,
         (false, Some(top)) => top.join(path),
@@ -45,7 +52,7 @@ pub fn parse(text: &str, top: Option<&Path>) -> Option<Info> {
 }
 
 /// Undo the spec's URL escaping (%XX).
-fn unescape(s: &str) -> Option<Vec<u8>> {
+pub fn unescape(s: &str) -> Option<Vec<u8>> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -122,6 +129,16 @@ pub fn location_text(original: &Path, home: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_climbing_with_dotdot_is_refused() {
+        let bad = "[Trash Info]\nPath=/home/sky/Documents/../../etc/passwd\nDeletionDate=2026-10-29T10:00:00\n";
+        assert_eq!(parse(bad, None), None);
+        let rel = "[Trash Info]\nPath=..%2Fescape\n";
+        assert_eq!(parse(rel, Some(Path::new("/mnt/d"))), None);
+        let ok = "[Trash Info]\nPath=/home/sky/a..b\n";
+        assert!(parse(ok, None).is_some());
+    }
 
     #[test]
     fn parses_absolute_relative_and_escaped_paths() {
