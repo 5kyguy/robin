@@ -20,7 +20,7 @@ use crate::fsops::{
 use crate::model::{Listing, Nav, SortDir, SortKey};
 use crate::ops::{self, Clipboard, Env, Job, JobKind, Mods, Op, Outcome, Progress, Trashed};
 use crate::safety::DirFd;
-use crate::{AppWindow, Error, GridLine, Result, Row};
+use crate::{AppWindow, Columns, Error, GridLine, Result, Row};
 
 /// What the trash/delete dialog is asking about.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,6 +216,35 @@ pub const MAX_COLUMNS: usize = 6;
 pub fn fit_columns(width: f32, tile: f32) -> usize {
     let n = ((width - 32.0 + 8.0) / (tile + 8.0)).floor();
     (n.max(1.0) as usize).min(MAX_COLUMNS)
+}
+
+/// How many characters the list's Name column holds at `width`,
+/// mirroring `Columns` in app.slint (monospace, ~7.3px a glyph at 12px).
+pub fn name_chars(width: f32) -> usize {
+    let (size, kind, modified) = if width < 480.0 {
+        (64.0, 72.0, 56.0)
+    } else if width < 640.0 {
+        (72.0, 96.0, 104.0)
+    } else {
+        (88.0, 120.0, 140.0)
+    };
+    let name_w = width - 12.0 - modified - 3.0 * 16.0 - kind - size - 40.0;
+    ((name_w / 7.3).floor().max(6.0)) as usize
+}
+
+/// Cut `name` in the middle so its ending stays visible:
+/// `dune-sunset-0412.jpg` at 17 becomes `dune-sun…0412.jpg`.
+pub fn elide_middle(name: &str, max: usize) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= max || max < 3 {
+        return name.to_string();
+    }
+    let tail = (max - 1) / 2;
+    let head = max - 1 - tail;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
 }
 
 /// How long a navigation read may take before the breadcrumb jumps to the
@@ -757,8 +786,9 @@ impl Controller {
                 return Action::Redraw;
             }
             match text {
-                "=" | "+" => return self.step_tile(1),
-                "-" | "_" => return self.step_tile(-1),
+                // Tile size only means something in the grid.
+                "=" | "+" if self.grid => return self.step_tile(1),
+                "-" | "_" if self.grid => return self.step_tile(-1),
                 "1" => return self.set_grid(false),
                 "2" => return self.set_grid(true),
                 _ => {}
@@ -1595,7 +1625,8 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     ui.on_content_resized(move || {
         let Some(ui) = w.upgrade() else { return };
         let Ok(s) = st.try_borrow() else { return };
-        if s.ctl.grid && s.ctl.fit(ui.get_content_w()) {
+        // Grid columns and the list's middle-cut names both follow width.
+        if !s.ctl.grid || s.ctl.fit(ui.get_content_w()) {
             redraw(&ui, &s);
         }
     });
@@ -1963,7 +1994,29 @@ fn redraw(ui: &AppWindow, s: &State) {
     ui.set_compact(ctl.compact);
     ui.set_hidden_on(ctl.listing.show_hidden());
     ui.set_tile(ctl.tile());
-    ctl.fit(ui.get_content_w());
+    let content_w = ui.get_content_w();
+    ctl.fit(content_w);
+    ui.set_grid_columns(ctl.columns.get() as i32);
+    ui.global::<Columns>().set_row_w(content_w);
+    // Before the first layout the width is 0; show full names then.
+    let budget = if content_w > 0.0 {
+        name_chars(content_w)
+    } else {
+        usize::MAX
+    };
+    let labels: Vec<SharedString> = ctl
+        .rows()
+        .iter()
+        .map(|r| {
+            let cut = elide_middle(&r.name, budget);
+            if cut == r.name.as_str() {
+                SharedString::new()
+            } else {
+                cut.into()
+            }
+        })
+        .collect();
+    ui.set_labels(ModelRc::new(Rc::new(VecModel::from(labels))));
     ui.set_grid_rows(ModelRc::new(Rc::new(VecModel::from(if ctl.grid {
         ctl.grid_lines()
     } else {
@@ -2281,7 +2334,8 @@ pub fn file_icon(is_dir: bool, ext: &str) -> (&'static str, i32) {
         "mp3" | "flac" | "ogg" | "opus" | "wav" | "m4a" => ("󰎆", 1),
         "pdf" => ("󰈦", 2),
         "zip" | "tar" | "gz" | "zst" | "xz" | "bz2" | "7z" | "rar" => ("󰗄", 3),
-        "toml" | "json" | "yaml" | "yml" | "ini" | "conf" => ("\u{e6b2}", 1),
+        "toml" | "json" | "yaml" | "yml" => ("\u{e6b2}", 1),
+        "ini" | "conf" | "cfg" => ("\u{f0493}", 0), // 󰒓 settings
         "md" | "txt" => ("\u{f0354}", 0),
         _ => ("󰈔", 4),
     }
@@ -2666,6 +2720,24 @@ mod tests {
         c.land(ticket.perform());
         assert!(c.listing.show_hidden());
         assert!(c.rows().iter().any(|r| r.name == ".x"));
+    }
+
+    #[test]
+    fn long_names_lose_their_middle_not_their_ending() {
+        assert_eq!(
+            elide_middle("dune-sunset-0412.jpg", 17),
+            "dune-sun…0412.jpg"
+        );
+        assert_eq!(elide_middle("short.jpg", 17), "short.jpg");
+        assert!(name_chars(567.0) > name_chars(500.0));
+    }
+
+    #[test]
+    fn ctrl_plus_does_nothing_in_the_list() {
+        let mut c = setup("tile-list");
+        assert_eq!(c.key("=", true, false), Action::None);
+        c.set_grid(true);
+        assert_eq!(c.key("=", true, false), Action::Redraw);
     }
 
     fn select(c: &mut Controller, name: &str) {
