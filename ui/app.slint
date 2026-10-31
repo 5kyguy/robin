@@ -98,6 +98,8 @@ export struct GridLine {
 export struct ViewTile {
     shot: image,
     current: bool,
+    // A video: shows its cached frame, or the video icon without one.
+    video: bool,
 }
 
 export struct Fact {
@@ -429,6 +431,8 @@ component FilmTile inherits Rectangle {
     in property <image> shot;
     in property <bool> current;
     in property <color> ring;
+    in property <bool> video: false;
+    in property <color> ink: #888888;
     width: 72px;
     height: 48px;
     border-radius: 3px;
@@ -440,6 +444,26 @@ component FilmTile inherits Rectangle {
         height: parent.height;
         image-fit: cover;
         opacity: current ? 1 : 0.62;
+    }
+    // No picture: the video icon, or the file icon for a still that
+    // can't be read; never a blank tile.
+    if shot.width == 0: Text {
+        text: video ? "󰕧" : "󰈟";
+        width: parent.width;
+        height: parent.height;
+        font-size: 20px;
+        color: ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if video && shot.width > 0: Text {
+        text: "󰐊";
+        x: 4px;
+        y: parent.height - 18px;
+        width: 14px;
+        height: 14px;
+        font-size: 12px;
+        color: #ffffff;
     }
     if current: Rectangle {
         width: parent.width;
@@ -641,6 +665,11 @@ export component AppWindow inherits Window {
     in property <bool> view-info: false;
     in property <bool> view-strip: true;
     in property <bool> view-video: false;
+    // The top bar, filmstrip and toolbar; hidden while zoomed past fit.
+    in property <bool> view-chrome: true;
+    // How far the picture is moved from centre, in pixels.
+    in property <float> view-pan-x: 0;
+    in property <float> view-pan-y: 0;
     // Why there is no picture (undecodable, or video without libmpv).
     in property <string> view-note;
     // Decoding the first picture: show this stand-in (a blurred tile, or
@@ -655,6 +684,8 @@ export component AppWindow inherits Window {
     callback view-go(int);
     callback view-key(string);
     callback view-external();
+    callback view-pan(float, float);
+    callback view-wake();
     in property <string> stats-mode: "";
     in property <[MapCell]> map-cells;
     in property <string> status-left: "15 items · 1 hidden";
@@ -2074,7 +2105,26 @@ export component AppWindow inherits Window {
         background: #000000;
         property <length> open-w: view-info ? self.width - 332px : self.width;
         Rectangle { background: bg.with-alpha(0.30); }
-        TouchArea { }
+        // Drags pan (the controller ignores them at fit); any move wakes
+        // the chrome.
+        TouchArea {
+            property <length> last-x;
+            property <length> last-y;
+            mouse-cursor: view-scale > 0 ? (self.pressed ? MouseCursor.grabbing : MouseCursor.grab) : MouseCursor.default;
+            pointer-event(e) => {
+                if e.kind == PointerEventKind.down {
+                    self.last-x = self.mouse-x;
+                    self.last-y = self.mouse-y;
+                }
+            }
+            moved => {
+                root.view-pan((self.mouse-x - self.last-x) / 1px, (self.mouse-y - self.last-y) / 1px);
+                self.last-x = self.mouse-x;
+                self.last-y = self.mouse-y;
+            }
+            changed mouse-x => { root.view-wake(); }
+            changed mouse-y => { root.view-wake(); }
+        }
         // The pixel size is already turned (src/app.rs turns the pixels).
         property <float> fit: view-px-w <= 0 || view-px-h <= 0 ? 1 : min(1, (open-w / 1px) / view-px-w, (self.height / 1px) / view-px-h);
         property <float> drawn: view-scale > 0 ? view-scale : fit;
@@ -2082,8 +2132,8 @@ export component AppWindow inherits Window {
             source: view-image;
             width: view-px-w * drawn * 1px;
             height: view-px-h * drawn * 1px;
-            x: (open-w - self.width) / 2;
-            y: (parent.height - self.height) / 2;
+            x: (open-w - self.width) / 2 + view-pan-x * 1px;
+            y: (parent.height - self.height) / 2 + view-pan-y * 1px;
             image-fit: fill;
         }
         if view-loading && view-placeholder.width > 0: Image {
@@ -2129,7 +2179,7 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        Rectangle {
+        if view-chrome: Rectangle {
             y: 16px;
             x: (open-w - self.width) / 2;
             width: min(560px, open-w - 32px);
@@ -2154,7 +2204,7 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        if view-strip && view-tiles.length > 1: Rectangle {
+        if view-chrome && view-strip && view-tiles.length > 1: Rectangle {
             y: parent.height - 16px - 46px - 12px - self.height;
             x: (open-w - self.width) / 2;
             width: view-tiles.length * 76px + 8px;
@@ -2167,12 +2217,12 @@ export component AppWindow inherits Window {
                 padding: 6px;
                 spacing: 4px;
                 for t[i] in view-tiles: FilmTile {
-                    shot: t.shot; current: t.current; ring: root.accent;
+                    shot: t.shot; current: t.current; ring: root.accent; video: t.video; ink: root.muted;
                     TouchArea { clicked => { root.view-go(i); } }
                 }
             }
         }
-        Rectangle {
+        if view-chrome: Rectangle {
             y: parent.height - 16px - 46px;
             x: (open-w - self.width) / 2;
             width: 300px;

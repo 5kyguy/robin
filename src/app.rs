@@ -484,6 +484,41 @@ impl Controller {
         }
     }
 
+    /// A drag on the picture moved (`dx`, `dy`) screen pixels.
+    pub fn viewer_pan(&mut self, dx: f32, dy: f32) -> Action {
+        let (image, view) = self.view_geom.get();
+        match self.viewer.as_mut() {
+            Some(v) if v.zoomed(image, view) => {
+                v.pan_by((dx, dy), image, view);
+                Action::Redraw
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// The mouse moved over the viewer: bring the chrome back.
+    pub fn viewer_wake(&mut self) -> Action {
+        match self.viewer.as_mut() {
+            Some(v) if v.chrome_hidden => {
+                v.chrome_hidden = false;
+                Action::Redraw
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// The chrome's idle timer ran out: hide it again if still zoomed.
+    pub fn viewer_idle(&mut self) -> Action {
+        let (image, view) = self.view_geom.get();
+        match self.viewer.as_mut() {
+            Some(v) if !v.chrome_hidden && v.zoomed(image, view) => {
+                v.chrome_hidden = true;
+                Action::Redraw
+            }
+            _ => Action::None,
+        }
+    }
+
     /// Close the viewer; the browser's selection lands on the last item
     /// viewed, so Esc after browsing ten photos leaves you on the tenth.
     pub fn close_viewer(&mut self) {
@@ -1585,6 +1620,8 @@ struct State {
     toast_all: Vec<String>,
     toast_pinned: bool,
     arm_timer: slint::Timer,
+    /// Hides the viewer's chrome again after the mouse stops, when zoomed.
+    chrome_timer: slint::Timer,
     /// Live refresh: the watch on `ctl.dir`, its debounce and poll timer.
     watch: Option<crate::watch::Watch>,
     /// Set while the open folder can't be watched.
@@ -1890,6 +1927,7 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         toast_all: Vec::new(),
         toast_pinned: false,
         arm_timer: slint::Timer::default(),
+        chrome_timer: slint::Timer::default(),
         watch: None,
         fallback: None,
         debounce: debounce(),
@@ -2027,6 +2065,34 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         }
     });
     let (w_ve, st_ve) = (ui.as_weak(), state.clone());
+    let (w_vp, st_vp) = (ui.as_weak(), state.clone());
+    let (w_vw, st_vw) = (ui.as_weak(), state.clone());
+    ui.on_view_pan(move |dx, dy| {
+        let action = st_vp.borrow_mut().ctl.viewer_pan(dx, dy);
+        if let Some(ui) = w_vp.upgrade() {
+            apply(&ui, &st_vp, action);
+        }
+    });
+    ui.on_view_wake(move || {
+        let action = st_vw.borrow_mut().ctl.viewer_wake();
+        if let Some(ui) = w_vw.upgrade() {
+            if action != Action::None {
+                apply(&ui, &st_vw, action);
+            }
+            // Each move restarts the idle clock.
+            let (w, st) = (ui.as_weak(), st_vw.clone());
+            st_vw.borrow().chrome_timer.start(
+                slint::TimerMode::SingleShot,
+                Duration::from_millis(2500),
+                move || {
+                    let action = st.borrow_mut().ctl.viewer_idle();
+                    if let Some(ui) = w.upgrade() {
+                        apply(&ui, &st, action);
+                    }
+                },
+            );
+        }
+    });
     ui.on_view_external(move || {
         let action = st_ve.borrow().ctl.viewer_external();
         if let Some(ui) = w_ve.upgrade() {
@@ -2700,6 +2766,9 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
     ui.set_view_info(v.info);
     ui.set_view_strip(v.strip);
     ui.set_view_video(crate::viewer::media(&path) == Some(crate::viewer::Media::Video));
+    ui.set_view_chrome(!v.chrome_hidden);
+    ui.set_view_pan_x(v.pan.0);
+    ui.set_view_pan_y(v.pan.1);
     let dims = match &pic {
         Ok(img) => {
             let (w, h) = img.dimensions();
@@ -2751,6 +2820,7 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
         tiles.push(crate::ViewTile {
             shot,
             current: i == v.index,
+            video: crate::viewer::media(&p) == Some(crate::viewer::Media::Video),
         });
     }
     // One batch of tiles at a time, so scrubbing can't pile them up.
@@ -4198,6 +4268,30 @@ mod tests {
         assert_eq!(Why::Video.line(), "No built-in video player yet");
         assert_eq!(Why::Unreadable.line(), "Can't read this file");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drags_pan_only_past_fit_and_the_chrome_hides_until_the_mouse_moves() {
+        let mut c = setup("viewer-pan");
+        select(&mut c, "a.jpg");
+        c.key(keys::RETURN, false, false);
+        c.view_geom.set(((1000.0, 800.0), (500.0, 400.0)));
+        assert_eq!(c.viewer_pan(30.0, 0.0), Action::None, "at fit");
+        assert!(!c.viewer.as_ref().unwrap().chrome_hidden);
+        for _ in 0..4 {
+            c.key("+", false, false);
+        }
+        assert!(c.viewer.as_ref().unwrap().chrome_hidden, "zoomed hides it");
+        assert_eq!(c.viewer_pan(30.0, -10.0), Action::Redraw);
+        assert_eq!(c.viewer.as_ref().unwrap().pan, (30.0, -10.0));
+        assert_eq!(c.viewer_wake(), Action::Redraw);
+        assert!(!c.viewer.as_ref().unwrap().chrome_hidden);
+        assert_eq!(c.viewer_wake(), Action::None, "already shown");
+        assert_eq!(c.viewer_idle(), Action::Redraw);
+        assert!(c.viewer.as_ref().unwrap().chrome_hidden);
+        c.key("0", false, false);
+        c.viewer_wake();
+        assert_eq!(c.viewer_idle(), Action::None, "at fit it stays");
     }
 
     #[test]

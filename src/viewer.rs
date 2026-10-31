@@ -45,7 +45,16 @@ pub struct Viewer {
     pub turns: u8,
     pub info: bool,
     pub strip: bool,
+    /// How far the image is moved from centred, in screen pixels, when it
+    /// is zoomed past fit. Always inside [`Viewer::pan_limit`].
+    pub pan: (f32, f32),
+    /// The top bar, filmstrip and toolbar are hidden while zoomed past
+    /// fit, until the mouse moves.
+    pub chrome_hidden: bool,
 }
+
+/// How far one arrow key pans, in screen pixels.
+pub const PAN_STEP: f32 = 80.0;
 
 /// What a key did in the viewer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +86,8 @@ impl Viewer {
             turns: 0,
             info: false,
             strip: true,
+            pan: (0.0, 0.0),
+            chrome_hidden: false,
         })
     }
 
@@ -122,6 +133,8 @@ impl Viewer {
         self.index = index;
         self.zoom = Zoom::Fit;
         self.turns = 0;
+        self.pan = (0.0, 0.0);
+        self.chrome_hidden = false;
         Step::Moved
     }
 
@@ -164,11 +177,72 @@ impl Viewer {
         };
     }
 
+    /// Zoomed in past the fit scale: the image overflows the viewport.
+    pub fn zoomed(&self, image: (f32, f32), view: (f32, f32)) -> bool {
+        matches!(self.zoom, Zoom::Scale(s) if s > self.fit_scale(image, view) + f32::EPSILON)
+    }
+
+    /// The farthest the image can move each way and still cover the
+    /// viewport: half its overflow, or 0 on an axis that fits.
+    pub fn pan_limit(&self, (iw, ih): (f32, f32), view: (f32, f32)) -> (f32, f32) {
+        let s = self.scale((iw, ih), view);
+        let (w, h) = if self.turns % 2 == 1 {
+            (ih, iw)
+        } else {
+            (iw, ih)
+        };
+        (
+            ((w * s - view.0) / 2.0).max(0.0),
+            ((h * s - view.1) / 2.0).max(0.0),
+        )
+    }
+
+    /// Move the image by (`dx`, `dy`) screen pixels, as a drag does,
+    /// clamped so its edges never come inside the viewport.
+    pub fn pan_by(&mut self, (dx, dy): (f32, f32), image: (f32, f32), view: (f32, f32)) {
+        let (lx, ly) = self.pan_limit(image, view);
+        self.pan = (
+            (self.pan.0 + dx).clamp(-lx, lx),
+            (self.pan.1 + dy).clamp(-ly, ly),
+        );
+    }
+
+    /// After a zoom or turn: keep the pan inside the new limits, and hide
+    /// the chrome exactly when the image overflows.
+    fn settle(&mut self, image: (f32, f32), view: (f32, f32)) {
+        self.pan_by((0.0, 0.0), image, view);
+        self.chrome_hidden = self.zoomed(image, view);
+    }
+
     /// A viewer key. `image` and `view` are the current image's and the
     /// viewport's sizes, for zoom steps.
     pub fn key(&mut self, text: &str, image: (f32, f32), view: (f32, f32)) -> Step {
         use crate::app::keys;
         let last = self.items.len() - 1;
+        if self.zoomed(image, view) {
+            // Zoomed past fit, the arrows move the picture; h, l and
+            // Space still step through the folder.
+            let d = match text {
+                keys::LEFT => Some((PAN_STEP, 0.0)),
+                keys::RIGHT => Some((-PAN_STEP, 0.0)),
+                keys::UP => Some((0.0, PAN_STEP)),
+                keys::DOWN => Some((0.0, -PAN_STEP)),
+                _ => None,
+            };
+            if let Some(d) = d {
+                self.pan_by(d, image, view);
+                return Step::Changed;
+            }
+        }
+        let step = self.key_inner(text, image, view, last);
+        if step == Step::Changed {
+            self.settle(image, view);
+        }
+        step
+    }
+
+    fn key_inner(&mut self, text: &str, image: (f32, f32), view: (f32, f32), last: usize) -> Step {
+        use crate::app::keys;
         match text {
             keys::LEFT | "h" => self.go(self.index.saturating_sub(1)),
             keys::RIGHT | "l" | " " => self.go((self.index + 1).min(last)),
@@ -252,6 +326,40 @@ mod tests {
         );
         assert_eq!(media(Path::new("x.MKV")), Some(Media::Video));
         assert_eq!(media(Path::new("README")), None);
+    }
+
+    #[test]
+    fn zoomed_past_fit_the_arrows_and_drags_pan_inside_the_edges() {
+        use crate::app::keys;
+        let mut v = open("a.jpg");
+        // A 400x200 image in a 200x200 view fits at 0.5.
+        let (img, view) = ((400.0, 200.0), (200.0, 200.0));
+        let k = |v: &mut Viewer, t: &str| v.key(t, img, view);
+        assert!(!v.zoomed(img, view));
+        assert_eq!(v.pan_limit(img, view), (0.0, 0.0), "fit: nothing to pan");
+        k(&mut v, "1");
+        assert!(v.zoomed(img, view));
+        assert!(v.chrome_hidden, "zooming past fit hides the chrome");
+        // At 100% it overflows 200 across and nothing down.
+        assert_eq!(v.pan_limit(img, view), (100.0, 0.0));
+        assert_eq!(k(&mut v, keys::LEFT), Step::Changed, "pans, not moves");
+        assert_eq!(v.current(), "a.jpg");
+        assert_eq!(v.pan, (PAN_STEP, 0.0));
+        k(&mut v, keys::LEFT);
+        assert_eq!(v.pan, (100.0, 0.0), "clamped to the left edge");
+        k(&mut v, keys::UP);
+        assert_eq!(v.pan.1, 0.0, "fits vertically: no pan");
+        v.pan_by((-1000.0, 50.0), img, view);
+        assert_eq!(v.pan, (-100.0, 0.0), "a drag stops at the right edge");
+        // l still walks the folder, resetting pan and chrome.
+        assert_eq!(k(&mut v, "l"), Step::Moved);
+        assert_eq!((v.pan, v.chrome_hidden), ((0.0, 0.0), false));
+        // Zooming back to fit shows the chrome and recentres.
+        k(&mut v, "1");
+        v.pan_by((-60.0, 0.0), img, view);
+        k(&mut v, "0");
+        assert_eq!((v.pan, v.chrome_hidden), ((0.0, 0.0), false));
+        assert_eq!(k(&mut v, keys::RIGHT), Step::Moved, "at fit arrows walk");
     }
 
     #[test]
