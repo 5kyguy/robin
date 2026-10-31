@@ -1867,11 +1867,28 @@ pub(crate) fn replace_file(dir: &DirFd, name: &std::ffi::OsStr, bytes: &[u8]) ->
         Mode::from_raw_mode(0o600),
     )
     .map_err(|e| Error::from_errno(&tmp, e))?;
+    // Keep the old file's permission bits; 0600 only for a new one.
+    let old_mode = component(name).ok().and_then(|c| {
+        rustix::fs::statat(dir.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .ok()
+            .filter(|st| !is_lnk(st.st_mode))
+            .map(|st| st.st_mode & 0o7777)
+    });
     let mut file = File::from(fd);
-    let written = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| Error::io(std::path::Path::new(name), e))
+    let kept = match old_mode {
+        Some(mode) => rustix::fs::fchmod(&file, Mode::from_raw_mode(mode))
+            .map_err(|e| Error::from_errno(&tmp, e)),
+        None => Ok(()),
+    };
+    let written = kept
+        .and_then(|()| {
+            file.write_all(bytes)
+                .map_err(|e| Error::io(std::path::Path::new(name), e))
+        })
+        .and_then(|()| {
+            file.sync_all()
+                .map_err(|e| Error::io(std::path::Path::new(name), e))
+        })
         .and_then(|()| {
             let name_c = component(name)?;
             rustix::fs::renameat(
@@ -2619,6 +2636,29 @@ mod tests {
         assert!(same_tree(&files, "album".as_ref(), &back, "album".as_ref()).unwrap());
         std::fs::write(root.join("back/album/sub/b"), "bed").unwrap();
         assert!(!same_tree(&files, "album".as_ref(), &back, "album".as_ref()).unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn replace_file_keeps_the_old_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("replace-mode");
+        std::fs::write(root.join("sizes"), "old").unwrap();
+        std::fs::set_permissions(root.join("sizes"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let dir = DirFd::open(&root).unwrap();
+        replace_file(&dir, "sizes".as_ref(), b"new").unwrap();
+        replace_file(&dir, "fresh".as_ref(), b"x").unwrap();
+        let mode = |n: &str| {
+            std::fs::metadata(root.join(n))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(std::fs::read_to_string(root.join("sizes")).unwrap(), "new");
+        assert_eq!(mode("sizes"), 0o644);
+        assert_eq!(mode("fresh"), 0o600);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
