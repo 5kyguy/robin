@@ -515,6 +515,10 @@ export component AppWindow inherits Window {
     in property <string> state: "files";
     /// The line under "Reading…" while a folder loads.
     in property <string> state-note: "";
+    /// A navigation read is slow: a thin progress bar under the toolbar.
+    in property <bool> nav-busy: false;
+    /// Renders pin the bar's position (0..1); negative animates it.
+    in property <float> nav-phase: -1;
     in property <string> overlay: "";
     in property <string> viewer: "";
     in property <string> stats-mode: "";
@@ -786,6 +790,17 @@ export component AppWindow inherits Window {
                 property <length> right-w: icon-box * 4 + 18px;
                 property <length> crumb-x: 8px + nav-w + 12px;
                 property <length> right-x: self.width - 8px - right-w;
+                if nav-busy: Rectangle {
+                    y: parent.height - 2px;
+                    height: 2px;
+                    clip: true;
+                    property <float> t: nav-phase >= 0 ? nav-phase : Math.mod(animation-tick() / 1ms, 1400) / 1400;
+                    Rectangle {
+                        width: parent.width * 0.3;
+                        x: (parent.width * 1.3) * t - self.width;
+                        background: accent;
+                    }
+                }
                 Rectangle {
                     x: 8px;
                     y: iy;

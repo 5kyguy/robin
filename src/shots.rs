@@ -83,6 +83,7 @@ pub fn known(view: &str) -> bool {
             | "list-name-natural"
             | "list-name-desc"
             | "watch-fallback"
+            | "nav-pending"
     )
 }
 
@@ -952,7 +953,7 @@ fn menu() -> Vec<slint::SharedString> {
 /// The views of the wired file operations: cut rows, a drag over a folder,
 /// a running job, the keyboard-focused confirms, and the undo toast.
 fn fileops_scene(ui: &AppWindow, view: &str) {
-    if view.starts_with("list-") || view == "watch-fallback" {
+    if view.starts_with("list-") || view == "watch-fallback" || view == "nav-pending" {
         return list_scene(ui, view);
     }
     let mut rows = files(false);
@@ -1159,6 +1160,21 @@ fn list_scene(ui: &AppWindow, view: &str) {
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
     ui.set_status_left(crate::ops::count(ctl.listing.view().len()).into());
+    if view == "nav-pending" {
+        // A slow navigation into raw-exports: the crumb names the target,
+        // the old listing stays, and the bar runs under the toolbar.
+        let t0 = std::time::Instant::now();
+        let _ = ctl.begin_navigate_at("/demo/Pictures/raw-exports".into(), t0);
+        ctl.tick_nav(t0 + crate::app::NAV_PENDING_AFTER);
+        let crumbs: Vec<String> =
+            crate::model::breadcrumbs(ctl.crumb_dir(), Some(Path::new("/demo")))
+                .iter()
+                .map(|c| c.label.clone())
+                .collect();
+        ui.set_crumbs(crumbs.join("  ›  ").into());
+        ui.set_nav_busy(ctl.nav_pending());
+        ui.set_nav_phase(0.45);
+    }
     // The two neutral notices, with the same text the app shows.
     let notice = match view {
         "watch-fallback" => Some(crate::app::watch_fallback_notice(Path::new(

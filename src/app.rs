@@ -181,6 +181,20 @@ pub struct Controller {
     read_gen: u64,
     /// The read in flight, if any, and whether it is a navigation.
     in_flight: Option<ReadKind>,
+    /// The navigation in flight: its target, when it started, and whether
+    /// it has been slow enough to show as pending.
+    nav: Option<PendingNav>,
+}
+
+/// How long a navigation read may take before the breadcrumb jumps to the
+/// target and the toolbar shows a progress bar.
+pub const NAV_PENDING_AFTER: Duration = Duration::from_millis(150);
+
+#[derive(Debug)]
+struct PendingNav {
+    target: PathBuf,
+    started: std::time::Instant,
+    shown: bool,
 }
 
 /// Why a folder is read: a navigation keeps the old folder on screen and
@@ -287,12 +301,51 @@ impl Controller {
             loaded: true,
             read_gen: 0,
             in_flight: None,
+            nav: None,
         }
     }
 
     /// Ask to open `dir`. The current folder stays until the read lands.
     pub fn begin_navigate(&mut self, dir: PathBuf) -> ReadTicket {
+        self.begin_navigate_at(dir, std::time::Instant::now())
+    }
+
+    /// `begin_navigate` at a given time. A navigation that supersedes one
+    /// already shown as pending retargets the breadcrumb right away.
+    pub fn begin_navigate_at(&mut self, dir: PathBuf, now: std::time::Instant) -> ReadTicket {
+        let shown = self.nav.as_ref().is_some_and(|n| n.shown);
+        self.nav = Some(PendingNav {
+            target: dir.clone(),
+            started: now,
+            shown,
+        });
         self.ticket(dir, ReadKind::Navigate)
+    }
+
+    /// Mark the navigation in flight as pending once it has taken
+    /// `NAV_PENDING_AFTER`; true when that changed what is shown.
+    pub fn tick_nav(&mut self, now: std::time::Instant) -> bool {
+        match &mut self.nav {
+            Some(n) if !n.shown && now.duration_since(n.started) >= NAV_PENDING_AFTER => {
+                n.shown = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a slow navigation is showing its progress bar.
+    pub fn nav_pending(&self) -> bool {
+        self.nav.as_ref().is_some_and(|n| n.shown)
+    }
+
+    /// The folder the breadcrumb names: a slow navigation's target, or the
+    /// open folder.
+    pub fn crumb_dir(&self) -> &Path {
+        match &self.nav {
+            Some(n) if n.shown => &n.target,
+            _ => &self.dir,
+        }
     }
 
     /// Ask to reread the open folder; `None` while a navigation is in
@@ -325,6 +378,7 @@ impl Controller {
             return Landed::Stale;
         }
         self.in_flight = None;
+        self.nav = None;
         let was_loaded = std::mem::replace(&mut self.loaded, true);
         match read.result {
             Ok((dir, snap)) if dir != self.dir => {
@@ -1235,12 +1289,13 @@ fn redraw(ui: &AppWindow, s: &State) {
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let crumbs: Vec<String> = crate::model::breadcrumbs(&ctl.dir, home.as_deref())
+    let crumbs: Vec<String> = crate::model::breadcrumbs(ctl.crumb_dir(), home.as_deref())
         .iter()
         .map(|c| c.label.clone())
         .collect();
     ui.set_crumbs(crumbs.join("  ›  ").into());
-    ui.set_path_text(ctl.dir.display().to_string().into());
+    ui.set_path_text(ctl.crumb_dir().display().to_string().into());
+    ui.set_nav_busy(ctl.nav_pending());
     let n = ctl.listing.view().len();
     let sel = ctl.listing.selection().len();
     let mut left = ops::count(n);
@@ -1317,7 +1372,20 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
         }
         Action::Navigate(dir) => {
             let ticket = st.borrow_mut().ctl.begin_navigate(dir);
+            let retargeted = st.borrow().ctl.nav_pending();
+            if retargeted {
+                redraw(ui, &st.borrow());
+            }
             start_read(Some(ticket));
+            let st = st.clone();
+            let ui = ui.as_weak();
+            slint::Timer::single_shot(NAV_PENDING_AFTER, move || {
+                let Some(ui) = ui.upgrade() else { return };
+                let mut s = st.borrow_mut();
+                if s.ctl.tick_nav(std::time::Instant::now()) {
+                    redraw(&ui, &s);
+                }
+            });
         }
         Action::Answer(choice) => {
             if let Some(tx) = st.borrow_mut().reply.take() {
@@ -2476,6 +2544,56 @@ mod tests {
         assert_eq!(c.dir, old.join("raw-exports"));
         assert!(c.listing.entries().is_empty());
         assert!(c.idle());
+    }
+
+    #[test]
+    fn a_slow_navigation_shows_its_target_after_150ms() {
+        let mut c = setup("nav-slow");
+        let old = c.dir.clone();
+        let t0 = std::time::Instant::now();
+        let ticket = c.begin_navigate_at(old.join("raw-exports"), t0);
+        assert!(!c.tick_nav(t0 + Duration::from_millis(149)));
+        assert_eq!(c.crumb_dir(), old, "a quick read never moves the crumb");
+        assert!(!c.nav_pending());
+        assert!(c.tick_nav(t0 + NAV_PENDING_AFTER));
+        assert!(!c.tick_nav(t0 + Duration::from_millis(400)), "once");
+        assert_eq!(c.crumb_dir(), old.join("raw-exports"));
+        assert_eq!(c.dir, old, "listing not swapped yet");
+        assert!(c.nav_pending());
+        c.land(ticket.perform());
+        assert!(!c.nav_pending(), "bar clears when the listing swaps in");
+        assert_eq!(c.crumb_dir(), c.dir);
+    }
+
+    #[test]
+    fn a_failed_slow_navigation_puts_the_crumb_back() {
+        let mut c = setup("nav-slow-fail");
+        let old = c.dir.clone();
+        let t0 = std::time::Instant::now();
+        let ticket = c.begin_navigate_at(old.join("missing"), t0);
+        c.tick_nav(t0 + NAV_PENDING_AFTER);
+        assert_eq!(c.crumb_dir(), old.join("missing"));
+        assert!(matches!(c.land(ticket.perform()), Landed::Failed(_)));
+        assert_eq!(c.crumb_dir(), old);
+        assert!(!c.nav_pending(), "bar clears on failure too");
+    }
+
+    #[test]
+    fn a_superseding_navigation_retargets_the_crumb() {
+        let mut c = setup("nav-retarget");
+        let old = c.dir.clone();
+        let t0 = std::time::Instant::now();
+        let first = c.begin_navigate_at(old.join("raw-exports"), t0);
+        c.tick_nav(t0 + NAV_PENDING_AFTER);
+        let up = old.parent().unwrap().to_path_buf();
+        let second = c.begin_navigate_at(up.clone(), t0 + Duration::from_millis(200));
+        assert_eq!(c.crumb_dir(), up, "retargeted at once");
+        assert!(c.nav_pending());
+        assert!(matches!(c.land(first.perform()), Landed::Stale));
+        assert!(c.nav_pending(), "a stale result leaves the bar up");
+        c.land(second.perform());
+        assert!(!c.nav_pending());
+        assert_eq!(c.dir, up);
     }
 
     #[test]
