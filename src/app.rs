@@ -496,6 +496,25 @@ impl Controller {
         }
     }
 
+    /// The window is now `window` big: keep the pan inside the new
+    /// limits, so growing the window never leaves a gap at an edge.
+    pub fn viewer_resized(&mut self, window: (f32, f32)) -> Action {
+        let (image, _) = self.view_geom.get();
+        let Some(v) = self.viewer.as_mut() else {
+            return Action::None;
+        };
+        let info = if v.info { 332.0 } else { 0.0 };
+        let view = ((window.0 - info).max(1.0), window.1.max(1.0));
+        self.view_geom.set((image, view));
+        let before = v.pan;
+        v.pan_by((0.0, 0.0), image, view);
+        if v.pan == before {
+            Action::None
+        } else {
+            Action::Redraw
+        }
+    }
+
     /// The mouse moved over the viewer: bring the chrome back.
     pub fn viewer_wake(&mut self) -> Action {
         match self.viewer.as_mut() {
@@ -2225,6 +2244,14 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     let st = state.clone();
     ui.on_content_resized(move || {
         let Some(ui) = w.upgrade() else { return };
+        if st.try_borrow().is_ok_and(|s| s.ctl.viewer.is_some()) {
+            let size = ui.window().size().to_logical(ui.window().scale_factor());
+            let action = st
+                .borrow_mut()
+                .ctl
+                .viewer_resized((size.width, size.height));
+            apply(&ui, &st, action);
+        }
         let Ok(s) = st.try_borrow() else { return };
         // Grid columns and the list's middle-cut names both follow width;
         // rebuild only when one of them changed.
@@ -2692,19 +2719,32 @@ fn remember_prefs(s: &State) {
 pub const STRIP_TILES: usize = 11;
 
 /// A decoded picture, or why there is none.
-type Decoded = std::result::Result<Rc<image::RgbaImage>, crate::picture::Why>;
+type Decoded = std::result::Result<Arc<image::RgbaImage>, crate::picture::Why>;
+
+/// Pixels ready for Slint, made on a worker: Slint images can't cross
+/// threads, but their buffers can.
+type Px = slint::SharedPixelBuffer<slint::Rgba8Pixel>;
+
+/// Longest side of the pixels handed to Slint for the open picture.
+/// Bigger pictures are shrunk on the worker; zoom still uses their real
+/// size, so past this they are drawn upscaled.
+const SHOWN_SIDE: u32 = 4096;
 
 /// Filmstrip tiles kept decoded; older ones are dropped past this.
 const TILE_CACHE: usize = 64;
 /// Longest side of a filmstrip tile's pixels.
 const TILE_SIDE: u32 = 144;
 
-/// A tile: its pixels (for the blurred stand-in) and them as shown, or
-/// `None` when it has no picture (videos without a cached frame).
-type Tile = Option<(Rc<image::RgbaImage>, slint::Image)>;
+/// A tile: its blurred stand-in and it as shown, or `None` when it has
+/// no picture (videos without a cached frame).
+type Tile = Option<(slint::Image, slint::Image)>;
 
 #[derive(Default)]
 struct Pics {
+    /// Bumped whenever the viewer closes: work started before lands stale.
+    gen: u64,
+    /// A turned copy being made: (path, turns).
+    turning: Option<(PathBuf, u8)>,
     /// The last picture decoded; kept on screen while the next loads.
     full: Option<(PathBuf, Decoded)>,
     /// It as shown, turned: (path, turns, image).
@@ -2720,13 +2760,59 @@ struct Pics {
     spinner: Option<slint::Timer>,
 }
 
+impl Pics {
+    /// The viewer closed: drop every picture, and make whatever is still
+    /// decoding land stale instead of starting what waited behind it.
+    fn close(&mut self) {
+        let mut decodes = std::mem::take(&mut self.decodes);
+        decodes.cancel();
+        *self = Pics {
+            gen: self.gen + 1,
+            decodes,
+            ..Pics::default()
+        };
+    }
+}
+
+/// `img` turned `turns` quarter turns clockwise and shrunk to fit
+/// `max`×`max`, as pixels for Slint. Runs on a worker.
+fn prepare(img: &image::RgbaImage, turns: u8, max: u32) -> Px {
+    let (w, h) = img.dimensions();
+    let shrunk;
+    let img = if w > max || h > max {
+        shrunk = image::DynamicImage::ImageRgba8(img.clone())
+            .resize(max, max, image::imageops::FilterType::Triangle)
+            .into_rgba8();
+        &shrunk
+    } else {
+        img
+    };
+    let turned = match turns % 4 {
+        0 => None,
+        1 => Some(image::imageops::rotate90(img)),
+        2 => Some(image::imageops::rotate180(img)),
+        _ => Some(image::imageops::rotate270(img)),
+    };
+    let img = turned.as_ref().unwrap_or(img);
+    let (w, h) = img.dimensions();
+    Px::clone_from_slice(img.as_raw(), w, h)
+}
+
 /// Work for a decode thread.
 enum DecodeJob {
     Full {
+        gen: u64,
         ticket: u64,
         path: PathBuf,
     },
+    Turn {
+        gen: u64,
+        path: PathBuf,
+        img: Arc<image::RgbaImage>,
+        turns: u8,
+    },
     Tiles {
+        gen: u64,
         paths: Vec<PathBuf>,
         cache: Option<PathBuf>,
     },
@@ -2736,25 +2822,57 @@ enum DecodeJob {
 /// Slint images are made on the UI thread.
 enum DecodeDone {
     Full {
+        gen: u64,
         ticket: u64,
         path: PathBuf,
-        pic: std::result::Result<image::RgbaImage, crate::picture::Why>,
+        pic: std::result::Result<(Arc<image::RgbaImage>, Px), crate::picture::Why>,
     },
-    Tiles(Vec<(PathBuf, Option<image::RgbaImage>)>),
+    Turn {
+        gen: u64,
+        path: PathBuf,
+        turns: u8,
+        px: Px,
+    },
+    /// Per path: the tile and its blurred stand-in.
+    Tiles(u64, Vec<(PathBuf, Option<(Px, Px)>)>),
 }
 
 impl DecodeJob {
     fn perform(self) -> DecodeDone {
         match self {
-            DecodeJob::Full { ticket, path } => {
-                let pic = crate::picture::full(&path);
-                DecodeDone::Full { ticket, path, pic }
+            DecodeJob::Full { gen, ticket, path } => {
+                let pic = crate::picture::full(&path).map(|img| {
+                    let px = prepare(&img, 0, SHOWN_SIDE);
+                    (Arc::new(img), px)
+                });
+                DecodeDone::Full {
+                    gen,
+                    ticket,
+                    path,
+                    pic,
+                }
             }
-            DecodeJob::Tiles { paths, cache } => DecodeDone::Tiles(
+            DecodeJob::Turn {
+                gen,
+                path,
+                img,
+                turns,
+            } => DecodeDone::Turn {
+                gen,
+                px: prepare(&img, turns, SHOWN_SIDE),
+                path,
+                turns,
+            },
+            DecodeJob::Tiles { gen, paths, cache } => DecodeDone::Tiles(
+                gen,
                 paths
                     .into_iter()
                     .map(|p| {
                         let t = crate::picture::tile(&p, TILE_SIDE, cache.as_deref()).ok();
+                        let t = t.map(|t| {
+                            let blurred = image::imageops::blur(&t, 4.0);
+                            (prepare(&t, 0, TILE_SIDE), prepare(&blurred, 0, TILE_SIDE))
+                        });
                         (p, t)
                     })
                     .collect(),
@@ -2782,25 +2900,62 @@ fn decode_landed(ui: &AppWindow, st: &Shared, done: DecodeDone) {
     let s = st.borrow();
     {
         let mut pics = s.pics.borrow_mut();
+        let current = pics.gen;
         match done {
-            DecodeDone::Full { ticket, path, pic } => {
+            DecodeDone::Full {
+                gen,
+                ticket,
+                path,
+                pic,
+            } => {
+                // Always counted off, so a close can't leave a slot taken.
                 let (wanted, next) = pics.decodes.finish(ticket);
                 if let Some((ticket, path)) = next {
-                    start_decode(DecodeJob::Full { ticket, path });
+                    start_decode(DecodeJob::Full {
+                        gen: current,
+                        ticket,
+                        path,
+                    });
                 }
-                if !wanted || pics.want.as_ref() != Some(&path) {
+                // Started before a close: nothing waits for it now.
+                if gen != current || !wanted || pics.want.as_ref() != Some(&path) {
                     return;
                 }
                 pics.want = None;
                 pics.spinner = None;
-                pics.full = Some((path, pic.map(Rc::new)));
+                pics.turning = None;
+                pics.shown = None;
+                let pic = pic.map(|(img, px)| {
+                    pics.shown = Some((path.clone(), 0, slint::Image::from_rgba8(px)));
+                    img
+                });
+                pics.full = Some((path, pic));
             }
-            DecodeDone::Tiles(done) => {
+            DecodeDone::Turn {
+                gen,
+                path,
+                turns,
+                px,
+            } => {
+                if gen != current || pics.turning.as_ref() != Some(&(path.clone(), turns)) {
+                    return;
+                }
+                pics.turning = None;
+                if pics.full.as_ref().map(|f| &f.0) == Some(&path) {
+                    pics.shown = Some((path, turns, slint::Image::from_rgba8(px)));
+                }
+            }
+            DecodeDone::Tiles(gen, done) => {
+                if gen != current {
+                    return;
+                }
                 for (path, pic) in done {
                     pics.tiles_pending.remove(&path);
-                    let tile = pic.map(|p| {
-                        let shown = to_slint(&p, 0);
-                        (Rc::new(p), shown)
+                    let tile = pic.map(|(shown, blurred)| {
+                        (
+                            slint::Image::from_rgba8(blurred),
+                            slint::Image::from_rgba8(shown),
+                        )
                     });
                     if pics.tiles.insert(path.clone(), tile).is_none() {
                         pics.tile_order.push_back(path);
@@ -2830,13 +2985,12 @@ fn launch(ui: &AppWindow, st: &Shared, argv: Vec<OsString>) {
     let Some((program, args)) = argv.split_first() else {
         return;
     };
-    match Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    match own_session(&mut cmd).spawn() {
         Ok(mut child) => {
             std::thread::spawn(move || child.wait());
         }
@@ -2847,32 +3001,24 @@ fn launch(ui: &AppWindow, st: &Shared, argv: Vec<OsString>) {
     }
 }
 
+/// Run `cmd` in a session of its own, so closing Robin's terminal (or
+/// Robin) never sends the player a hangup.
+fn own_session(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setsid is async-signal-safe and touches no Rust state.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    }
+}
+
 /// What the render harness was asked to launch, oldest first.
 pub fn launched() -> Vec<Vec<OsString>> {
     LAUNCHED.with(|l| l.borrow().clone())
-}
-
-/// `img` turned `turns` quarter turns clockwise, as a Slint image.
-fn to_slint(img: &image::RgbaImage, turns: u8) -> slint::Image {
-    let turned;
-    let img = match turns % 4 {
-        0 => img,
-        1 => {
-            turned = image::imageops::rotate90(img);
-            &turned
-        }
-        2 => {
-            turned = image::imageops::rotate180(img);
-            &turned
-        }
-        _ => {
-            turned = image::imageops::rotate270(img);
-            &turned
-        }
-    };
-    let (w, h) = img.dimensions();
-    let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(img.as_raw(), w, h);
-    slint::Image::from_rgba8(buf)
 }
 
 /// `path` with the home folder written as `~`.
@@ -2910,7 +3056,10 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
     let ctl = &s.ctl;
     let Some(v) = ctl.viewer.as_ref() else {
         ui.set_view_on(false);
-        *s.pics.borrow_mut() = Pics::default();
+        let mut pics = s.pics.borrow_mut();
+        if pics.full.is_some() || pics.want.is_some() || !pics.tiles.is_empty() {
+            pics.close();
+        }
         return;
     };
     let path = ctl.dir.join(v.current());
@@ -2919,7 +3068,11 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
     if !ready && pics.want.as_ref() != Some(&path) {
         pics.want = Some(path.clone());
         if let Some((ticket, path)) = pics.decodes.request(path.clone()) {
-            start_decode(DecodeJob::Full { ticket, path });
+            start_decode(DecodeJob::Full {
+                gen: pics.gen,
+                ticket,
+                path,
+            });
         }
         // A spinner only for a slow decode.
         let w = ui.as_weak();
@@ -2945,21 +3098,31 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
         pics.tiles
             .get(&path)
             .and_then(|t| t.as_ref())
-            .map(|(px, _)| to_slint(&image::imageops::blur(px.as_ref(), 4.0), 0))
+            .map(|(blurred, _)| blurred.clone())
             .unwrap_or_default()
     } else {
         slint::Image::default()
     };
     ui.set_view_loading(loading_first);
     ui.set_view_placeholder(placeholder);
-    let shown_path = pics.full.as_ref().map(|f| f.0.clone()).unwrap_or_default();
-    let turns = if ready { v.turns } else { 0 };
+    let want_turns = if ready { v.turns } else { 0 };
     let pic = pics.full.as_ref().map(|f| f.1.clone());
-    if let Some(Ok(img)) = &pic {
-        if pics.shown.as_ref().map(|s| (&s.0, s.1)) != Some((&shown_path, turns)) {
-            pics.shown = Some((shown_path.clone(), turns, to_slint(img, turns)));
+    if let (Some((full_path, _)), Some(Ok(img))) = (pics.full.as_ref(), &pic) {
+        let want = (full_path.clone(), want_turns);
+        let have = pics.shown.as_ref().map(|s| (s.0.clone(), s.1));
+        if have.as_ref() != Some(&want) && pics.turning.as_ref() != Some(&want) {
+            // Turned off the UI thread; the old turn stays until it lands.
+            pics.turning = Some(want.clone());
+            start_decode(DecodeJob::Turn {
+                gen: pics.gen,
+                path: want.0,
+                img: img.clone(),
+                turns: want_turns,
+            });
         }
     }
+    // Sizes follow what is on screen, so a pending turn never stretches.
+    let turns = pics.shown.as_ref().map_or(0, |s| s.1);
     // A picture still loading shows nothing for zoom and facts yet.
     let pic = match pic {
         Some(p) if ready || p.is_ok() => p,
@@ -3037,6 +3200,7 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
     if pics.tiles_pending.is_empty() && !missing.is_empty() {
         pics.tiles_pending.extend(missing.iter().cloned());
         start_decode(DecodeJob::Tiles {
+            gen: pics.gen,
             paths: missing,
             cache: ctl.env.cache_dir(),
         });
@@ -5593,5 +5757,66 @@ mod tests {
         fs::write(c.dir.join("raw-exports/3.raw"), b"x").unwrap();
         c.refresh().unwrap();
         assert_eq!(c.rows()[0].size, "4 items", "counts are retaken on refresh");
+    }
+
+    #[test]
+    fn pictures_are_turned_and_shrunk_before_they_reach_the_ui() {
+        let img = image::RgbaImage::from_pixel(400, 100, image::Rgba([9, 8, 7, 255]));
+        let px = prepare(&img, 1, 4096);
+        assert_eq!((px.width(), px.height()), (100, 400));
+        let px = prepare(&img, 2, 200);
+        assert_eq!((px.width(), px.height()), (200, 50));
+        let px = prepare(&img, 3, 200);
+        assert_eq!((px.width(), px.height()), (50, 200));
+    }
+
+    #[test]
+    fn closing_the_viewer_strands_its_decodes_and_frees_their_slots() {
+        let mut pics = Pics::default();
+        let (old, _) = pics.decodes.request(PathBuf::from("/a.jpg")).unwrap();
+        pics.decodes.request(PathBuf::from("/b.jpg")).unwrap();
+        assert!(
+            pics.decodes.request(PathBuf::from("/c.jpg")).is_none(),
+            "c waits"
+        );
+        pics.want = Some("/c.jpg".into());
+        let gen = pics.gen;
+        pics.close();
+        assert_ne!(pics.gen, gen, "tiles and turns from before land stale");
+        assert!(pics.want.is_none());
+        let (wanted, next) = pics.decodes.finish(old);
+        assert!(!wanted && next.is_none(), "c was dropped with the viewer");
+        // A reopen gets a fresh ticket the stale one can't match.
+        let (new, _) = pics.decodes.request(PathBuf::from("/a.jpg")).unwrap();
+        assert_ne!(new, old);
+        assert!(pics.decodes.is_latest(new));
+    }
+
+    #[test]
+    fn a_resize_pulls_the_pan_back_inside_the_picture() {
+        let mut c = setup("viewer-resize");
+        select(&mut c, "a.jpg");
+        c.key(keys::RETURN, false, false);
+        c.view_geom.set(((1000.0, 800.0), (500.0, 400.0)));
+        let v = c.viewer.as_mut().unwrap();
+        v.zoom = crate::viewer::Zoom::Scale(1.0);
+        v.pan_by((-400.0, -400.0), (1000.0, 800.0), (500.0, 400.0));
+        assert_eq!(v.pan, (-250.0, -200.0));
+        assert_eq!(c.viewer_resized((900.0, 700.0)), Action::Redraw);
+        assert_eq!(c.viewer.as_ref().unwrap().pan, (-50.0, -50.0));
+        assert_eq!(
+            c.viewer_resized((900.0, 700.0)),
+            Action::None,
+            "already inside"
+        );
+    }
+
+    #[test]
+    fn launched_apps_lead_their_own_session() {
+        let mut cmd = std::process::Command::new("sh");
+        // $$ is the shell's pid; a session leader's sid equals it.
+        cmd.args(["-c", "test \"$(ps -o sid= -p $$ | tr -d ' ')\" = \"$$\""]);
+        let status = own_session(&mut cmd).status().unwrap();
+        assert!(status.success());
     }
 }

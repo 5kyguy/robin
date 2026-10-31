@@ -2179,7 +2179,8 @@ export component AppWindow inherits Window {
         // where a decoded picture at fit would sit.
         property <bool> strip-on: view-chrome && view-strip && view-tiles.length > 1;
         property <length> load-top: strip-on ? 64px : 0px;
-        property <length> load-h: strip-on ? self.height - 64px - 144px : self.height;
+        // Never negative: a window shorter than the strip shows no box.
+        property <length> load-h: max(0px, strip-on ? self.height - 64px - 144px : self.height);
         if view-loading && view-placeholder.width > 0: Image {
             source: view-placeholder;
             x: 0px;
@@ -2192,7 +2193,7 @@ export component AppWindow inherits Window {
         if view-loading && view-placeholder.width == 0: Rectangle {
             x: (open-w - self.width) / 2;
             y: load-top + (load-h - self.height) / 2;
-            width: min(480px, open-w - 64px, (load-h - 32px) * 3 / 2);
+            width: min(480px, open-w - 64px, max(0px, load-h - 32px) * 3 / 2);
             height: self.width * 2 / 3;
             border-radius: 6px;
             background: surface;

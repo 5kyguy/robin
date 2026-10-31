@@ -284,6 +284,8 @@ fn paint_in(
                 "view-turn" => type_keys(&ui, "r"),
                 _ => {}
             }
+            // Turns are made on a worker too.
+            app::land_reads();
         }
         "view-video" => {
             select_row(&ui, "speeder-run.mp4");
