@@ -512,6 +512,16 @@ impl Env {
     }
 }
 
+impl Env {
+    /// A seeded home: trash under its own `.local/share`, never the host's.
+    pub fn for_home(home: &Path) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            home_trash: home.join(".local/share/Trash"),
+        }
+    }
+}
+
 /// Whether Del can trash things in `dir`, or must offer a permanent delete.
 pub fn trash_choice(dir: &Path, env: &Env) -> TrashChoice {
     if same_filesystem(dir, &env.home) {
@@ -899,6 +909,12 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn a_fixture_home_keeps_trash_inside_it() {
+        let env = Env::for_home(Path::new("/tmp/fx"));
+        assert_eq!(env.home_trash, Path::new("/tmp/fx/.local/share/Trash"));
     }
 
     fn env(root: &Path) -> Env {

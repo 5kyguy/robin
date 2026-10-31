@@ -168,6 +168,8 @@ pub struct Controller {
     pub focus: i32,
     pub armed: bool,
     pub drag: Option<Drag>,
+    /// Mounts and free space; the system's, or a fixture's in renders.
+    pub mounts: std::sync::Arc<dyn crate::mounts::MountSource>,
     pressed: Option<usize>,
     pub job_running: bool,
     /// A fixed (now, UTC offset) for tests and renders; the system clock
@@ -306,6 +308,7 @@ impl Controller {
             focus: 0,
             armed: false,
             drag: None,
+            mounts: std::sync::Arc::new(crate::mounts::SystemMounts),
             pressed: None,
             job_running: false,
             clock: None,
@@ -991,6 +994,7 @@ pub struct Launch {
     pub theme: crate::theme::Theme,
     pub compact: bool,
     pub clock: Option<(i64, i64)>,
+    pub mounts: std::sync::Arc<dyn crate::mounts::MountSource>,
 }
 
 impl Launch {
@@ -1002,6 +1006,7 @@ impl Launch {
             theme: crate::theme::Theme::cyan(),
             compact: false,
             clock: None,
+            mounts: std::sync::Arc::new(crate::mounts::SystemMounts),
         }
     }
 }
@@ -1037,6 +1042,7 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     ui.set_compact(launch.compact);
     let mut ctl = Controller::new(launch.dir, launch.env);
     ctl.clock = launch.clock;
+    ctl.mounts = launch.mounts;
     ctl.loaded = false;
     let startup = ctl.begin_refresh();
     let state: Shared = Rc::new(RefCell::new(State {

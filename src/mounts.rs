@@ -5,7 +5,7 @@
 //! system bus is contacted only by [`list_udisks`]; tests use the pure
 //! mapping and a mountinfo fixture.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::safety::{dev_parts, fstype_in_mountinfo};
@@ -113,6 +113,81 @@ fn unescape(mount: &str) -> String {
     mount.replace("\\040", " ").replace("\\011", "\t")
 }
 
+/// Size and free space of one mounted filesystem, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Space {
+    pub total: u64,
+    pub free: u64,
+}
+
+/// Where the mount list and free space come from: the running system,
+/// or a fixture so renders and tests never depend on the host's disks.
+pub trait MountSource: Send + Sync {
+    fn volumes(&self) -> Result<Vec<Volume>>;
+    fn space(&self, mount_point: &Path) -> Result<Space>;
+}
+
+/// `/proc/self/mountinfo` and `statvfs(3)`.
+pub struct SystemMounts;
+
+impl MountSource for SystemMounts {
+    fn volumes(&self) -> Result<Vec<Volume>> {
+        let path = Path::new("/proc/self/mountinfo");
+        let text = std::fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
+        Ok(volumes_from_mountinfo(&text))
+    }
+
+    fn space(&self, mount_point: &Path) -> Result<Space> {
+        let st = rustix::fs::statvfs(mount_point)
+            .map_err(|e| Error::io(mount_point, std::io::Error::from(e)))?;
+        Ok(Space {
+            total: st.f_blocks * st.f_frsize,
+            free: st.f_bavail * st.f_frsize,
+        })
+    }
+}
+
+/// A seeded mount table: `mountinfo` in the kernel's format and `space`
+/// with one `<mount point> <total> <free>` line per mount.
+pub struct FixtureMounts {
+    mountinfo: String,
+    space: Vec<(PathBuf, Space)>,
+}
+
+impl FixtureMounts {
+    pub fn load(dir: &Path) -> Result<Self> {
+        let read = |name: &str| {
+            let path = dir.join(name);
+            std::fs::read_to_string(&path).map_err(|e| Error::io(&path, e))
+        };
+        let mountinfo = read("mountinfo")?;
+        let space = read("space")?
+            .lines()
+            .filter_map(|line| {
+                let mut f = line.rsplitn(3, ' ');
+                let free = f.next()?.parse().ok()?;
+                let total = f.next()?.parse().ok()?;
+                Some((PathBuf::from(f.next()?), Space { total, free }))
+            })
+            .collect();
+        Ok(Self { mountinfo, space })
+    }
+}
+
+impl MountSource for FixtureMounts {
+    fn volumes(&self) -> Result<Vec<Volume>> {
+        Ok(volumes_from_mountinfo(&self.mountinfo))
+    }
+
+    fn space(&self, mount_point: &Path) -> Result<Space> {
+        self.space
+            .iter()
+            .find(|(p, _)| p == mount_point)
+            .map(|(_, s)| *s)
+            .ok_or_else(|| Error::Message(format!("no space seeded for {}", mount_point.display())))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +221,28 @@ mod tests {
         assert_eq!(device.device, "/dev/sda1");
         assert_eq!(device.label, "archive");
         assert_eq!(udisks_mount().2, "Mount");
+    }
+
+    #[test]
+    fn fixture_mounts_read_the_seeded_table() {
+        let root = std::env::temp_dir().join(format!("robin-mounts-{}", std::process::id()));
+        let _ = crate::fixture::remove(&root);
+        crate::fixture::materialize(&root).unwrap();
+        let m = FixtureMounts::load(&crate::fixture::mounts_dir(&root)).unwrap();
+        let vols = m.volumes().unwrap();
+        let sandisk = root.join("media/SANDISK");
+        assert!(vols
+            .iter()
+            .any(|v| Path::new(&v.mount_point) == sandisk && v.fs_type == "exfat"));
+        let s = m.space(&sandisk).unwrap();
+        assert!(s.free < s.total);
+        assert!(m.space(Path::new("/nowhere")).is_err());
+        crate::fixture::remove(&root).unwrap();
+    }
+
+    #[test]
+    fn system_space_reads_statvfs() {
+        let s = SystemMounts.space(Path::new("/")).unwrap();
+        assert!(s.total > 0 && s.free <= s.total);
     }
 }

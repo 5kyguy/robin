@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn demo_prints_a_tree() {
         let dir = std::env::temp_dir().join(format!("robin-cli-demo-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::fixture::remove(&dir);
         assert_eq!(
             run([
                 "--demo".into(),
@@ -175,7 +175,7 @@ mod tests {
             0
         );
         assert!(dir.join("Pictures/palette.toml").is_file());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::fixture::remove(&dir);
     }
 
     #[test]

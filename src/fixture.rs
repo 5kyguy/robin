@@ -48,11 +48,72 @@ pub fn materialize(root: &Path) -> Result<()> {
     write(root, "Pictures/dune-sunset-0413.jpg", PIXEL_PNG)?;
     write(root, "Pictures/r2-portrait-001.png", PIXEL_PNG)?;
     write(root, "Videos/speeder-run.mp4", b"not a real video\n")?;
+    seed_home(root)?;
     let link = root.join("Pictures/latest");
     if link.symlink_metadata().is_err() {
         symlink("dune-sunset-0412.jpg", &link).map_err(|e| Error::io(&link, e))?;
     }
     Ok(())
+}
+
+/// Where the fake mount table lives inside a fixture.
+pub fn mounts_dir(root: &Path) -> std::path::PathBuf {
+    root.join(".robin-fixture")
+}
+
+/// The XDG dirs, one trashed file, a folder nobody may read, and a mount
+/// table that puts the fixture on a home disk and a fake SANDISK stick.
+fn seed_home(root: &Path) -> Result<()> {
+    for dir in [
+        ".config",
+        ".cache",
+        ".local/share/Trash/files",
+        "media/SANDISK",
+    ] {
+        let path = root.join(dir);
+        fs::create_dir_all(&path).map_err(|e| Error::io(&path, e))?;
+    }
+    write(root, ".local/share/Trash/files/old-draft.txt", b"draft\n")?;
+    write(
+        root,
+        ".local/share/Trash/info/old-draft.txt.trashinfo",
+        b"[Trash Info]\nPath=/demo/Documents/old-draft.txt\nDeletionDate=2026-10-29T10:00:00\n",
+    )?;
+    let r = root.display();
+    let mountinfo = format!(
+        "22 1 259:2 / / rw - ext4 /dev/nvme0n1p2 rw\n\
+         40 22 259:3 / {r} rw - ext4 /dev/nvme0n1p3 rw\n\
+         41 40 8:1 / {r}/media/SANDISK rw - exfat /dev/sda1 rw\n"
+    );
+    let space = format!(
+        "/ 512000000000 128000000000\n\
+         {r} 1800000000000 812000000000\n\
+         {r}/media/SANDISK 64000000000 6000000000\n"
+    );
+    let m = mounts_dir(root);
+    fs::create_dir_all(&m).map_err(|e| Error::io(&m, e))?;
+    write(&m, "mountinfo", mountinfo.as_bytes())?;
+    write(&m, "space", space.as_bytes())?;
+    let secret = root.join("secret");
+    fs::create_dir_all(&secret).map_err(|e| Error::io(&secret, e))?;
+    set_mode(&secret, 0o000)
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| Error::io(path, e))
+}
+
+/// Delete a fixture, reopening its unreadable folder first.
+pub fn remove(root: &Path) -> Result<()> {
+    let secret = root.join("secret");
+    if secret.is_dir() || secret.symlink_metadata().is_ok() {
+        set_mode(&secret, 0o755)?;
+    }
+    match fs::remove_dir_all(root) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Error::io(root, e)),
+        _ => Ok(()),
+    }
 }
 
 fn write(root: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
@@ -72,8 +133,15 @@ mod tests {
     #[test]
     fn demo_tree_has_the_fictional_pictures() {
         let root = std::env::temp_dir().join(format!("robin-fixture-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = remove(&root);
         materialize(&root).unwrap();
+        assert!(root
+            .join(".local/share/Trash/info/old-draft.txt.trashinfo")
+            .is_file());
+        assert!(
+            std::fs::read_dir(root.join("secret")).is_err(),
+            "seeded unreadable"
+        );
         assert!(root.join("Pictures/palette.toml").is_file());
         assert!(root.join("Pictures/dune-sunset-0412.jpg").is_file());
         assert!(root.join("Documents/empty").is_dir());
@@ -83,6 +151,7 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
-        let _ = std::fs::remove_dir_all(&root);
+        remove(&root).unwrap();
+        assert!(!root.exists());
     }
 }
