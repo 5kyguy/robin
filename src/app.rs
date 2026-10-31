@@ -654,8 +654,10 @@ impl Controller {
         Ok(())
     }
 
+    /// What an operation acts on: the selection as far as the view
+    /// shows it, never a name hidden by the filter or the dotfile toggle.
     fn names(&self) -> Vec<OsString> {
-        self.listing.selection().iter().cloned().collect()
+        self.listing.visible_selection()
     }
 
     fn row_name(&self, index: usize) -> Option<(OsString, bool)> {
@@ -2740,6 +2742,18 @@ mod tests {
         assert_eq!((lines[0].n, lines[0].first), (2, 0));
         assert_eq!((lines[1].n, lines[1].first), (1, 2));
         assert!(!c.fit(32.0 + 152.0 * 2.0 + 8.0), "same width, no rebuild");
+    }
+
+    #[test]
+    fn a_search_narrows_what_operations_act_on() {
+        let mut c = setup("search-ops");
+        c.listing.move_cursor(Nav::Home, false, 1);
+        c.listing.move_cursor(Nav::Down, true, 1);
+        c.listing.move_cursor(Nav::Down, true, 1);
+        assert_eq!(c.names().len(), 3);
+        c.listing.set_query("a.jpg");
+        assert_eq!(c.names(), vec![OsString::from("a.jpg")]);
+        assert_eq!(c.listing.selection().len(), 1);
     }
 
     #[test]

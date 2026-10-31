@@ -150,8 +150,20 @@ impl Listing {
         self.show_hidden
     }
 
+    /// Filter by `query`. Selected names it hides stop being selected,
+    /// so nothing acts on files the user can't see.
     pub fn set_query(&mut self, query: &str) {
         self.query = query.to_string();
+        self.drop_unseen();
+    }
+
+    /// The selection the view still shows, in view order.
+    pub fn visible_selection(&self) -> Vec<OsString> {
+        self.view()
+            .iter()
+            .filter(|e| self.selection.contains(&e.name))
+            .map(|e| e.name.clone())
+            .collect()
     }
 
     pub fn query(&self) -> &str {
