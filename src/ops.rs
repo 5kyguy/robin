@@ -709,9 +709,13 @@ pub fn run_asking(
     };
     // Deleting inside a trash's files/ also drops each item's trashinfo.
     let info_dir = match job.kind {
-        JobKind::Delete => trash_info_dir(&job.src, env),
+        JobKind::Delete => trash_of(&job.src, env),
         _ => None,
     };
+    let info_dir = info_dir.and_then(|fd| {
+        let info = fd.open_dir_nofollow(OsStr::new("info")).ok()?;
+        Some((fd, info))
+    });
     for (i, name) in job.names.iter().enumerate() {
         if cancel.is_cancelled() {
             out.cancelled = true;
@@ -742,7 +746,7 @@ pub fn run_asking(
             JobKind::Delete => fsops::remove_child(&src, name, &mut |_| {}, &item).and_then(|()| {
                 info_dir
                     .as_ref()
-                    .map_or(Ok(()), |d| fsops::forget_trashinfo(d, name))
+                    .map_or(Ok(()), |d| fsops::forget_trashinfo(&d.1, name))
             }),
             JobKind::Restore => unreachable!("handled above"),
         };
@@ -758,8 +762,8 @@ pub fn run_asking(
         }
     }
     if job.empty_trash {
-        if let Some(trash) = job.src.parent().filter(|_| info_dir.is_some()) {
-            if let Err(e) = tidy_trash(trash) {
+        if let Some((trash, _)) = &info_dir {
+            if let Err(e) = tidy_trash(trash, &job.names) {
                 out.failed.push(format!("trash info: {e}"));
             }
         }
@@ -775,60 +779,80 @@ pub fn run_asking(
     out
 }
 
-/// The `info/` beside `dir` when `dir` is a trash's `files/`.
-fn trash_info_dir(dir: &Path, env: &Env) -> Option<DirFd> {
+/// The trash folder holding `dir` when `dir` is a trash's `files/`,
+/// opened without following a symlink at the trash itself.
+fn trash_of(dir: &Path, env: &Env) -> Option<DirFd> {
     let trash = dir.parent()?;
     let uid = rustix::process::getuid().as_raw();
     if dir.file_name()? != "files" || !is_trash_dir(trash, &env.home_trash, uid) {
         return None;
     }
-    let parent = DirFd::open(trash).ok()?;
-    parent.open_dir_nofollow(OsStr::new("info")).ok()
+    open_trash(trash, &env.home_trash)
 }
 
-/// Drop trashinfo whose item is gone and directorysizes lines for
-/// folders no longer in files/, so nothing stale outlives Empty Trash.
-fn tidy_trash(trash: &Path) -> std::io::Result<()> {
-    let files = trash.join("files");
-    if let Ok(infos) = std::fs::read_dir(trash.join("info")) {
-        for entry in infos.flatten() {
-            let name = entry.file_name();
-            let Some(stem) = name.as_bytes().strip_suffix(b".trashinfo") else {
-                continue;
-            };
-            let item = files.join(OsStr::from_bytes(stem));
-            if std::fs::symlink_metadata(&item).is_err() {
-                std::fs::remove_file(entry.path())?;
-            }
+/// Open a trash the spec way: `$topdir/.Trash/$uid` only when `.Trash`
+/// is a real sticky folder, and never through a symlink at the last
+/// step, so a planted link can't point Empty Trash elsewhere.
+fn open_trash(trash: &Path, home_trash: &Path) -> Option<DirFd> {
+    let name = trash.file_name()?;
+    let parent = trash.parent()?;
+    if trash != home_trash && parent.file_name().is_some_and(|p| p == ".Trash") {
+        let top = DirFd::open(parent.parent()?).ok()?;
+        let dot = fsops::open_sticky_trash(&top).ok()??;
+        return dot.open_dir_nofollow(name).ok();
+    }
+    DirFd::open(parent).ok()?.open_dir_nofollow(name).ok()
+}
+
+/// After Empty Trash: drop the trashinfo and directorysizes lines of the
+/// items this job deleted, and nothing else. Another program's entries,
+/// even ones that look orphaned, are left alone.
+fn tidy_trash(trash: &DirFd, deleted: &[OsString]) -> Result<()> {
+    let files = trash.open_dir_nofollow(OsStr::new("files"))?;
+    let gone = |n: &OsStr| {
+        crate::fsops::component(n).is_ok_and(|c| {
+            rustix::fs::statat(
+                files.as_fd(),
+                c.as_c_str(),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .is_err()
+        })
+    };
+    let gone: Vec<&OsString> = deleted.iter().filter(|n| gone(n)).collect();
+    if let Ok(info) = trash.open_dir_nofollow(OsStr::new("info")) {
+        for n in &gone {
+            fsops::forget_trashinfo(&info, n)?;
         }
     }
-    let sizes = trash.join("directorysizes");
-    let Ok(text) = std::fs::read(&sizes) else {
+    let Some(text) = fsops::read_small(trash, OsStr::new("directorysizes"))? else {
         return Ok(());
     };
-    let kept: Vec<&[u8]> = text
+    let lines: Vec<&[u8]> = text
         .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect();
+    let kept: Vec<&[u8]> = lines
+        .iter()
+        .copied()
         .filter(|line| {
-            let Some(enc) = line.rsplit(|b| *b == b' ').next() else {
-                return false;
-            };
-            std::str::from_utf8(enc)
-                .ok()
-                .and_then(crate::trash::unescape)
-                .filter(|n| !n.is_empty())
-                .is_some_and(|n| {
-                    std::fs::symlink_metadata(files.join(OsStr::from_bytes(&n))).is_ok()
-                })
+            let name = line
+                .rsplit(|b| *b == b' ')
+                .next()
+                .and_then(|enc| std::str::from_utf8(enc).ok())
+                .and_then(crate::trash::unescape);
+            !name.is_some_and(|n| gone.iter().any(|g| g.as_bytes() == n.as_slice()))
         })
         .collect();
+    if kept.len() == lines.len() {
+        return Ok(());
+    }
     if kept.is_empty() {
-        return std::fs::remove_file(&sizes);
+        return fsops::unlink_child(trash, OsStr::new("directorysizes"));
     }
     let mut out = kept.join(&b'\n');
     out.push(b'\n');
-    let tmp = trash.join(".directorysizes.robin");
-    std::fs::write(&tmp, out)?;
-    std::fs::rename(tmp, sizes)
+    fsops::replace_file(trash, OsStr::new("directorysizes"), &out)
 }
 
 /// `~/…` under home, the full path elsewhere.
@@ -1421,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_trash_prunes_orphans_and_reports_what_stayed() {
+    fn empty_trash_tidies_only_what_it_deleted() {
         use std::os::unix::fs::PermissionsExt;
         let root = scratch("empty-tidy");
         let t = root.join("trash");
@@ -1459,7 +1483,7 @@ mod tests {
             "{:?}",
             toast.details
         );
-        assert!(!t.join("info/ghost.trashinfo").exists());
+        assert!(t.join("info/ghost.trashinfo").exists(), "not ours to prune");
         assert!(!t.join("info/a.trashinfo").exists());
         assert!(
             t.join("info/stuck.trashinfo").exists(),
@@ -1467,8 +1491,57 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(t.join("directorysizes")).unwrap(),
-            "4096 1 stuck\n"
+            "4096 1 stuck\n4096 1 gone%20dir\n"
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn empty_trash_never_writes_through_a_directorysizes_link() {
+        let root = scratch("dirsizes");
+        let t = root.join("trash");
+        fs::create_dir_all(t.join("files/d")).unwrap();
+        fs::create_dir_all(t.join("info")).unwrap();
+        fs::write(t.join("info/d.trashinfo"), "i").unwrap();
+        fs::write(root.join("victim"), "4096 1 d\n4096 1 keep\n").unwrap();
+        std::os::unix::fs::symlink(root.join("victim"), t.join("directorysizes")).unwrap();
+        let files = t.join("files");
+        let mut job = Job::new(JobKind::Delete, &files, names(&["d"]), &files);
+        job.empty_trash = true;
+        let _ = run(&job, &env(&root), &Cancel::new(), &mut |_| {});
+        assert_eq!(
+            fs::read_to_string(root.join("victim")).unwrap(),
+            "4096 1 d\n4096 1 keep\n"
+        );
+        assert!(
+            t.join("directorysizes").is_symlink(),
+            "refused, not followed"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_volume_trash_counts_only_under_a_real_sticky_dot_trash() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = rustix::process::getuid().as_raw().to_string();
+        let root = scratch("sticky");
+        let home_trash = root.join("home-trash");
+        let make = |top: &Path| {
+            let t = top.join(".Trash").join(&uid);
+            fs::create_dir_all(t.join("info")).unwrap();
+            t
+        };
+        let real = make(&root.join("ok"));
+        assert!(open_trash(&real, &home_trash).is_none(), "not sticky");
+        fs::set_permissions(root.join("ok/.Trash"), fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(open_trash(&real, &home_trash).is_some());
+        fs::create_dir_all(root.join("ln")).unwrap();
+        std::os::unix::fs::symlink(root.join("ok/.Trash"), root.join("ln/.Trash")).unwrap();
+        assert!(open_trash(&root.join("ln/.Trash").join(&uid), &home_trash).is_none());
+        let dash = root.join("vol").join(format!(".Trash-{uid}"));
+        fs::create_dir_all(root.join("vol")).unwrap();
+        std::os::unix::fs::symlink(&real, &dash).unwrap();
+        assert!(open_trash(&dash, &home_trash).is_none(), "symlinked trash");
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -1470,7 +1470,7 @@ pub fn open_volume_trash(top: &DirFd) -> Result<DirFd> {
     Ok(root)
 }
 
-fn open_sticky_trash(top: &DirFd) -> Result<Option<DirFd>> {
+pub(crate) fn open_sticky_trash(top: &DirFd) -> Result<Option<DirFd>> {
     let name = std::ffi::OsStr::new(".Trash");
     match top.open_dir_nofollow(name) {
         Ok(dir) => {
@@ -1661,6 +1661,13 @@ pub fn restore_across(
     dest_parent: &DirFd,
     name: &std::ffi::OsStr,
 ) -> Result<()> {
+    // Hard links can't cross drives; say so instead of splitting them.
+    if has_hard_links(files, stored)? {
+        return Err(Error::Message(format!(
+            "{} has hard links that can't be kept on another drive, left it in the trash",
+            name.to_string_lossy()
+        )));
+    }
     let tmp = std::ffi::OsString::from(partial_name());
     let placed = (|| -> Result<()> {
         let cancel = Cancel::new();
@@ -1716,14 +1723,33 @@ pub fn restore_across(
     // Both copies exist now; a failure here leaves a duplicate, never a loss.
     remove_child(files, stored, &mut |_| {}, &Cancel::new()).map_err(|e| {
         Error::Message(format!(
-            "restored {}, but the trashed copy stayed: {e}",
+            "restored {}, but removing it from the trash failed partway, so the trash copy may be incomplete: {e}",
             name.to_string_lossy()
         ))
     })?;
     forget_trashinfo(info_dir, stored)
 }
 
-/// Same kinds, sizes, bytes and link targets all the way down.
+/// Whether any file under `name` has other hard links. A copy to
+/// another drive can't keep them, so the restore refuses rather than
+/// quietly turning one file into several.
+fn has_hard_links(dir: &DirFd, name: &std::ffi::OsStr) -> Result<bool> {
+    let c = component(name)?;
+    let st = rustix::fs::statat(dir.as_fd(), c.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| Error::from_errno(name, e))?;
+    if is_dir(st.st_mode) {
+        let sub = dir.open_dir_nofollow(name)?;
+        for e in sub.list()? {
+            if has_hard_links(&sub, &e.name)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    Ok(!is_lnk(st.st_mode) && st.st_nlink > 1)
+}
+
+/// Same kinds, modes, sizes, bytes and link targets all the way down.
 fn same_tree(
     a_dir: &DirFd,
     a: &std::ffi::OsStr,
@@ -1737,6 +1763,10 @@ fn same_tree(
         .map_err(|e| Error::from_errno(b, e))?;
     let ifmt = libc::S_IFMT;
     if sa.st_mode & ifmt != sb.st_mode & ifmt {
+        return Ok(false);
+    }
+    // Permission bits too (not on links, whose mode means nothing).
+    if !is_lnk(sa.st_mode) && sa.st_mode & 0o7777 != sb.st_mode & 0o7777 {
         return Ok(false);
     }
     if is_dir(sa.st_mode) {
@@ -1791,6 +1821,74 @@ fn same_tree(
 }
 
 /// Remove `info/<stored>.trashinfo` once its item has left the trash.
+/// Read a small file in `dir` without following a symlink; None when
+/// it doesn't exist.
+pub(crate) fn read_small(dir: &DirFd, name: &std::ffi::OsStr) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let c = component(name)?;
+    let fd = match rustix::fs::openat(
+        dir.as_fd(),
+        c.as_c_str(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(Error::from_errno(name, e)),
+    };
+    let mut out = Vec::new();
+    File::from(fd)
+        .read_to_end(&mut out)
+        .map_err(|e| Error::io(std::path::Path::new(name), e))?;
+    Ok(Some(out))
+}
+
+/// Unlink a file in `dir`; already gone is fine.
+pub(crate) fn unlink_child(dir: &DirFd, name: &std::ffi::OsStr) -> Result<()> {
+    let c = component(name)?;
+    match rustix::fs::unlinkat(dir.as_fd(), c.as_c_str(), AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(e) => Err(Error::from_errno(name, e)),
+    }
+}
+
+/// Replace `name` in `dir` with `bytes` atomically: a uniquely named
+/// temp created O_EXCL|O_NOFOLLOW, written and fsynced, then renamed
+/// over the old file and the folder fsynced. A crash leaves the old
+/// file or the new one, never half of either.
+pub(crate) fn replace_file(dir: &DirFd, name: &std::ffi::OsStr, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let tmp = std::ffi::OsString::from(partial_name());
+    let tmp_c = component(&tmp)?;
+    let fd = rustix::fs::openat(
+        dir.as_fd(),
+        tmp_c.as_c_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|e| Error::from_errno(&tmp, e))?;
+    let mut file = File::from(fd);
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| Error::io(std::path::Path::new(name), e))
+        .and_then(|()| {
+            let name_c = component(name)?;
+            rustix::fs::renameat(
+                dir.as_fd(),
+                tmp_c.as_c_str(),
+                dir.as_fd(),
+                name_c.as_c_str(),
+            )
+            .map_err(|e| Error::from_errno(name, e))
+        });
+    if written.is_err() {
+        let _ = rustix::fs::unlinkat(dir.as_fd(), tmp_c.as_c_str(), AtFlags::empty());
+    }
+    written?;
+    rustix::fs::fsync(dir.as_fd()).map_err(|e| Error::from_errno(name, e))
+}
+
 pub fn forget_trashinfo(info_dir: &DirFd, stored: &std::ffi::OsStr) -> Result<()> {
     let mut info = stored.to_os_string();
     info.push(".trashinfo");
@@ -2347,7 +2445,7 @@ fn partial_name() -> String {
     format!(".robin-partial-{}-{n}-{jitter:08x}", std::process::id())
 }
 
-fn component(name: &std::ffi::OsStr) -> Result<std::ffi::CString> {
+pub(crate) fn component(name: &std::ffi::OsStr) -> Result<std::ffi::CString> {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.contains(&b'/') || bytes == b"." || bytes == b".." {
         return Err(Error::InvalidName);
@@ -2521,6 +2619,66 @@ mod tests {
         assert!(same_tree(&files, "album".as_ref(), &back, "album".as_ref()).unwrap());
         std::fs::write(root.join("back/album/sub/b"), "bed").unwrap();
         assert!(!same_tree(&files, "album".as_ref(), &back, "album".as_ref()).unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn same_tree_notices_a_changed_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, files, _info, back) = across_fixture("same-mode");
+        copy_tree_for_test(&root);
+        assert!(same_tree(&files, "album".as_ref(), &back, "album".as_ref()).unwrap());
+        std::fs::set_permissions(
+            root.join("back/album/sub/b"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(!same_tree(&files, "album".as_ref(), &back, "album".as_ref()).unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn copy_tree_for_test(root: &std::path::Path) {
+        let ok = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(root.join("trash/files/album"))
+            .arg(root.join("back/album"))
+            .status()
+            .unwrap();
+        assert!(ok.success());
+    }
+
+    #[test]
+    fn restore_across_refuses_to_split_hard_links() {
+        let (root, files, info, back) = across_fixture("hardlink");
+        std::fs::hard_link(root.join("trash/files/album/sub/b"), root.join("elsewhere")).unwrap();
+        let err =
+            restore_across(&files, &info, "album".as_ref(), &back, "album".as_ref()).unwrap_err();
+        assert!(err.to_string().contains("hard links"), "{err}");
+        assert!(root.join("trash/files/album/sub/b").exists());
+        assert!(root.join("trash/info/album.trashinfo").exists());
+        assert_eq!(std::fs::read_dir(root.join("back")).unwrap().count(), 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restore_across_warns_when_the_trash_copy_is_left_partial() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, files, info, back) = across_fixture("partial");
+        let sub = root.join("trash/files/album/sub");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err =
+            restore_across(&files, &info, "album".as_ref(), &back, "album".as_ref()).unwrap_err();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            err.to_string().contains("trash copy may be incomplete"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("back/album/sub/b")).unwrap(),
+            "bee"
+        );
+        let copied = root.join("back/album/sub");
+        std::fs::set_permissions(&copied, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
 
