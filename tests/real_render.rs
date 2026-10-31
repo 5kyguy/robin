@@ -44,6 +44,8 @@ fn scripted_views_render_through_the_real_app() {
         ("view-wake", 900),
         ("view-strip-video", 900),
         ("stats-real", 1100),
+        ("stats-scanning", 1100),
+        ("stats-scanning-first", 1100),
     ];
     for (view, width) in scenes {
         let out = dir.join(format!("{view}-{width}.png"));

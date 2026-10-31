@@ -1675,6 +1675,10 @@ struct State {
     stats: Option<crate::stats::Report>,
     stats_gen: u64,
     stats_at: i64,
+    /// The scan in flight, if any: a second open reuses it instead of
+    /// starting another walk.
+    stats_scan: Option<crate::stats::ScanCtl>,
+    stats_tick: Option<slint::Timer>,
     /// statvfs with a timeout, shared by every side job.
     probe: Arc<crate::sidebar::SpaceProbe>,
     /// Where view settings are remembered, and what was last written.
@@ -1816,25 +1820,51 @@ fn clear_thumbs(ui: &AppWindow, st: &Shared, cache: PathBuf) {
 }
 
 /// Open the Statistics view and (re)scan on a worker: a home walk can
-/// take seconds. The last report shows meanwhile.
+/// take seconds. The last report shows meanwhile, dimmed. A scan already
+/// running is reused, never doubled.
 fn open_stats(ui: &AppWindow, st: &Shared) {
     ui.set_stats_mode("overview".into());
     let job = {
         let mut s = st.borrow_mut();
-        s.stats_gen += 1;
-        match &s.stats {
-            Some(r) => show_stats(
+        if let Some(r) = &s.stats {
+            show_stats(
                 ui,
                 r,
                 &scanned_line(&s.ctl, s.stats_at, true),
                 s.ctl.listing.show_hidden(),
-            ),
-            None => ui.set_stat_scanned("Scanning…".into()),
+            );
+        }
+        ui.set_stat_has_results(s.stats.is_some());
+        if s.stats_scan.is_some() {
+            ui.set_stat_scanning(true);
+            return;
         }
         let Some(home) = s.ctl.env.home.clone() else {
+            ui.set_stat_scanning(false);
             ui.set_stat_scanned("No home folder to scan".into());
             return;
         };
+        s.stats_gen += 1;
+        let ctl = crate::stats::ScanCtl::default();
+        s.stats_scan = Some(ctl.clone());
+        ui.set_stat_scanning(true);
+        ui.set_stat_scan_count("0".into());
+        if !SCRIPTED.with(|c| c.get()) {
+            let timer = slint::Timer::default();
+            let weak = ui.as_weak();
+            let files = ctl.files.clone();
+            timer.start(
+                slint::TimerMode::Repeated,
+                std::time::Duration::from_millis(200),
+                move || {
+                    if let Some(ui) = weak.upgrade() {
+                        let n = files.load(std::sync::atomic::Ordering::Relaxed);
+                        ui.set_stat_scan_count(crate::stats::group_digits(n).into());
+                    }
+                },
+            );
+            s.stats_tick = Some(timer);
+        }
         (
             s.stats_gen,
             crate::stats::StatsJob {
@@ -1842,6 +1872,7 @@ fn open_stats(ui: &AppWindow, st: &Shared) {
                 home,
                 trash: s.ctl.env.home_trash.clone(),
                 mounts: s.ctl.mounts.clone(),
+                ctl,
             },
         )
     };
@@ -1858,12 +1889,37 @@ fn open_stats(ui: &AppWindow, st: &Shared) {
     });
 }
 
+/// Stop the running scan. Its report lands marked cancelled and is
+/// dropped; the last full one stays.
+fn cancel_stats(st: &Shared) {
+    if let Some(ctl) = &st.borrow().stats_scan {
+        ctl.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn stats_landed(ui: &AppWindow, st: &Shared, gen: u64, report: crate::stats::Report) {
     let mut s = st.borrow_mut();
     if gen != s.stats_gen {
         return;
     }
+    s.stats_scan = None;
+    s.stats_tick = None;
+    ui.set_stat_scanning(false);
+    if report.home.cancelled {
+        ui.set_stat_has_results(s.stats.is_some());
+        match &s.stats {
+            Some(r) => show_stats(
+                ui,
+                r,
+                &scanned_line(&s.ctl, s.stats_at, false),
+                s.ctl.listing.show_hidden(),
+            ),
+            None => ui.set_stat_scanned("Scan cancelled · Rescan".into()),
+        }
+        return;
+    }
     s.stats_at = ctl_now(&s.ctl);
+    ui.set_stat_has_results(true);
     if ui.get_stats_mode() != "" {
         show_stats(
             ui,
@@ -1875,9 +1931,41 @@ fn stats_landed(ui: &AppWindow, st: &Shared, gen: u64, report: crate::stats::Rep
     s.stats = Some(report);
 }
 
+/// The muted line under the treemap title and its tooltip, or empty when
+/// nothing was left out.
+pub fn skipped_line(scan: &crate::stats::Scan) -> (String, String) {
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let mut parts = Vec::new();
+    let mut tip = Vec::new();
+    if !scan.skipped.is_empty() {
+        parts.push(plural(scan.skipped.len(), "folder", "folders") + " skipped (no access)");
+        tip.push("Skipped (no access):".to_string());
+        tip.extend(scan.skipped.iter().map(|p| format!("  {}", p.display())));
+    }
+    if !scan.other_drives.is_empty() {
+        parts.push(plural(scan.other_drives.len(), "other drive", "other drives") + " not counted");
+        tip.push("Other drives, not counted:".to_string());
+        tip.extend(
+            scan.other_drives
+                .iter()
+                .map(|p| format!("  {}", p.display())),
+        );
+    }
+    (parts.join(" · "), tip.join("\n"))
+}
+
 /// Fill the Statistics view from a report. `stale` marks a rescan running.
 pub fn show_stats(ui: &AppWindow, r: &crate::stats::Report, scanned: &str, hidden: bool) {
     use crate::stats::UsageLevel;
+    let (skipped, tip) = skipped_line(&r.home);
+    ui.set_stat_skipped(skipped.into());
+    ui.set_stat_skipped_tip(tip.into());
     let disks: Vec<crate::StatDisk> = r
         .disks
         .iter()
@@ -2232,6 +2320,8 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         stats: None,
         stats_gen: 0,
         stats_at: 0,
+        stats_scan: None,
+        stats_tick: None,
         probe: crate::sidebar::SpaceProbe::new(std::time::Duration::from_millis(400)),
         prefs_saved: std::cell::Cell::new(saved.unwrap_or_else(crate::prefs::ViewPrefs::fresh)),
         prefs_path: launch.prefs,
@@ -2443,6 +2533,10 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         }
     });
     let (w_sr, st_sr) = (ui.as_weak(), state.clone());
+    {
+        let st = state.clone();
+        ui.on_stats_cancel(move || cancel_stats(&st));
+    }
     ui.on_stats_rescan(move || {
         if let Some(ui) = w_sr.upgrade() {
             open_stats(&ui, &st_sr);
@@ -4964,6 +5058,23 @@ mod tests {
         assert_eq!(names, vec![OsString::from("a.jpg")]);
         assert!(matches!(c.remove(false), Action::Open(Dialog::Delete(_))));
         let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn the_skipped_line_counts_both_kinds_and_lists_paths_in_the_tip() {
+        let mut scan = crate::stats::Scan::default();
+        assert_eq!(skipped_line(&scan), (String::new(), String::new()));
+        scan.skipped = vec!["/h/a".into(), "/h/b".into(), "/h/c".into()];
+        scan.other_drives = vec!["/h/mnt".into(), "/h/ssd".into()];
+        let (line, tip) = skipped_line(&scan);
+        assert_eq!(
+            line,
+            "3 folders skipped (no access) · 2 other drives not counted"
+        );
+        assert!(tip.contains("/h/b") && tip.contains("/h/ssd"));
+        scan.skipped.truncate(1);
+        scan.other_drives.clear();
+        assert_eq!(skipped_line(&scan).0, "1 folder skipped (no access)");
     }
 
     #[test]

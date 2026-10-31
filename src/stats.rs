@@ -242,69 +242,147 @@ pub struct Scan {
     pub top: Vec<(String, u64)>,
     /// (files, bytes) per kind, in `KINDS` order.
     pub kinds: [(u64, u64); 7],
+    /// Folders that could not be opened or read; their contents are not
+    /// counted.
+    pub skipped: Vec<PathBuf>,
+    /// Mount points under the root on another filesystem, not descended.
+    pub other_drives: Vec<PathBuf>,
+    /// The scan was cancelled before it finished; totals are partial.
+    pub cancelled: bool,
+}
+
+/// Shared with a running scan: a cancel flag the UI sets and a live file
+/// count the UI reads.
+#[derive(Clone, Debug, Default)]
+pub struct ScanCtl {
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub files: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ScanCtl {
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 pub fn scan_dir(root: &Path, largest_limit: usize) -> Result<Scan> {
+    scan_dir_with(root, largest_limit, &ScanCtl::default())
+}
+
+/// Walk `root` on its own filesystem: other mounts are noted, not entered;
+/// symlinks are not followed; a hardlinked file counts once; sizes are
+/// allocated blocks; an unreadable folder is noted and skipped. `ctl` can
+/// stop the walk early.
+pub fn scan_dir_with(root: &Path, largest_limit: usize, ctl: &ScanCtl) -> Result<Scan> {
     let dir = DirFd::open(root)?;
-    let mut scan = Scan::default();
-    for entry in dir.list()? {
-        if entry.is_symlink {
+    let mut w = Walker {
+        dev: dir.dev()?,
+        limit: largest_limit,
+        ctl,
+        seen: std::collections::HashSet::new(),
+        heap: std::collections::BinaryHeap::new(),
+        scan: Scan::default(),
+    };
+    let entries = dir.list()?;
+    for entry in entries {
+        let before = w.scan.total_bytes;
+        if !w.entry(&dir, root, &entry) {
             continue;
         }
-        let before = scan.total_bytes;
-        if entry.is_dir {
-            if let Ok(child) = dir.open_dir_nofollow(&entry.name) {
-                walk(&child, &root.join(&entry.name), &mut scan, largest_limit)?;
-                let used = scan.total_bytes - before;
-                scan.children
-                    .push((entry.name.to_string_lossy().into_owned(), used));
-            }
-        } else {
-            file(&mut scan, root, &entry, largest_limit);
-        }
-        scan.top.push((
+        w.scan.top.push((
             entry.name.to_string_lossy().into_owned(),
-            scan.total_bytes - before,
+            w.scan.total_bytes - before,
         ));
     }
+    let mut scan = w.scan;
+    scan.cancelled = ctl.cancelled();
+    scan.largest = w
+        .heap
+        .into_sorted_vec()
+        .into_iter()
+        .map(|std::cmp::Reverse((n, p))| (p, n))
+        .collect();
     scan.top.sort_by_key(|item| std::cmp::Reverse(item.1));
     scan.children.sort_by_key(|item| std::cmp::Reverse(item.1));
-    scan.largest.sort_by_key(|item| std::cmp::Reverse(item.1));
-    scan.largest.truncate(largest_limit);
     Ok(scan)
 }
 
-fn walk(dir: &DirFd, path: &Path, scan: &mut Scan, limit: usize) -> Result<()> {
-    for entry in dir.list()? {
-        if entry.is_symlink {
-            continue;
-        }
-        if entry.is_dir {
-            if let Ok(child) = dir.open_dir_nofollow(&entry.name) {
-                let child_path = path.join(&entry.name);
-                let before = scan.total_bytes;
-                walk(&child, &child_path, scan, limit)?;
-                let used = scan.total_bytes - before;
-                scan.children
-                    .push((entry.name.to_string_lossy().into_owned(), used));
-            }
-        } else {
-            file(scan, path, &entry, limit);
-        }
-    }
-    Ok(())
+struct Walker<'a> {
+    dev: u64,
+    limit: usize,
+    ctl: &'a ScanCtl,
+    seen: std::collections::HashSet<(u64, u64)>,
+    /// Min-heap of the `limit` largest files: the smallest is popped when a
+    /// bigger one arrives.
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, PathBuf)>>,
+    scan: Scan,
 }
 
-fn file(scan: &mut Scan, path: &Path, entry: &crate::safety::Dirent, limit: usize) {
-    scan.total_bytes += entry.len;
-    scan.file_count += 1;
-    let k = &mut scan.kinds[Kind::of(&entry.name).index()];
-    k.0 += 1;
-    k.1 += entry.len;
-    if scan.largest.len() < limit || scan.largest.last().is_some_and(|(_, n)| entry.len > *n) {
-        scan.largest.push((path.join(&entry.name), entry.len));
-        scan.largest.sort_by_key(|item| std::cmp::Reverse(item.1));
-        scan.largest.truncate(limit);
+impl Walker<'_> {
+    /// Count one entry of `dir` (at `path`). False when it is not counted
+    /// at all (symlink, other drive, cancelled).
+    fn entry(&mut self, dir: &DirFd, path: &Path, entry: &crate::safety::Dirent) -> bool {
+        if entry.is_symlink || self.ctl.cancelled() {
+            return false;
+        }
+        if entry.dev != self.dev {
+            self.scan.other_drives.push(path.join(&entry.name));
+            return false;
+        }
+        if entry.is_dir {
+            let child_path = path.join(&entry.name);
+            let before = self.scan.total_bytes;
+            match dir.open_dir_nofollow(&entry.name) {
+                Ok(child) => self.walk(&child, &child_path),
+                Err(_) => self.scan.skipped.push(child_path),
+            }
+            let used = self.scan.total_bytes - before;
+            self.scan
+                .children
+                .push((entry.name.to_string_lossy().into_owned(), used));
+        } else {
+            self.file(path, entry);
+        }
+        true
+    }
+
+    fn walk(&mut self, dir: &DirFd, path: &Path) {
+        match dir.list() {
+            Ok(entries) => {
+                for entry in entries {
+                    self.entry(dir, path, &entry);
+                }
+            }
+            // A read error partway through: skip this folder, keep going.
+            Err(_) => self.scan.skipped.push(path.to_path_buf()),
+        }
+    }
+
+    fn file(&mut self, path: &Path, entry: &crate::safety::Dirent) {
+        if entry.nlink > 1 && !self.seen.insert((entry.dev, entry.ino)) {
+            return;
+        }
+        let size = entry.allocated;
+        let scan = &mut self.scan;
+        scan.total_bytes += size;
+        scan.file_count += 1;
+        self.ctl
+            .files
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let k = &mut scan.kinds[Kind::of(&entry.name).index()];
+        k.0 += 1;
+        k.1 += size;
+        if self.limit == 0 {
+            return;
+        }
+        if self.heap.len() < self.limit {
+            self.heap
+                .push(std::cmp::Reverse((size, path.join(&entry.name))));
+        } else if self.heap.peek().is_some_and(|m| size > m.0 .0) {
+            self.heap.pop();
+            self.heap
+                .push(std::cmp::Reverse((size, path.join(&entry.name))));
+        }
     }
 }
 
@@ -377,13 +455,14 @@ pub struct StatsJob {
     pub trash: PathBuf,
     pub cache: PathBuf,
     pub mounts: std::sync::Arc<dyn crate::mounts::MountSource>,
+    pub ctl: ScanCtl,
 }
 
 impl StatsJob {
     pub fn perform(self) -> Report {
-        let home = scan_dir(&self.home, 0).unwrap_or_default();
-        let trash = scan_dir(&self.trash.join("files"), 0).unwrap_or_default();
-        let cache = scan_dir(&self.cache, 0).unwrap_or_default();
+        let home = scan_dir_with(&self.home, 0, &self.ctl).unwrap_or_default();
+        let trash = scan_dir_with(&self.trash.join("files"), 0, &self.ctl).unwrap_or_default();
+        let cache = scan_dir_with(&self.cache, 0, &self.ctl).unwrap_or_default();
         let cache_parts = ["thumbnails", "mpv", "robin"]
             .iter()
             .filter_map(|name| {
@@ -514,8 +593,8 @@ mod tests {
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(p, vec![0u8; n]).unwrap();
         };
-        w("home/Videos/a.mp4", 700);
-        w("home/Videos/deep/b.MKV", 300);
+        w("home/Videos/a.mp4", 700_000);
+        w("home/Videos/deep/b.MKV", 300_000);
         w("home/Pictures/c.jpg", 200);
         w("home/notes.md", 40);
         w("home/.cache/thumbnails/normal/t.png", 30);
@@ -530,21 +609,36 @@ mod tests {
             cache: home.join(".cache"),
             home: home.clone(),
             mounts: std::sync::Arc::new(OneDisk),
+            ctl: ScanCtl::default(),
         }
         .perform();
-        assert_eq!(r.home.top[0], ("Videos".into(), 1000));
-        assert_eq!(r.home.kinds[0], (2, 1000), "mp4 and MKV are video");
+        // Sizes are allocated blocks, so expectations come from the disk.
+        let a = |rel: &str| alloc(&home.join(rel));
+        let videos = a("Videos/a.mp4") + a("Videos/deep/b.MKV");
+        let top = r.home.top.iter().find(|t| t.0 == "Videos").unwrap();
+        assert_eq!(top.1, videos);
+        assert_eq!(r.home.kinds[0], (2, videos), "mp4 and MKV are video");
         assert_eq!(
             r.home.kinds[1],
-            (2, 230),
+            (2, a("Pictures/c.jpg") + a(".cache/thumbnails/normal/t.png")),
             "the cached thumbnail is an image too"
         );
-        assert_eq!(r.trash_bytes, 20);
+        let t = ".local/share/Trash/files/";
+        assert_eq!(
+            r.trash_bytes,
+            a(&format!("{t}old.txt")) + a(&format!("{t}dir/x"))
+        );
         assert_eq!(r.trash_items, 2, "top-level trashed items, not files");
-        assert_eq!(r.cache_bytes, 55);
+        assert_eq!(
+            r.cache_bytes,
+            a(".cache/thumbnails/normal/t.png") + a(".cache/mpv/w") + a(".cache/other/z")
+        );
         assert_eq!(
             r.cache_parts,
-            vec![("thumbnails".into(), 30), ("mpv".into(), 20)]
+            vec![
+                ("thumbnails".into(), a(".cache/thumbnails/normal/t.png")),
+                ("mpv".into(), a(".cache/mpv/w"))
+            ]
         );
         let names: Vec<_> = r.disks.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
@@ -582,8 +676,104 @@ mod tests {
         std::os::unix::fs::symlink(root.join("big.bin"), root.join("link")).unwrap();
         let scan = scan_dir(&root, 5).unwrap();
         assert_eq!(scan.file_count, 2);
-        assert_eq!(scan.total_bytes, 130);
-        assert_eq!(scan.largest[0].1, 80);
+        assert_eq!(
+            scan.total_bytes,
+            alloc(&root.join("docs/a.txt")) + alloc(&root.join("big.bin"))
+        );
+        assert_eq!(scan.largest[0].1, alloc(&root.join("big.bin")));
+        // A symlinked folder is not entered either.
+        std::os::unix::fs::symlink(root.join("docs"), root.join("docs-link")).unwrap();
+        assert_eq!(scan_dir(&root, 5).unwrap().file_count, 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn alloc(p: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(p).unwrap().blocks() * 512
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("robin-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn hardlinks_count_once_and_sparse_files_count_what_they_use() {
+        let root = tmp("links");
+        fs::write(root.join("a"), vec![1u8; 64 * 1024]).unwrap();
+        fs::hard_link(root.join("a"), root.join("b")).unwrap();
+        let sparse = fs::File::create(root.join("sparse")).unwrap();
+        sparse.set_len(1 << 30).unwrap();
+        let scan = scan_dir(&root, 5).unwrap();
+        assert_eq!(scan.file_count, 2, "a and b are one file");
+        assert_eq!(
+            scan.total_bytes,
+            alloc(&root.join("a")) + alloc(&root.join("sparse"))
+        );
+        assert!(scan.total_bytes < 1 << 20, "the 1 GiB hole is not counted");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unreadable_folder_is_noted_and_the_scan_goes_on() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp("noaccess");
+        fs::create_dir_all(root.join("locked")).unwrap();
+        fs::write(root.join("locked/x"), b"x").unwrap();
+        fs::write(root.join("ok"), b"ok").unwrap();
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let scan = scan_dir(&root, 5).unwrap();
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        // root ignores permissions; only assert the skip when it applies.
+        if fs::read_dir(root.join("locked")).is_err() || scan.skipped.len() == 1 {
+            assert_eq!(scan.skipped, vec![root.join("locked")]);
+            assert_eq!(scan.file_count, 1);
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn another_filesystem_is_noted_not_entered() {
+        // Mounting needs privileges, so pose as a walk that started on
+        // another device: everything here then looks like a crossing.
+        let ctl = ScanCtl::default();
+        let mut w = Walker {
+            dev: u64::MAX,
+            limit: 0,
+            ctl: &ctl,
+            seen: Default::default(),
+            heap: Default::default(),
+            scan: Scan::default(),
+        };
+        let root = tmp("mount");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/f"), b"f").unwrap();
+        let dir = DirFd::open(&root).unwrap();
+        for e in dir.list().unwrap() {
+            w.entry(&dir, &root, &e);
+        }
+        assert_eq!(w.scan.other_drives, vec![root.join("sub")]);
+        assert_eq!(w.scan.file_count, 0, "nothing past the mount is counted");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cancelled_scan_stops_and_says_so() {
+        let root = tmp("cancel");
+        for i in 0..20 {
+            fs::write(root.join(format!("f{i}")), b"x").unwrap();
+        }
+        let ctl = ScanCtl::default();
+        ctl.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let scan = scan_dir_with(&root, 5, &ctl).unwrap();
+        assert!(scan.cancelled);
+        assert_eq!(scan.file_count, 0);
+        let live = ScanCtl::default();
+        let done = scan_dir_with(&root, 3, &live).unwrap();
+        assert_eq!(live.files.load(std::sync::atomic::Ordering::Relaxed), 20);
+        assert_eq!(done.largest.len(), 3, "the heap keeps only the limit");
         let _ = fs::remove_dir_all(&root);
     }
 }

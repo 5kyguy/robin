@@ -51,6 +51,8 @@ pub fn scripted(view: &str) -> bool {
             | "view-wake"
             | "view-strip-video"
             | "stats-real"
+            | "stats-scanning"
+            | "stats-scanning-first"
     )
 }
 
@@ -180,7 +182,7 @@ fn paint_in(
         crate::fixture::freeze_times(root, FIXTURE_MTIME)?;
     }
     let mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(root))?;
-    if view == "stats-real" {
+    if view.starts_with("stats-") {
         seed_cache(home)?;
     }
     let mut env = crate::ops::Env::for_home(home);
@@ -297,6 +299,20 @@ fn paint_in(
         "stats-real" => {
             ui.invoke_stats_open();
             app::land_reads();
+        }
+        // A rescan in flight over the last results, dimmed; a second open
+        // reuses it.
+        "stats-scanning" => {
+            ui.invoke_stats_open();
+            app::land_reads();
+            ui.invoke_stats_rescan();
+            ui.invoke_stats_open();
+            ui.set_stat_scan_count("12 480".into());
+        }
+        // The first scan, nothing to show yet.
+        "stats-scanning-first" => {
+            ui.invoke_stats_open();
+            ui.set_stat_scan_count("3 211".into());
         }
         // Select the item with no trashinfo; the banner explains it.
         "trash-noinfo" => select_row(&ui, "mystery.bin"),

@@ -358,6 +358,16 @@ fn mock_report() -> crate::stats::Report {
                 (9_870, 31 * GB),
                 (21_400, 128 * GB),
             ],
+            skipped: [
+                "/home/sky/.local/share/containers",
+                "/home/sky/Vault",
+                "/home/sky/.gnupg",
+            ]
+            .map(std::path::PathBuf::from)
+            .to_vec(),
+            other_drives: ["/home/sky/mnt/archive", "/home/sky/Games/ssd"]
+                .map(std::path::PathBuf::from)
+                .to_vec(),
             ..Default::default()
         },
         trash_bytes: 4_700_000_000,

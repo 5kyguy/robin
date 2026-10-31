@@ -726,6 +726,12 @@ export component AppWindow inherits Window {
     in property <[StatDisk]> stat-disks;
     in property <[StatType]> stat-types;
     in property <string> stat-scanned: "";
+    in property <bool> stat-scanning: false;
+    in property <bool> stat-has-results: true;
+    in property <string> stat-scan-count: "";
+    in property <string> stat-skipped: "";
+    in property <string> stat-skipped-tip: "";
+    callback stats-cancel();
     in property <string> stat-tree-title: "LARGEST FOLDERS";
     in property <string> stat-cache-total: "";
     in property <string> stat-cache-detail: "";
@@ -2612,7 +2618,32 @@ export component AppWindow inherits Window {
             color: muted;
             horizontal-alignment: right;
             vertical-alignment: center;
+            visible: !stat-scanning;
             TouchArea { clicked => { root.stats-rescan(); } }
+        }
+        if stat-scanning: Rectangle {
+            x: parent.width - pad - 320px;
+            y: 14px;
+            width: 320px;
+            height: 24px;
+            Text {
+                text: "Scanning… " + stat-scan-count + " files";
+                width: parent.width - 28px;
+                height: parent.height;
+                font-size: 11px;
+                color: muted;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                x: parent.width - 20px;
+                width: 20px;
+                height: parent.height;
+                border-radius: 4px;
+                background: cancel-touch.has-hover ? hairline : transparent;
+                Text { text: "×"; font-size: 13px; color: muted; horizontal-alignment: center; vertical-alignment: center; }
+                cancel-touch := TouchArea { clicked => { root.stats-cancel(); } }
+            }
         }
         Rectangle {
             x: pad;
@@ -2651,10 +2682,11 @@ export component AppWindow inherits Window {
             y: mid-y;
             width: tree-w;
             height: mid-h;
-            background: surface;
+            background: stat-has-results ? surface : transparent;
             border-radius: 10px;
             border-width: 1px;
             border-color: hairline;
+            if stat-scanning && !stat-has-results: Text { text: "Scanning…"; width: parent.width; height: parent.height; font-size: 12px; color: muted; horizontal-alignment: center; vertical-alignment: center; }
             Text {
                 text: stat-tree-title;
                 x: 16px;
@@ -2666,12 +2698,34 @@ export component AppWindow inherits Window {
                 letter-spacing: 1px;
                 color: muted;
             }
+            if stat-skipped != "": Text {
+                text: stat-skipped;
+                x: 16px;
+                y: 25px;
+                width: parent.width - 32px;
+                height: 14px;
+                font-size: 10px;
+                color: muted;
+                overflow: elide;
+                skipped-touch := TouchArea { }
+                if skipped-touch.has-hover: Rectangle {
+                    y: 16px;
+                    z: 10;
+                    width: min(420px, parent.width);
+                    height: tip-text.preferred-height + 12px;
+                    background: root.bg;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: hairline;
+                    tip-text := Text { x: 8px; y: 6px; width: parent.width - 16px; text: stat-skipped-tip; font-size: 11px; color: text; wrap: word-wrap; }
+                }
+            }
             Rectangle {
                 x: 16px;
                 y: 40px;
                 width: map-w;
                 height: map-h;
-                background: surface;
+                background: stat-has-results ? surface : transparent;
                 for cell in map-cells: Rectangle {
                     x: cell.x;
                     y: cell.y;
@@ -2711,35 +2765,40 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+            if stat-scanning && stat-has-results: Rectangle { width: parent.width; height: parent.height; border-radius: 10px; background: root.bg.with-alpha(0.55); TouchArea { } }
         }
         Rectangle {
             x: pad + tree-w + 12px;
             y: mid-y;
             width: parent.width - pad - tree-w - 12px - pad;
             height: mid-h;
-            background: surface;
+            background: stat-has-results ? surface : transparent;
             border-radius: 10px;
             border-width: 1px;
             border-color: hairline;
+            if stat-scanning && !stat-has-results: Text { text: "Scanning…"; width: parent.width; height: parent.height; font-size: 12px; color: muted; horizontal-alignment: center; vertical-alignment: center; }
             property <length> bw: self.width - 32px;
             Text { text: "FILE TYPES"; x: 16px; y: 10px; width: 160px; height: 18px; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; }
             for t in stat-types: Rectangle { x: 16px + bw * t.start; y: 40px; width: bw * t.share; height: 16px; background: accent.with-alpha(t.alpha); }
             for t[i] in stat-types: TypeRow { x: 16px; y: 68px + i * 24px; width: parent.width - 32px; name: t.name; count: t.count; size: t.size; ink: root.text; muted-ink: root.muted; swatch: root.accent.with-alpha(t.alpha); }
+            if stat-scanning && stat-has-results: Rectangle { width: parent.width; height: parent.height; border-radius: 10px; background: root.bg.with-alpha(0.55); TouchArea { } }
         }
         Rectangle {
             x: pad;
             y: bot-y;
             width: (parent.width - pad * 2 - 12px) / 2;
             height: 96px;
-            background: surface;
+            background: stat-has-results ? surface : transparent;
             border-radius: 10px;
             border-width: 1px;
             border-color: hairline;
+            if stat-scanning && !stat-has-results: Text { text: "Scanning…"; width: parent.width; height: parent.height; font-size: 12px; color: muted; horizontal-alignment: center; vertical-alignment: center; }
             Text { text: "CACHE"; x: 16px; y: 12px; width: 80px; height: 16px; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; }
             Text { text: stat-cache-total; x: 16px; y: 34px; width: 120px; height: 24px; font-size: 20px; font-weight: 700; color: text; }
             // Short labels, wrapping to a second line rather than cut off.
             Text { text: stat-cache-detail; x: 16px; y: 62px; width: parent.width - 32px - 188px; height: 30px; font-size: 11px; color: muted; wrap: word-wrap; overflow: elide; }
             Rectangle {
+                visible: stat-has-results;
                 x: parent.width - 16px - 180px;
                 y: 32px;
                 width: 180px;
@@ -2750,21 +2809,24 @@ export component AppWindow inherits Window {
                 Text { text: "Clear thumbnail cache"; font-size: 11px; color: text; horizontal-alignment: center; vertical-alignment: center; }
                 TouchArea { clicked => { root.stats-clear-thumbs(); } }
             }
+            if stat-scanning && stat-has-results: Rectangle { width: parent.width; height: parent.height; border-radius: 10px; background: root.bg.with-alpha(0.55); TouchArea { } }
         }
         Rectangle {
             x: pad + (parent.width - pad * 2 - 12px) / 2 + 12px;
             y: bot-y;
             width: (parent.width - pad * 2 - 12px) / 2;
             height: 96px;
-            background: surface;
+            background: stat-has-results ? surface : transparent;
             border-radius: 10px;
             border-width: 1px;
             border-color: hairline;
+            if stat-scanning && !stat-has-results: Text { text: "Scanning…"; width: parent.width; height: parent.height; font-size: 12px; color: muted; horizontal-alignment: center; vertical-alignment: center; }
             Text { text: "TRASH"; x: 16px; y: 12px; width: 80px; height: 16px; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; }
             Text { text: stat-trash-size; x: 16px; y: 34px; width: parent.width - 32px - 140px; height: 24px; font-size: 20px; font-weight: 700; color: text; }
             // Under the size, as on the cache card.
             Text { text: stat-trash-count; x: 16px; y: 62px; width: parent.width - 32px - 140px; height: 18px; font-size: 11px; color: muted; overflow: elide; }
             Rectangle {
+                visible: stat-has-results;
                 x: parent.width - 16px - 112px;
                 y: 32px;
                 width: 112px;
@@ -2779,6 +2841,7 @@ export component AppWindow inherits Window {
                 // Opens the Trash, where emptying asks to confirm.
                 trash-touch := TouchArea { clicked => { root.place-open(2, 0); } }
             }
+            if stat-scanning && stat-has-results: Rectangle { width: parent.width; height: parent.height; border-radius: 10px; background: root.bg.with-alpha(0.55); TouchArea { } }
         }
         if stats-mode == "empty-trash": Rectangle {
             x: 0px;
