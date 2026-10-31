@@ -1488,7 +1488,7 @@ fn redraw(ui: &AppWindow, s: &State) {
     let (column, desc) = ctl.sort_header();
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
-    let home = Some(ctl.env.home.clone());
+    let home = ctl.env.home.clone();
     let crumbs: Vec<String> = crate::model::breadcrumbs(ctl.crumb_dir(), home.as_deref())
         .iter()
         .map(|c| c.label.clone())
@@ -2072,7 +2072,7 @@ mod tests {
         fs::write(dir.join("a.jpg"), b"a").unwrap();
         fs::write(dir.join("b.jpg"), b"b").unwrap();
         let env = Env {
-            home: root.clone(),
+            home: Some(root.clone()),
             home_trash: root.join("trash"),
         };
         let mut c = Controller::new(dir, env);
