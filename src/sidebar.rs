@@ -95,17 +95,46 @@ impl SideGate {
     }
 }
 
-/// statvfs with a deadline. A probe still running from an earlier job is
-/// not repeated: the last answer for that mount (or none) is used, so a
-/// dead network share or a stuck drive never piles up threads.
+/// Disk calls with a deadline: statvfs for a device, and stat plus a
+/// listing for a folder's count. Any of these can hang on a dead network
+/// share or a stuck drive. A probe still running from an earlier job is
+/// not repeated: the last answer for that path (or none) is used, so a
+/// hung mount never piles up threads.
+///
+/// A timed-out thread is left to finish on its own rather than pruned:
+/// a thread blocked in the kernel can't be cancelled, and the `busy`
+/// flag already caps it at one per path. When it does return, its answer
+/// becomes the cached `last`.
 pub struct SpaceProbe {
     timeout: Duration,
-    cache: Mutex<HashMap<PathBuf, Probe>>,
+    cache: Mutex<HashMap<(Kind, PathBuf), Probe>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Kind {
+    Space,
+    Folder,
+}
+
+/// A folder as the sidebar sees it: a real directory (never a link) with
+/// its device and visible item count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderInfo {
+    pub dev: u64,
+    /// Read only when on the expected device; blank otherwise.
+    pub count: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Answer {
+    Space(Space),
+    /// `None`: missing, a link or not a folder.
+    Folder(Option<FolderInfo>),
 }
 
 #[derive(Default)]
 struct Probe {
-    last: Option<Space>,
+    last: Option<Answer>,
     busy: bool,
 }
 
@@ -117,25 +146,29 @@ impl SpaceProbe {
         })
     }
 
-    pub fn space(self: &Arc<Self>, mounts: &Arc<dyn MountSource>, path: &Path) -> Option<Space> {
+    fn timed(
+        self: &Arc<Self>,
+        key: (Kind, PathBuf),
+        work: impl FnOnce() -> Option<Answer> + Send + 'static,
+    ) -> Option<Answer> {
         {
             let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = cache.entry(path.to_path_buf()).or_default();
+            let entry = cache.entry(key.clone()).or_default();
             if entry.busy {
-                return entry.last;
+                return entry.last.clone();
             }
             entry.busy = true;
         }
         let (tx, rx) = mpsc::channel();
-        let (me, m, p) = (self.clone(), mounts.clone(), path.to_path_buf());
+        let (me, k) = (self.clone(), key.clone());
         std::thread::spawn(move || {
-            let got = m.space(&p).ok();
+            let got = work();
             {
                 let mut cache = me.cache.lock().unwrap_or_else(|e| e.into_inner());
-                let entry = cache.entry(p).or_default();
+                let entry = cache.entry(k).or_default();
                 entry.busy = false;
                 if got.is_some() {
-                    entry.last = got;
+                    entry.last = got.clone();
                 }
             }
             let _ = tx.send(got);
@@ -146,10 +179,45 @@ impl SpaceProbe {
                 .cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .get(path)
-                .and_then(|e| e.last),
+                .get(&key)
+                .and_then(|e| e.last.clone()),
         }
     }
+
+    pub fn space(self: &Arc<Self>, mounts: &Arc<dyn MountSource>, path: &Path) -> Option<Space> {
+        let m = mounts.clone();
+        let p = path.to_path_buf();
+        match self.timed((Kind::Space, path.to_path_buf()), move || {
+            m.space(&p).ok().map(Answer::Space)
+        }) {
+            Some(Answer::Space(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// `path` as a real folder, counted when it is on `dev` (or always,
+    /// with no `dev`). The outer `None` means the probe timed out with no
+    /// earlier answer, so whether it is a folder is unknown.
+    pub fn folder(self: &Arc<Self>, path: &Path, dev: Option<u64>) -> Option<Option<FolderInfo>> {
+        let p = path.to_path_buf();
+        match self.timed((Kind::Folder, path.to_path_buf()), move || {
+            Some(Answer::Folder(folder_info(&p, dev)))
+        }) {
+            Some(Answer::Folder(f)) => Some(f),
+            _ => None,
+        }
+    }
+}
+
+fn folder_info(path: &Path, dev: Option<u64>) -> Option<FolderInfo> {
+    let meta = path.symlink_metadata().ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    Some(FolderInfo {
+        dev: meta.dev(),
+        count: visible_count(path, dev),
+    })
 }
 
 /// The XDG user dirs shown under Pinned, in order, with their keys in
@@ -185,8 +253,10 @@ impl SideJob {
         let dirs = std::fs::read_to_string(config.join("user-dirs.dirs"))
             .map(|text| user_dirs(&text, home))
             .unwrap_or_default();
-        let dev = home.symlink_metadata().ok().map(|m| m.dev());
-        let mut out = vec![folder("󰋜", "Home".into(), home.to_path_buf(), dev)];
+        let home_info = self.probe.folder(home, None);
+        let dev = home_info.clone().flatten().map(|f| f.dev);
+        let count = home_info.flatten().map(|f| f.count).unwrap_or_default();
+        let mut out = vec![folder("󰋜", "Home".into(), home.to_path_buf(), count)];
         for (key, default, glyph) in XDG {
             let path = dirs
                 .iter()
@@ -194,14 +264,20 @@ impl SideJob {
                 .map(|(_, p)| p.clone())
                 .unwrap_or_else(|| home.join(default));
             // xdg-user-dirs points a disabled dir at $HOME itself.
-            if path == home || !path.is_dir() {
+            if path == home {
                 continue;
             }
+            // Only a real folder; a hung probe keeps the row, uncounted.
+            let count = match self.probe.folder(&path, dev) {
+                Some(None) => continue,
+                Some(Some(f)) => f.count,
+                None => String::new(),
+            };
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| default.to_string());
-            out.push(folder(glyph, name, path, dev));
+            out.push(folder(glyph, name, path, count));
         }
         out
     }
@@ -233,7 +309,12 @@ impl SideJob {
         SideEntry {
             glyph: "󰩺",
             name: "Trash".into(),
-            count: visible_count(&files, None),
+            count: self
+                .probe
+                .folder(&files, None)
+                .flatten()
+                .map(|f| f.count)
+                .unwrap_or_default(),
             path: files,
             usage: None,
             removable: false,
@@ -248,8 +329,7 @@ impl SideJob {
     }
 }
 
-fn folder(glyph: &'static str, name: String, path: PathBuf, home_dev: Option<u64>) -> SideEntry {
-    let count = visible_count(&path, home_dev);
+fn folder(glyph: &'static str, name: String, path: PathBuf, count: String) -> SideEntry {
     SideEntry {
         glyph,
         name,
@@ -688,6 +768,34 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[test]
+    fn a_pinned_link_or_file_is_not_a_folder() {
+        let root = std::env::temp_dir().join(format!("robin-pinlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let cfg = root.join("cfg");
+        std::fs::create_dir_all(home.join("real")).unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::os::unix::fs::symlink("real", home.join("Snaps")).unwrap();
+        std::fs::write(home.join("Tunes"), b"").unwrap();
+        std::fs::write(
+            cfg.join("user-dirs.dirs"),
+            "XDG_PICTURES_DIR=\"$HOME/Snaps\"\nXDG_MUSIC_DIR=\"$HOME/Tunes\"\n",
+        )
+        .unwrap();
+        let mut env = Env::for_home(&home);
+        env.config_home = Some(cfg);
+        let job = SideJob {
+            env,
+            mounts: Arc::new(crate::mounts::SystemMounts),
+            dir: home.clone(),
+            probe: SpaceProbe::new(Duration::from_secs(5)),
+        };
+        let names: Vec<String> = job.pinned().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["Home"], "a link and a file are skipped");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// A drive whose statvfs never returns until released.
     struct Hung {
         calls: std::sync::atomic::AtomicUsize,
@@ -727,7 +835,7 @@ mod tests {
         assert_eq!(hung.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         tx.send(()).unwrap();
         for _ in 0..100 {
-            if !probe.cache.lock().unwrap()[p].busy {
+            if !probe.cache.lock().unwrap()[&(Kind::Space, p.to_path_buf())].busy {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
