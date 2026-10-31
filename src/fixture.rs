@@ -47,6 +47,11 @@ pub fn materialize(root: &Path) -> Result<()> {
     write(root, "Pictures/dune-sunset-0412.jpg", PIXEL_PNG)?;
     write(root, "Pictures/dune-sunset-0413.jpg", PIXEL_PNG)?;
     write(root, "Pictures/r2-portrait-001.png", PIXEL_PNG)?;
+    write(root, "Pictures/raw-exports/dune-sunset-0412.dng", PIXEL_PNG)?;
+    write(root, "Pictures/raw-exports/dune-sunset-0413.dng", PIXEL_PNG)?;
+    write(root, "Pictures/raw-exports/dune-sunset-0414.dng", PIXEL_PNG)?;
+    write(root, "Pictures/tatooine-trip/mos-espa-01.jpg", PIXEL_PNG)?;
+    write(root, "Pictures/tatooine-trip/mos-espa-02.jpg", PIXEL_PNG)?;
     write(root, "Videos/speeder-run.mp4", b"not a real video\n")?;
     seed_home(root)?;
     let link = root.join("Pictures/latest");
@@ -191,6 +196,11 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+        let n = |d: &str| std::fs::read_dir(root.join(d)).unwrap().count();
+        assert_eq!(
+            (n("Pictures/raw-exports"), n("Pictures/tatooine-trip")),
+            (3, 2)
+        );
         freeze_times(&root, 1_000_000).unwrap();
         let m = std::fs::metadata(root.join("Pictures/palette.toml")).unwrap();
         let secs = m
