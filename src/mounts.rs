@@ -53,7 +53,7 @@ pub fn volumes_from_mountinfo(text: &str) -> Vec<Volume> {
         out.push(Volume {
             mount_point: unescape(mount_point),
             fs_type: fs_type.to_string(),
-            source: source.to_string(),
+            source: unescape(source),
         });
     }
     out
@@ -109,8 +109,30 @@ pub fn fstype_of_path(path: &Path) -> Option<String> {
     fstype_in_mountinfo(&text, major, minor).map(str::to_string)
 }
 
-fn unescape(mount: &str) -> String {
-    mount.replace("\\040", " ").replace("\\011", "\t")
+/// Undo the kernel's `\ooo` octal escapes (space, tab, newline,
+/// backslash) in a mountinfo field.
+fn unescape(field: &str) -> String {
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
+        {
+            let v = (b[i + 1] - b'0') as u32 * 64
+                + (b[i + 2] - b'0') as u32 * 8
+                + (b[i + 3] - b'0') as u32;
+            if let Ok(byte) = u8::try_from(v) {
+                out.push(byte);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Size and free space of one mounted filesystem, in bytes.
@@ -191,6 +213,19 @@ impl MountSource for FixtureMounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mountinfo_octal_escapes_are_decoded() {
+        let text = "40 22 8:1 / /media/My\\040Disk\\134x\\012y rw - exfat /dev/disk\\040a rw\n";
+        let v = volumes_from_mountinfo(text);
+        assert_eq!(v[0].mount_point, "/media/My Disk\\x\ny");
+        assert_eq!(v[0].source, "/dev/disk a");
+        assert_eq!(
+            unescape("a\\0b\\"),
+            "a\\0b\\",
+            "short escapes stay as typed"
+        );
+    }
 
     #[test]
     fn mountinfo_skips_pseudo_filesystems() {
