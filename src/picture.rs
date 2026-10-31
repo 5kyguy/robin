@@ -98,10 +98,32 @@ pub fn tile(path: &Path, side: u32, cache: Option<&Path>) -> Result<RgbaImage, W
 /// not checked: a stale tile is better than a slow one.
 pub fn cached_thumbnail(path: &Path, cache: &Path) -> Option<PathBuf> {
     let name = crate::thumbs::cache_name(&crate::thumbs::file_uri(path));
+    let mtime = std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
     ["normal", "large", "x-large", "xx-large"]
         .iter()
         .map(|size| cache.join("thumbnails").join(size).join(&name))
-        .find(|p| p.is_file())
+        .find(|p| p.is_file() && thumb_mtime(p) == Some(mtime))
+}
+
+/// The source mtime a freedesktop thumbnail was made from (`Thumb::MTime`).
+/// A thumbnail without it, or with another time, is stale and ignored.
+fn thumb_mtime(png_path: &Path) -> Option<u64> {
+    let file = std::fs::File::open(png_path).ok()?;
+    let reader = png::Decoder::new(std::io::BufReader::new(file))
+        .read_info()
+        .ok()?;
+    reader
+        .info()
+        .uncompressed_latin1_text
+        .iter()
+        .find(|t| t.keyword == "Thumb::MTime")
+        .and_then(|t| t.text.trim().parse().ok())
 }
 
 fn decode_reader<R: std::io::BufRead + Seek>(r: R, tile: Option<u32>) -> Result<RgbaImage, Why> {
@@ -306,10 +328,32 @@ mod tests {
         let clip = dir.join("clip.mp4");
         std::fs::write(&clip, b"v").unwrap();
         assert_eq!(tile(&clip, 72, Some(&dir)).unwrap_err(), Why::Video);
-        let normal = dir.join("thumbnails/normal");
-        std::fs::create_dir_all(&normal).unwrap();
-        let name = crate::thumbs::cache_name(&crate::thumbs::file_uri(&clip));
-        std::fs::copy(dir.join("speeder-frame.png"), normal.join(name)).unwrap();
+        // A frame stamped with another mtime is stale: still the video case.
+        let frame = image::open(dir.join("speeder-frame.png"))
+            .unwrap()
+            .to_rgba8();
+        let stamp = |mtime| {
+            crate::thumbs::store_rgba(
+                &crate::thumbs::ThumbRequest {
+                    source: &clip,
+                    cache_home: &dir,
+                    size: crate::thumbs::ThumbSize::Normal,
+                    mtime,
+                },
+                frame.as_raw(),
+                frame.width(),
+                frame.height(),
+            )
+            .unwrap()
+        };
+        let real = std::fs::metadata(&clip).unwrap().modified().unwrap();
+        stamp(real - std::time::Duration::from_secs(60));
+        assert_eq!(
+            tile(&clip, 72, Some(&dir)).unwrap_err(),
+            Why::Video,
+            "stale"
+        );
+        stamp(real);
         assert_eq!(tile(&clip, 72, Some(&dir)).unwrap().width(), 72);
         let _ = std::fs::remove_dir_all(&dir);
     }

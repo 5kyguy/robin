@@ -309,10 +309,22 @@ fn seed_strip_videos(home: &Path) -> Result<()> {
     std::fs::write(&cached, b"video").map_err(|e| io(&cached, e))?;
     let bare = pics.join("dune-timelapse.mp4");
     std::fs::write(&bare, b"video").map_err(|e| io(&bare, e))?;
-    let dir = home.join(".cache/thumbnails/normal");
-    std::fs::create_dir_all(&dir).map_err(|e| io(&dir, e))?;
-    let frame = dir.join(crate::thumbs::cache_name(&crate::thumbs::file_uri(&cached)));
-    std::fs::copy(pics.join("speeder-frame.png"), &frame).map_err(|e| io(&frame, e))?;
+    // Stamped with the time freeze_times gives the video, so it's fresh.
+    let src = pics.join("speeder-frame.png");
+    let frame = image::open(&src)
+        .map_err(|e| crate::Error::Message(format!("{}: {e}", src.display())))?
+        .to_rgba8();
+    crate::thumbs::store_rgba(
+        &crate::thumbs::ThumbRequest {
+            source: &cached,
+            cache_home: &home.join(".cache"),
+            size: crate::thumbs::ThumbSize::Normal,
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(FIXTURE_MTIME as u64),
+        },
+        frame.as_raw(),
+        frame.width(),
+        frame.height(),
+    )?;
     Ok(())
 }
 
