@@ -23,7 +23,10 @@ pub const FIXTURE_MTIME: i64 = FROZEN_NOW - 2_400;
 
 /// Views with an input script.
 pub fn scripted(view: &str) -> bool {
-    matches!(view, "browser-list" | "nav-pending" | "start-denied")
+    matches!(
+        view,
+        "browser-list" | "nav-pending" | "start-denied" | "sidebar-device" | "sidebar-trash"
+    )
 }
 
 pub struct Options<'a> {
@@ -153,6 +156,16 @@ fn paint_in(
         // A slow navigation into raw-exports whose read hasn't landed.
         let t0 = std::time::Instant::now();
         app::navigate_pending(home.join("Pictures/raw-exports"), t0, 0.45);
+    }
+    // Click a sidebar row as a person would, then let its reads land.
+    let click = match view {
+        "sidebar-device" => Some((1, 2)), // SANDISK
+        "sidebar-trash" => Some((2, 0)),
+        _ => None,
+    };
+    if let Some((section, index)) = click {
+        ui.invoke_place_open(section, index);
+        app::land_reads();
     }
     snapshot(&ui, size, out)
 }
