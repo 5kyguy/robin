@@ -13,6 +13,7 @@ pub mod instance;
 pub mod model;
 pub mod mounts;
 pub mod ops;
+pub mod render;
 pub mod safety;
 pub mod shots;
 pub mod stats;

@@ -984,6 +984,41 @@ type Shared = Rc<RefCell<State>>;
 
 thread_local! {
     static STATE: RefCell<Option<(Shared, slint::Weak<AppWindow>)>> = const { RefCell::new(None) };
+    /// Set by the render harness: reads wait in `PENDING_READS` until the
+    /// script lands them, instead of running on a worker thread.
+    static SCRIPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PENDING_READS: RefCell<Vec<ReadTicket>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `build` for the render harness: the same window and callbacks, with
+/// folder reads held for [`land_reads`] so a script decides when each
+/// one arrives.
+pub fn build_scripted(launch: Launch) -> Result<AppWindow> {
+    SCRIPTED.with(|s| s.set(true));
+    build(launch)
+}
+
+/// Perform and land every held read, including rereads they queue.
+pub fn land_reads() {
+    while let Some(ticket) = PENDING_READS.with(|p| p.borrow_mut().pop()) {
+        let read = ticket.perform();
+        with_state(|ui, st| landed(&ui, st, read));
+    }
+}
+
+/// Start a navigation to `target` at `t0` and hold its read, then move the
+/// clock past `NAV_PENDING_AFTER` so the pending state shows. `phase`
+/// freezes the progress bar's sweep for a still frame.
+pub fn navigate_pending(target: PathBuf, t0: std::time::Instant, phase: f32) {
+    with_state(|ui, st| {
+        let ticket = st.borrow_mut().ctl.begin_navigate_at(target, t0);
+        sync_drop_dest(&st.borrow());
+        let gen = ticket.gen();
+        start_read(Some(ticket));
+        st.borrow_mut().ctl.tick_nav(gen, t0 + NAV_PENDING_AFTER);
+        redraw(&ui, &st.borrow());
+        ui.set_nav_phase(phase);
+    });
 }
 
 /// What a window starts with: the folder, where trash and home are, the
@@ -1313,6 +1348,10 @@ fn poll_watch(ui: &AppWindow, st: &Shared) {
 /// it finishes.
 fn start_read(ticket: Option<ReadTicket>) {
     let Some(ticket) = ticket else { return };
+    if SCRIPTED.with(|s| s.get()) {
+        PENDING_READS.with(|p| p.borrow_mut().push(ticket));
+        return;
+    }
     std::thread::spawn(move || {
         let read = ticket.perform();
         let _ = slint::invoke_from_event_loop(move || {

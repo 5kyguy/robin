@@ -104,6 +104,46 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| Error::io(path, e))
 }
 
+/// Stamp every file and folder (except the unreadable one) with the same
+/// mtime, so a frozen clock renders the same "Modified" column every run.
+pub fn freeze_times(root: &Path, secs: i64) -> Result<()> {
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                // The link's own time, not its target's, is what a listing shows.
+                use rustix::fs::{utimensat, AtFlags, Timespec, Timestamps, CWD};
+                let t = Timespec {
+                    tv_sec: secs,
+                    tv_nsec: 0,
+                };
+                let times = Timestamps {
+                    last_access: t,
+                    last_modification: t,
+                };
+                utimensat(CWD, &path, &times, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|e| Error::io(&path, e))?;
+                continue;
+            }
+            if kind.is_dir() {
+                stack.push(path.clone());
+            }
+            if let Ok(f) = fs::File::open(&path) {
+                f.set_modified(when).map_err(|e| Error::io(&path, e))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Delete a fixture, reopening its unreadable folder first.
 pub fn remove(root: &Path) -> Result<()> {
     let secret = root.join("secret");
@@ -151,6 +191,14 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+        freeze_times(&root, 1_000_000).unwrap();
+        let m = std::fs::metadata(root.join("Pictures/palette.toml")).unwrap();
+        let secs = m
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(secs.as_secs(), 1_000_000);
         remove(&root).unwrap();
         assert!(!root.exists());
     }

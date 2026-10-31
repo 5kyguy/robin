@@ -22,7 +22,8 @@ where
         }
         Some("--demo") => demo(iter),
         Some("--select") => select_file(iter),
-        Some("--render") => render(iter),
+        Some("--render") => render(iter, false),
+        Some("--render-mock") => render(iter, true),
         Some(other) if !other.starts_with('-') => {
             crate::app::run(crate::app::start_dir(Some(std::path::Path::new(other))))
         }
@@ -42,6 +43,11 @@ Usage:
   robin --demo [--out DIR]
   robin --render <view> [--fixture DIR] [--size WxH] [--density comfortable|compact]
                         [--theme cyan|black] [--out FILE]
+  robin --render-mock <view> [--size WxH] [--theme cyan|black] [--out FILE]
+
+--render starts the real app on a seeded fixture home (DIR, or a temp
+folder) with a frozen clock and plays the view's input script. Views
+without a script yet are only in --render-mock, hand-filled frames.
   robin --help
 
 The interface follows docs/DESIGN.md. Views that are not built yet fail
@@ -81,7 +87,7 @@ fn default_demo_dir() -> PathBuf {
     std::env::temp_dir().join("robin-demo")
 }
 
-fn render<'a>(mut iter: impl Iterator<Item = &'a std::ffi::OsString>) -> Result<i32> {
+fn render<'a>(mut iter: impl Iterator<Item = &'a std::ffi::OsString>, mock: bool) -> Result<i32> {
     let view = iter
         .next()
         .and_then(|s| s.to_str().map(str::to_string))
@@ -89,8 +95,8 @@ fn render<'a>(mut iter: impl Iterator<Item = &'a std::ffi::OsString>) -> Result<
     let mut size = (1280, 800);
     let mut theme_name = "cyan".to_string();
     let mut out: Option<PathBuf> = None;
-    let mut _fixture: Option<PathBuf> = None;
-    let mut _density = "comfortable".to_string();
+    let mut fixture: Option<PathBuf> = None;
+    let mut density = "comfortable".to_string();
     while let Some(flag) = iter.next() {
         let flag = flag
             .to_str()
@@ -101,9 +107,9 @@ fn render<'a>(mut iter: impl Iterator<Item = &'a std::ffi::OsString>) -> Result<
                 .ok_or_else(|| Error::Message(format!("{flag} needs a value")))
         };
         match flag {
-            "--fixture" => _fixture = Some(PathBuf::from(value(&mut iter)?)),
+            "--fixture" => fixture = Some(PathBuf::from(value(&mut iter)?)),
             "--size" => size = parse_size(&value(&mut iter)?)?,
-            "--density" => _density = value(&mut iter)?,
+            "--density" => density = value(&mut iter)?,
             "--theme" => theme_name = value(&mut iter)?,
             "--out" => out = Some(PathBuf::from(value(&mut iter)?)),
             other => return Err(Error::Message(format!("unknown flag {other}"))),
@@ -118,11 +124,38 @@ fn render<'a>(mut iter: impl Iterator<Item = &'a std::ffi::OsString>) -> Result<
             )))
         }
     };
+    let compact = match density.as_str() {
+        "comfortable" => false,
+        "compact" => true,
+        other => {
+            return Err(Error::Message(format!(
+                "unknown density {other}. Use comfortable or compact."
+            )))
+        }
+    };
     let out = out.unwrap_or_else(|| PathBuf::from(format!("{view}.png")));
-    if !crate::shots::known(&view) {
+    // The harness frame is a theme calibration, not a scene: it stays mock.
+    if mock || view == "harness" {
+        if !crate::shots::known(&view) {
+            return Err(Error::Message(format!("view `{view}` is not built yet")));
+        }
+        crate::shots::paint(&view, &theme, size, &out)?;
+    } else if crate::render::scripted(&view) {
+        crate::render::paint(crate::render::Options {
+            view: &view,
+            theme,
+            size,
+            compact,
+            fixture,
+            out: &out,
+        })?;
+    } else if crate::shots::known(&view) {
+        return Err(Error::Message(format!(
+            "view `{view}` has no real-app script yet. Try --render-mock {view}."
+        )));
+    } else {
         return Err(Error::Message(format!("view `{view}` is not built yet")));
     }
-    crate::shots::paint(&view, &theme, size, &out)?;
     println!("{}", out.display());
     Ok(0)
 }
@@ -183,6 +216,16 @@ mod tests {
         let err = run(["--render", "not-a-view"]).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("not built"), "{message}");
+    }
+
+    #[test]
+    fn a_mock_only_view_points_at_render_mock() {
+        let err = run(["--render", "browser-grid-m"]).unwrap_err().to_string();
+        assert!(err.contains("--render-mock"), "{err}");
+        let err = run(["--render", "browser-list", "--density", "airy"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("density"), "{err}");
     }
 
     #[test]
