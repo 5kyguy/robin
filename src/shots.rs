@@ -95,7 +95,7 @@ pub fn paint(view: &str, theme: &Theme, size: (u32, u32), out: &Path) -> Result<
         .select();
     let _ = slint::set_xdg_app_id("dev.skyguy.robin");
     let ui = AppWindow::new().map_err(|e| Error::Message(e.to_string()))?;
-    apply_theme(&ui, theme);
+    crate::app::apply_theme(&ui, theme);
     if view == "harness" {
         ui.set_harness(true);
         ui.set_label("harness".into());
@@ -125,20 +125,6 @@ pub fn paint(view: &str, theme: &Theme, size: (u32, u32), out: &Path) -> Result<
     )
     .map_err(|e| Error::Message(format!("write {}: {e}", out.display())))?;
     Ok(())
-}
-
-pub(crate) fn apply_theme(ui: &AppWindow, theme: &Theme) {
-    ui.set_bg(theme.bg.to_slint());
-    ui.set_surface(theme.surface.to_slint());
-    ui.set_text(theme.text.to_slint());
-    ui.set_muted(theme.muted.to_slint());
-    ui.set_accent(theme.accent.to_slint());
-    ui.set_on_accent(theme.on_accent.to_slint());
-    ui.set_line(theme.line.to_slint());
-    ui.set_danger(theme.danger.to_slint());
-    ui.set_on_danger(theme.on_danger.to_slint());
-    ui.set_warning(theme.warning.to_slint());
-    ui.set_on_warning(theme.on_warning.to_slint());
 }
 
 fn apply_scene(ui: &AppWindow, view: &str) {

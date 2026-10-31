@@ -983,11 +983,60 @@ thread_local! {
     static STATE: RefCell<Option<(Shared, slint::Weak<AppWindow>)>> = const { RefCell::new(None) };
 }
 
+/// What a window starts with: the folder, where trash and home are, the
+/// look, and an optional frozen clock for renders.
+pub struct Launch {
+    pub dir: PathBuf,
+    pub env: Env,
+    pub theme: crate::theme::Theme,
+    pub compact: bool,
+    pub clock: Option<(i64, i64)>,
+}
+
+impl Launch {
+    /// The interactive app: the system's home and trash, cyan, comfortable.
+    pub fn system(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            env: Env::from_system(),
+            theme: crate::theme::Theme::cyan(),
+            compact: false,
+            clock: None,
+        }
+    }
+}
+
 pub fn run(dir: PathBuf) -> Result<i32> {
+    let ui = build(Launch::system(dir))?;
+    ui.show().map_err(|e| Error::Message(e.to_string()))?;
+    slint::run_event_loop().map_err(|e| Error::Message(e.to_string()))?;
+    Ok(0)
+}
+
+pub fn apply_theme(ui: &AppWindow, theme: &crate::theme::Theme) {
+    ui.set_bg(theme.bg.to_slint());
+    ui.set_surface(theme.surface.to_slint());
+    ui.set_text(theme.text.to_slint());
+    ui.set_muted(theme.muted.to_slint());
+    ui.set_accent(theme.accent.to_slint());
+    ui.set_on_accent(theme.on_accent.to_slint());
+    ui.set_line(theme.line.to_slint());
+    ui.set_danger(theme.danger.to_slint());
+    ui.set_on_danger(theme.on_danger.to_slint());
+    ui.set_warning(theme.warning.to_slint());
+    ui.set_on_warning(theme.on_warning.to_slint());
+}
+
+/// Make the window and wire every callback, with the startup read
+/// already requested, but don't show it or run the event loop: `run`
+/// does that interactively and the render harness drives it by script.
+pub fn build(launch: Launch) -> Result<AppWindow> {
     let ui = AppWindow::new().map_err(|e| Error::Message(e.to_string()))?;
-    crate::shots::apply_theme(&ui, &crate::theme::Theme::cyan());
+    apply_theme(&ui, &launch.theme);
     ui.set_harness(false);
-    let mut ctl = Controller::new(dir, Env::from_system());
+    ui.set_compact(launch.compact);
+    let mut ctl = Controller::new(launch.dir, launch.env);
+    ctl.clock = launch.clock;
     ctl.loaded = false;
     let startup = ctl.begin_refresh();
     let state: Shared = Rc::new(RefCell::new(State {
@@ -1132,10 +1181,7 @@ pub fn run(dir: PathBuf) -> Result<i32> {
         ui.set_toast_on(false);
         apply(&ui, &st, Action::Run(Job::restore(items)));
     });
-
-    ui.show().map_err(|e| Error::Message(e.to_string()))?;
-    slint::run_event_loop().map_err(|e| Error::Message(e.to_string()))?;
-    Ok(0)
+    Ok(ui)
 }
 
 const WATCH_DEBOUNCE_MS: u64 = 200;
@@ -1374,7 +1420,7 @@ fn redraw(ui: &AppWindow, s: &State) {
     let (column, desc) = ctl.sort_header();
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = Some(ctl.env.home.clone());
     let crumbs: Vec<String> = crate::model::breadcrumbs(ctl.crumb_dir(), home.as_deref())
         .iter()
         .map(|c| c.label.clone())
