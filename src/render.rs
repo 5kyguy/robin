@@ -198,6 +198,15 @@ fn paint_in(
         "grid-view" => {
             ui.invoke_set_grid(true);
             select_row(&ui, "dune-sunset-0413.jpg");
+            // The grid must not keep the list's model alive (100k-entry
+            // folders): fail the render, and the real_render test, if it does.
+            use slint::Model;
+            let (files, lines) = (ui.get_files().row_count(), ui.get_grid_rows().row_count());
+            if files != 0 || lines == 0 {
+                return Err(crate::Error::Message(format!(
+                    "grid mode: {files} list rows, {lines} grid lines"
+                )));
+            }
         }
         // Grid with hidden files shown, from the status bar toggle.
         "grid-hidden" => {
