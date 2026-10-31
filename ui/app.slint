@@ -720,14 +720,22 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                     }
                 }
-                for place[i] in device-places: VerticalLayout {
+                // The highlight wraps the label and its usage bar together.
+                for place[i] in device-places: Rectangle {
+                    border-radius: 6px;
+                    background: place.selected ? root.selected : transparent;
+                    border-width: place.selected ? 1px : 0px;
+                    border-color: root.accent;
+                    TouchArea { clicked => { root.place-open(1, i); } }
+                    VerticalLayout {
+                    padding-bottom: !root.collapsed && place.usage >= 0 ? 4px : 0px;
                     spacing: 1px;
                     SideRow {
                         clicked => { root.place-open(1, i); }
                         glyph: place.glyph;
                         name: place.name;
                         count: place.count;
-                        picked: place.selected;
+                        picked: false;
                         rail: root.collapsed;
                         side-row: root.side-row;
                         ink: root.text;
@@ -755,6 +763,7 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                    }
                 Rectangle { height: 8px; }
                 if !collapsed && trash-places.length > 0: HorizontalLayout {
                     Rectangle { width: 12px; }
