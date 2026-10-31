@@ -22,6 +22,18 @@ const PIXEL_PNG: &[u8] = &[
 pub fn materialize(root: &Path) -> Result<()> {
     fs::create_dir_all(root).map_err(|e| Error::io(root, e))?;
     if !is_marked(root) {
+        // Only ever claim an empty folder: the tree below is rewritten,
+        // so a typo'd --out must not land in someone's real directory.
+        let used = fs::read_dir(root)
+            .map_err(|e| Error::io(root, e))?
+            .next()
+            .is_some();
+        if used {
+            return Err(Error::Message(format!(
+                "{} is not empty and not a robin fixture",
+                root.display()
+            )));
+        }
         let marker = root.join(MARKER);
         if marker.symlink_metadata().is_ok() {
             return Err(Error::Message(format!(
@@ -283,6 +295,18 @@ mod tests {
     }
 
     #[test]
+    fn a_used_folder_is_never_claimed() {
+        let root = std::env::temp_dir().join(format!("robin-used-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("notes.txt"), b"mine").unwrap();
+        assert!(materialize(&root).is_err());
+        assert!(!root.join(MARKER).exists(), "no marker written");
+        assert!(!home(&root).exists(), "no tree written");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn a_secret_link_is_never_chmodded() {
         let root = std::env::temp_dir().join(format!("robin-secretlink-{}", std::process::id()));
         let outside = std::env::temp_dir().join(format!("robin-outside-{}", std::process::id()));
@@ -290,6 +314,7 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         fs::create_dir_all(home(&root)).unwrap();
         symlink(&outside, home(&root).join("secret")).unwrap();
+        fs::write(root.join(MARKER), MARKER_TEXT).unwrap();
         assert!(materialize(&root).is_err());
         assert!(fs::read_dir(&outside).is_ok(), "target untouched");
         fs::remove_file(home(&root).join("secret")).unwrap();
