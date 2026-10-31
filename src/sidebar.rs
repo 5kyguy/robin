@@ -676,7 +676,7 @@ mod tests {
         assert_eq!(d.trash.len(), 1);
         assert_eq!(
             (d.trash[0].name.as_str(), d.trash[0].count.as_str()),
-            ("Trash", "1")
+            ("Trash", "3")
         );
         assert_eq!(d.space, "6 GB free of 64 GB", "the open folder's mount");
         assert!(d.devices[2].removable && !d.devices[1].removable);

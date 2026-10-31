@@ -18,6 +18,9 @@ fn scripted_views_render_through_the_real_app() {
         "start-denied",
         "sidebar-device",
         "sidebar-trash",
+        "trash-view",
+        "trash-empty-confirm",
+        "trash-empty",
     ] {
         let out = dir.join(format!("{view}.png"));
         let fixture = dir.join(format!("home-{view}"));

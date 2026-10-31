@@ -136,6 +136,38 @@ fn seed_home(top: &Path, root: &Path) -> Result<()> {
         ".local/share/Trash/info/old-draft.txt.trashinfo",
         info.as_bytes(),
     )?;
+    // Two more trashed items, one a folder, so the Trash view has columns to show.
+    write(root, ".local/share/Trash/files/q3-budget.ods", b"budget\n")?;
+    write(
+        root,
+        ".local/share/Trash/files/old-screenshots/shot-1.png",
+        b"png\n",
+    )?;
+    for (name, path, when) in [
+        (
+            "q3-budget.ods",
+            "Documents/Finance/q3-budget.ods",
+            "2026-10-30T18:45:00",
+        ),
+        (
+            "old-screenshots",
+            "Pictures/old-screenshots",
+            "2026-10-27T09:12:00",
+        ),
+    ] {
+        let info = format!(
+            "[Trash Info]\nPath={}/{path}\nDeletionDate={when}\n",
+            root.display()
+        );
+        write(
+            root,
+            &format!(".local/share/Trash/info/{name}.trashinfo"),
+            info.as_bytes(),
+        )?;
+    }
+    // An empty trash for the Trash view's empty state.
+    let empty = top.join("empty-trash/files");
+    fs::create_dir_all(&empty).map_err(|e| Error::io(&empty, e))?;
     let t = top.display();
     let mountinfo = format!(
         "22 1 259:2 / / rw - ext4 /dev/nvme0n1p2 rw\n\

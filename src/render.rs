@@ -25,7 +25,14 @@ pub const FIXTURE_MTIME: i64 = FROZEN_NOW - 2_400;
 pub fn scripted(view: &str) -> bool {
     matches!(
         view,
-        "browser-list" | "nav-pending" | "start-denied" | "sidebar-device" | "sidebar-trash"
+        "browser-list"
+            | "nav-pending"
+            | "start-denied"
+            | "sidebar-device"
+            | "sidebar-trash"
+            | "trash-view"
+            | "trash-empty-confirm"
+            | "trash-empty"
     )
 }
 
@@ -145,9 +152,13 @@ fn paint_in(
         _ => home.join("Pictures"),
     };
     let mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(root))?;
+    let mut env = crate::ops::Env::for_home(home);
+    if view == "trash-empty" {
+        env.home_trash = root.join("empty-trash");
+    }
     let ui = app::build_scripted(Launch {
         dir: start,
-        env: crate::ops::Env::for_home(home),
+        env,
         theme,
         compact,
         clock: Some((FROZEN_NOW, FROZEN_OFFSET)),
@@ -162,12 +173,21 @@ fn paint_in(
     // Click a sidebar row as a person would, then let its reads land.
     let click = match view {
         "sidebar-device" => Some((1, 2)), // SANDISK
-        "sidebar-trash" => Some((2, 0)),
+        "sidebar-trash" | "trash-view" | "trash-empty-confirm" | "trash-empty" => Some((2, 0)),
         _ => None,
     };
     if let Some((section, index)) = click {
         ui.invoke_place_open(section, index);
         app::land_reads();
+    }
+    match view {
+        // Pick the second row, as a click would.
+        "trash-view" => {
+            ui.invoke_row_pointer(1, 0, 0, false, false, false);
+            ui.invoke_row_pointer(1, 2, 0, false, false, false);
+        }
+        "trash-empty-confirm" => ui.invoke_trash_empty(),
+        _ => {}
     }
     snapshot(&ui, size, out)
 }

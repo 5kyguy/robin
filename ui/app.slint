@@ -512,6 +512,11 @@ export component AppWindow inherits Window {
     in property <string> label: "Robin";
     in property <bool> compact: false;
     in property <bool> grid: false;
+    // The open folder is the Trash: Name, Original location, Deleted.
+    in property <bool> trash-view: false;
+    in property <bool> trash-can-restore: false;
+    callback trash-restore();
+    callback trash-empty();
     in property <bool> collapsed: false;
     in property <length> tile: 152px;
     in property <string> state: "files";
@@ -951,6 +956,43 @@ export component AppWindow inherits Window {
                 background: bg;
                 if state == "files" && !grid: VerticalLayout {
                     opacity: nav-busy ? 0.6 : 1;
+                    if trash-view: Rectangle {
+                        height: 44px;
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            padding-top: 6px;
+                            padding-bottom: 6px;
+                            spacing: 8px;
+                            Text {
+                                text: "Items here can be restored to where they were deleted from.";
+                                font-size: 11px;
+                                color: muted;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            Rectangle {
+                                width: restore-label.preferred-width + 32px;
+                                height: 32px;
+                                border-radius: 6px;
+                                border-width: 1px;
+                                border-color: line;
+                                opacity: trash-can-restore ? 1 : 0.42;
+                                restore-label := Text { text: "Restore"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                                TouchArea { enabled: trash-can-restore; clicked => { root.trash-restore(); } }
+                            }
+                            Rectangle {
+                                width: empty-label.preferred-width + 32px;
+                                height: 32px;
+                                border-radius: 6px;
+                                background: danger;
+                                empty-label := Text { text: "Empty Trash"; font-size: 12px; color: on-danger; horizontal-alignment: center; vertical-alignment: center; }
+                                TouchArea { clicked => { root.trash-empty(); } }
+                            }
+                        }
+                    }
+                    if trash-view: Rectangle { height: 1px; background: divider; }
                     Rectangle {
                         height: 26px;
                         HeaderCell {
@@ -966,7 +1008,7 @@ export component AppWindow inherits Window {
                             muted: muted;
                             clicked => { root.sort-by(0); }
                         }
-                        HeaderCell {
+                        if !trash-view: HeaderCell {
                             label: "SIZE";
                             column: 1;
                             sorted: root.sort-column == 1;
@@ -980,22 +1022,23 @@ export component AppWindow inherits Window {
                             clicked => { root.sort-by(1); }
                         }
                         HeaderCell {
-                            label: "TYPE";
+                            label: trash-view ? "ORIGINAL LOCATION" : "TYPE";
                             column: 2;
-                            sorted: root.sort-column == 2;
+                            sorted: !trash-view && root.sort-column == 2;
                             desc: root.sort-desc;
-                            x: Columns.type-x(parent.width);
-                            width: Columns.type-w;
+                            x: trash-view ? Columns.size-x(parent.width) : Columns.type-x(parent.width);
+                            width: trash-view ? Columns.mod-x(parent.width) - Columns.size-x(parent.width) - 8px : Columns.type-w;
                             align-right: false;
                             height: parent.height;
                             accent: accent;
                             muted: muted;
-                            clicked => { root.sort-by(2); }
+                            // Trash rows sort by name; these columns aren't the file's own.
+                            clicked => { if !trash-view { root.sort-by(2); } }
                         }
                         HeaderCell {
-                            label: "MODIFIED";
+                            label: trash-view ? "DELETED" : "MODIFIED";
                             column: 3;
-                            sorted: root.sort-column == 3;
+                            sorted: !trash-view && root.sort-column == 3;
                             desc: root.sort-desc;
                             x: Columns.mod-x(parent.width);
                             width: Columns.mod-w;
@@ -1003,7 +1046,7 @@ export component AppWindow inherits Window {
                             height: parent.height;
                             accent: accent;
                             muted: muted;
-                            clicked => { root.sort-by(3); }
+                            clicked => { if !trash-view { root.sort-by(3); } }
                         }
                     }
                     Rectangle { height: 1px; background: divider; }
@@ -1071,9 +1114,9 @@ export component AppWindow inherits Window {
                             }
                             Text {
                                 text: row.kind;
-                                x: Columns.type-x(parent.width);
+                                x: trash-view ? Columns.size-x(parent.width) : Columns.type-x(parent.width);
                                 y: 0px;
-                                width: Columns.type-w;
+                                width: trash-view ? Columns.mod-x(parent.width) - Columns.size-x(parent.width) - 8px : Columns.type-w;
                                 height: parent.height;
                                 font-size: 12px;
                                 color: muted;
@@ -1133,11 +1176,11 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                if state == "empty" || state == "denied" || state == "unmounted" || state == "ejected" || state == "nosearch" || state == "loading": VerticalLayout {
+                if state == "empty" || state == "trash-empty" || state == "denied" || state == "unmounted" || state == "ejected" || state == "nosearch" || state == "loading": VerticalLayout {
                     alignment: center;
                     width: parent.width;
                     Text {
-                        text: state == "empty" ? "󰉖" : state == "denied" ? "󰌾" : state == "nosearch" ? "󰍉" : state == "loading" ? "" : "󰕓";
+                        text: state == "empty" ? "󰉖" : state == "trash-empty" ? "󰩺" : state == "denied" ? "󰌾" : state == "nosearch" ? "󰍉" : state == "loading" ? "" : "󰕓";
                         font-size: 64px;
                         color: state == "denied" || state == "ejected" ? warning.with-alpha(0.6) : muted.with-alpha(0.6);
                         horizontal-alignment: center;
@@ -1145,7 +1188,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 12px; }
                     Text {
-                        text: state == "empty" ? "This folder is empty" : state == "denied" ? state-title : state == "unmounted" ? "SANDISK is not mounted" : state == "ejected" ? "SANDISK was removed" : state == "nosearch" ? "Nothing matches \"kotlin\"" : "Reading…";
+                        text: state == "empty" ? "This folder is empty" : state == "trash-empty" ? "Trash is empty" : state == "denied" ? state-title : state == "unmounted" ? "SANDISK is not mounted" : state == "ejected" ? "SANDISK was removed" : state == "nosearch" ? "Nothing matches \"kotlin\"" : "Reading…";
                         font-size: 18px;
                         font-weight: 700;
                         color: text;
@@ -1154,7 +1197,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 6px; }
                     Text {
-                        text: state == "empty" ? "Drop files here or press Ctrl+N" : state == "denied" ? state-note : state == "nosearch" ? "Searched 4 812 items in ~/Projects" : state == "loading" ? state-note : "";
+                        text: state == "empty" ? "Drop files here or press Ctrl+N" : state == "trash-empty" ? "Files you move to the trash wait here until you empty it." : state == "denied" ? state-note : state == "nosearch" ? "Searched 4 812 items in ~/Projects" : state == "loading" ? state-note : "";
                         font-size: 11px;
                         color: muted;
                         horizontal-alignment: center;
