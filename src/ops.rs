@@ -628,14 +628,30 @@ pub fn run_asking(
     let mut out = Outcome::default();
     let total = job.names.len();
     if job.kind == JobKind::Restore {
+        let mut policy = ConflictPolicy::new();
         for (i, t) in job.restore.iter().enumerate() {
+            if cancel.is_cancelled() {
+                out.cancelled = true;
+                break;
+            }
             progress(&Progress {
                 done: i,
                 total,
                 current: job.names[i].to_string_lossy().into_owned(),
             });
-            match restore_one(t) {
-                Ok(()) => out.done += 1,
+            let item = Cancel::new();
+            let mut opts = CopyOpts {
+                cancel: &item,
+                policy: &mut policy,
+                ask: &mut *ask,
+            };
+            match restore_one(t, env, &mut opts) {
+                Ok(fsops::Restored::Restored) => out.done += 1,
+                Ok(fsops::Restored::Skipped) => {}
+                Err(Error::Cancelled) => {
+                    out.cancelled = true;
+                    break;
+                }
                 Err(e) => out.failed.push(format!("{}: {e}", t.original.display())),
             }
         }
@@ -841,8 +857,8 @@ pub(crate) fn undo(items: &[Trashed]) -> (usize, Vec<String>) {
     (out.done, out.failed)
 }
 
-/// Put one trashed entry back where it was, never over a new file.
-fn restore_one(t: &Trashed) -> Result<()> {
+/// Put one trashed entry back where it was, asking when the name is taken.
+fn restore_one(t: &Trashed, env: &Env, opts: &mut CopyOpts<'_>) -> Result<fsops::Restored> {
     let parent = t
         .original
         .parent()
@@ -850,7 +866,21 @@ fn restore_one(t: &Trashed) -> Result<()> {
     let name = t.original.file_name().ok_or(Error::InvalidName)?;
     let trash = DirFd::open(&t.trash)?;
     let dest = DirFd::open(parent)?;
-    fsops::restore_from_trash(&trash, &t.stored, &dest, name)
+    // Replace moves what is there now to the trash rather than deleting it.
+    let mut make_room = |dir: &DirFd, name: &OsStr| -> Result<()> {
+        let target = trash_target(parent, env)?;
+        let original = parent.join(name);
+        let info = match &target.top {
+            Some(top) => original
+                .strip_prefix(top)
+                .unwrap_or(&original)
+                .to_string_lossy()
+                .into_owned(),
+            None => original.to_string_lossy().into_owned(),
+        };
+        fsops::place_in_trash(dir, name, &target.fd, target.choice, &info).map(|_| ())
+    };
+    fsops::restore_asking(&trash, &t.stored, &dest, name, opts, &mut make_room)
 }
 
 #[cfg(test)]
@@ -1149,19 +1179,68 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    #[test]
-    fn undo_never_replaces_a_new_file() {
-        let root = scratch("undo-clash");
+    /// Trash `a` ("old"), write a new `a` ("new"), then restore answering `pick`.
+    fn restore_over_new(label: &str, pick: fsops::Conflict) -> (PathBuf, Outcome, Vec<String>) {
+        let root = scratch(label);
         let dir = root.join("work");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("a"), "old").unwrap();
-        let job = Job::new(JobKind::Trash, &dir, names(&["a"]), &dir);
-        let out = run(&job, &env(&root), &Cancel::new(), &mut |_| {});
+        let e = env(&root);
+        let out = run(
+            &Job::new(JobKind::Trash, &dir, names(&["a"]), &dir),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+        );
         fs::write(dir.join("a"), "new").unwrap();
-        let (restored, failed) = undo(&out.trashed);
-        assert_eq!((restored, failed.len()), (0, 1));
-        assert_eq!(fs::read_to_string(dir.join("a")).unwrap(), "new");
+        let mut asked = Vec::new();
+        let back = run_asking(
+            &Job::restore(out.trashed),
+            &e,
+            &Cancel::new(),
+            &mut |_| {},
+            &mut |p| {
+                asked.push(p.name.clone());
+                Ok(ConflictChoice {
+                    action: pick,
+                    apply_all: false,
+                })
+            },
+        );
+        (root, back, asked)
+    }
+
+    #[test]
+    fn restore_onto_a_taken_name_asks_and_skip_leaves_it_in_the_trash() {
+        let (root, back, asked) = restore_over_new("restore-skip", fsops::Conflict::Skip);
+        assert_eq!(asked, ["a"]);
+        assert_eq!((back.done, back.failed.len()), (0, 0));
+        assert_eq!(fs::read_to_string(root.join("work/a")).unwrap(), "new");
         assert!(root.join("trash/files/a").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restore_keep_both_lands_under_a_fresh_name() {
+        let (root, back, _) = restore_over_new("restore-keep", fsops::Conflict::Rename);
+        assert_eq!(back.done, 1, "{back:?}");
+        assert_eq!(fs::read_to_string(root.join("work/a")).unwrap(), "new");
+        assert_eq!(fs::read_to_string(root.join("work/a (2)")).unwrap(), "old");
+        assert!(!root.join("trash/info/a.trashinfo").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restore_replace_trashes_the_newer_file_instead_of_deleting_it() {
+        let (root, back, _) = restore_over_new("restore-replace", fsops::Conflict::Replace);
+        assert_eq!(back.done, 1, "{back:?}");
+        assert_eq!(fs::read_to_string(root.join("work/a")).unwrap(), "old");
+        let kept: Vec<_> = fs::read_dir(root.join("trash/files"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read_to_string(kept[0].path()).unwrap(), "new");
         fs::remove_dir_all(&root).unwrap();
     }
 

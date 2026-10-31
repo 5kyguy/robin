@@ -20,6 +20,7 @@ pub mod sidebar;
 pub mod stats;
 pub mod theme;
 pub mod thumbs;
+pub mod trash;
 pub mod video;
 pub mod watch;
 

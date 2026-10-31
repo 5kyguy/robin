@@ -1648,6 +1648,52 @@ pub fn restore_from_trash(
     }
 }
 
+/// Whether a restore put the item back or the user skipped it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restored {
+    Restored,
+    Skipped,
+}
+
+/// [`restore_from_trash`], asking through the conflict dialog when
+/// `name` is taken. Keep both restores under a fresh name; Replace calls
+/// `make_room` to clear the way first (the window moves the existing
+/// item to the trash, so nothing is lost).
+pub fn restore_asking(
+    trash: &DirFd,
+    stored: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    name: &std::ffi::OsStr,
+    opts: &mut CopyOpts<'_>,
+    make_room: &mut dyn FnMut(&DirFd, &std::ffi::OsStr) -> Result<()>,
+) -> Result<Restored> {
+    let name_c = component(name)?;
+    match rustix::fs::statat(
+        dest_parent.as_fd(),
+        name_c.as_c_str(),
+        AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Err(Errno::NOENT) => {
+            return restore_from_trash(trash, stored, dest_parent, name)
+                .map(|()| Restored::Restored)
+        }
+        Err(e) => return Err(Error::from_errno(name, e)),
+        Ok(_) => {}
+    }
+    let files = trash.open_dir_nofollow(std::ffi::OsStr::new("files"))?;
+    match settle_conflict(&files, stored, dest_parent, name, opts)? {
+        Conflict::Skip => Ok(Restored::Skipped),
+        Conflict::Rename => {
+            let fresh = fresh_name(dest_parent, name)?;
+            restore_from_trash(trash, stored, dest_parent, &fresh).map(|()| Restored::Restored)
+        }
+        Conflict::Replace => {
+            make_room(dest_parent, name)?;
+            restore_from_trash(trash, stored, dest_parent, name).map(|()| Restored::Restored)
+        }
+    }
+}
+
 /// Walk up from `path` to the top of its filesystem.
 pub fn mount_top(path: &Path) -> Result<std::path::PathBuf> {
     let dev = |p: &Path| {
