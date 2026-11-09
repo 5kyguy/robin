@@ -2657,8 +2657,17 @@ fn debounce() -> crate::model::Debounce {
         .max_wait(Duration::from_millis(WATCH_MAX_WAIT_MS))
 }
 
-/// Dropped paths waiting for a dialog to close, grouped into jobs per
-/// destination frozen at drop time.
+/// Whether a finished refresh walked the open folder up to an ancestor.
+/// Queued drops must be flushed against `open` before [`Controller::land`]
+/// applies such a result, or an unresolved drop is grouped into the parent.
+fn refresh_walks_up(read: &ReadResult, open: &Path) -> bool {
+    read.kind == ReadKind::Refresh && matches!(&read.result, Ok((dir, _)) if dir.as_path() != open)
+}
+
+/// Drain queued external drops into copy jobs once nothing is holding
+/// them back: no dialog is open and no navigation is in flight. Each path
+/// keeps the destination frozen when it arrived; one still open (dropped
+/// mid-navigation) goes to the folder that is open now.
 fn flush_drops(ui: &AppWindow, st: &Shared) {
     if st.borrow().ctl.dialog.is_some() || st.borrow().ctl.nav_in_flight() {
         return; // keep them queued until the dialog closes or the folder lands
@@ -2787,6 +2796,16 @@ fn start_read(ticket: Option<ReadTicket>) {
 /// reread keeps the scroll offset; errors keep the folder and toast.
 fn landed(ui: &AppWindow, st: &Shared, read: ReadResult) {
     let kind = read.kind;
+    // A refresh that walked up because the open folder is gone must flush
+    // queued drops against that folder first. Otherwise a drop still open
+    // from a mid-navigation wait resolves into the parent once ctl.dir
+    // moves, and a frozen dest aimed at the vanished folder sits until a
+    // later tick. Flushing now starts the copies at their intended target
+    // (they fail cleanly if it is already gone) instead of misdirecting
+    // them into the ancestor.
+    if refresh_walks_up(&read, &st.borrow().ctl.dir) {
+        flush_drops(ui, st);
+    }
     let mut s = st.borrow_mut();
     let landed = s.ctl.land(read);
     sync_drop_dest(&s);
@@ -5770,6 +5789,98 @@ mod tests {
         );
         assert_eq!(by_dest[0].0, PathBuf::from("/old"));
         assert_eq!(by_dest[1].0, PathBuf::from("/new"));
+    }
+
+    #[test]
+    fn drops_pending_when_a_folder_vanishes_keep_that_folder_not_the_parent() {
+        let mut c = setup("drop-vanished");
+        let parent = c.dir.clone();
+        let gone = parent.join("raw-exports");
+        let nav = c.begin_navigate(gone.clone());
+        assert!(matches!(
+            c.land(nav.perform()),
+            Landed::Shown { moved: true }
+        ));
+        assert_eq!(&c.dir, &gone);
+
+        let root = parent.parent().unwrap().to_path_buf();
+        let paths: Vec<_> = ["dx", "dy"]
+            .into_iter()
+            .map(|n| {
+                let p = root.join(n);
+                fs::write(&p, b"x").unwrap();
+                p
+            })
+            .collect();
+        // One drop frozen to the open folder, one still open as during a
+        // mid-navigation wait that has not flushed yet.
+        let dropped = vec![
+            (paths[0].clone(), Some(gone.clone())),
+            (paths[1].clone(), None),
+        ];
+
+        fs::remove_dir(&gone).unwrap();
+        let ticket = c.begin_refresh().expect("idle after nav");
+        let read = ticket.perform();
+        assert!(
+            refresh_walks_up(&read, &c.dir),
+            "the refresh walked up from the vanished folder"
+        );
+
+        // Resolve against the vanishing folder *before* land, matching
+        // landed()'s flush-first order. Both drops must keep `gone`.
+        let before = group_drops(dropped.clone(), &c.dir);
+        assert_eq!(before.len(), 1, "{before:?}");
+        assert_eq!(before[0].0, gone);
+        assert_eq!(before[0].1.len(), 2);
+        let plan = ops::external_drop(&before[0].1, &before[0].0);
+        assert_eq!(plan.jobs.len(), 1);
+        assert_eq!(plan.jobs[0].dest, gone, "intended target, not the parent");
+
+        // Grouping after land would redirect the open drop into the parent.
+        assert!(matches!(c.land(read), Landed::Shown { moved: true }));
+        assert_eq!(&c.dir, &parent);
+        let after = group_drops(dropped, &c.dir);
+        let open_dest = after
+            .iter()
+            .find(|(_, ps)| ps.iter().any(|p| p == &paths[1]))
+            .map(|(d, _)| d.clone());
+        assert_eq!(
+            open_dest,
+            Some(parent.clone()),
+            "post-walk-up grouping is what flush-first avoids"
+        );
+        // A successful navigation also moves dir, but must not flush-first:
+        // mid-nav drops wait and take wherever that read lands.
+        let elsewhere = parent.join("raw-exports");
+        let nav_read = ReadResult {
+            gen: 0,
+            kind: ReadKind::Navigate,
+            result: Ok((
+                elsewhere.clone(),
+                Snapshot {
+                    entries: Vec::new(),
+                    counts: Default::default(),
+                },
+            )),
+            trash: None,
+        };
+        assert!(!refresh_walks_up(&nav_read, &parent));
+        assert!(refresh_walks_up(
+            &ReadResult {
+                gen: 0,
+                kind: ReadKind::Refresh,
+                result: Ok((
+                    parent.clone(),
+                    Snapshot {
+                        entries: Vec::new(),
+                        counts: Default::default(),
+                    },
+                )),
+                trash: None,
+            },
+            &elsewhere
+        ));
     }
 
     #[test]
