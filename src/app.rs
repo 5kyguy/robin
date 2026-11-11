@@ -2757,10 +2757,12 @@ pub fn watch_warns_on_failure(dir: &Path) -> bool {
     !watch_path_is_gone(dir)
 }
 
-/// The open folder is gone or is no longer a directory.
+/// The open folder is gone or is no longer a directory, matching
+/// [`Error::is_gone`]: ENOENT, or ENOTDIR when an ancestor was replaced
+/// by a file.
 fn watch_path_is_gone(dir: &Path) -> bool {
     match std::fs::symlink_metadata(dir) {
-        Err(e) => e.raw_os_error() == Some(libc::ENOENT),
+        Err(e) => matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR)),
         Ok(m) => !m.is_dir(),
     }
 }
@@ -5721,6 +5723,26 @@ mod tests {
             "replaced by a file: also gone as a folder"
         );
         fs::remove_file(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_ancestor_replaced_by_a_file_does_not_warn_that_live_refresh_is_unavailable() {
+        let root = std::env::temp_dir().join(format!("robin-watch-enotdir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let leaf = root.join("parent").join("leaf");
+        fs::create_dir_all(&leaf).unwrap();
+        assert!(
+            watch_warns_on_failure(&leaf),
+            "a folder that is still here still warns"
+        );
+        fs::remove_dir_all(root.join("parent")).unwrap();
+        fs::write(root.join("parent"), b"x").unwrap();
+        assert!(
+            !watch_warns_on_failure(&leaf),
+            "ENOTDIR from a file in the path: walk up quietly, like is_gone"
+        );
+        fs::remove_file(root.join("parent")).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
