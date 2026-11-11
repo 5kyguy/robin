@@ -727,6 +727,11 @@ impl Controller {
         self.nav.is_some()
     }
 
+    /// The folder a navigation in flight is opening, if any.
+    pub fn nav_target(&self) -> Option<&Path> {
+        self.nav.as_ref().map(|n| n.target.as_path())
+    }
+
     /// Whether a slow navigation is showing its progress bar.
     pub fn nav_pending(&self) -> bool {
         self.nav.as_ref().is_some_and(|n| n.shown)
@@ -1771,6 +1776,10 @@ struct State {
     /// The open folder as the drop handler sees it; `None` while a
     /// navigation is in flight.
     drop_dest: Rc<RefCell<Option<PathBuf>>>,
+    /// A drop held by a dialog or an in-flight navigation, and the toast
+    /// generation of the 2s "waiting" notice if that is what is showing.
+    drop_wait: Option<DropWait>,
+    drop_wait_toast_gen: u64,
     /// The sidebar rows and status-right, as the last side job read them.
     side: crate::sidebar::SideData,
     side_gate: crate::sidebar::SideGate,
@@ -2428,6 +2437,8 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         read_error: None,
         dropped: Rc::default(),
         drop_dest: Rc::default(),
+        drop_wait: None,
+        drop_wait_toast_gen: 0,
         side: Default::default(),
         side_gate: Default::default(),
         stats: None,
@@ -2755,6 +2766,10 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
             ui.set_toast_open(open);
             return;
         }
+        if ui.get_toast_action() == DROP_WAIT_CANCEL {
+            cancel_drop_wait(&ui, &st);
+            return;
+        }
         let items = std::mem::take(&mut st.borrow_mut().undo);
         if items.is_empty() {
             return;
@@ -2886,6 +2901,175 @@ fn watch_path_is_gone(dir: &Path) -> bool {
     }
 }
 
+/// How long a drop may wait on a dialog or an in-flight navigation before
+/// the user is told, and before the drop is cancelled.
+pub const DROP_WAIT_TOAST: Duration = Duration::from_secs(2);
+pub const DROP_WAIT_LIMIT: Duration = Duration::from_secs(15);
+
+/// The action on the hung-drop toast. Clicking it drops the queue so a
+/// later flush cannot complete the copy.
+pub const DROP_WAIT_CANCEL: &str = "Cancel";
+
+/// 2s notice: typographic ellipsis; `X` is the drop destination.
+pub fn drop_wait_toast(name: &str) -> String {
+    format!("Waiting to drop into {name}…")
+}
+
+/// 15s notice after the drop is cancelled because it never proceeded.
+pub fn drop_wait_cancelled(name: &str) -> String {
+    format!("Cancelled the drop into {name}")
+}
+
+/// The folder name used as `X` in hung-drop toasts: the in-flight
+/// navigation's target if any, otherwise the first frozen drop
+/// destination, otherwise the open folder.
+pub fn drop_wait_name(dropped: &[DroppedPath], open: &Path, nav_target: Option<&Path>) -> String {
+    if let Some(target) = nav_target {
+        return crate::ops::folder_name(target);
+    }
+    let dest = dropped
+        .iter()
+        .find_map(|(_, d)| d.as_deref())
+        .unwrap_or(open);
+    crate::ops::folder_name(dest)
+}
+
+/// A drop queue that cannot be flushed yet, and how long it has waited.
+#[derive(Clone, Debug)]
+pub struct DropWait {
+    since: std::time::Instant,
+    toasted: bool,
+}
+
+impl DropWait {
+    pub fn start(now: std::time::Instant) -> Self {
+        Self {
+            since: now,
+            toasted: false,
+        }
+    }
+
+    pub fn tick(&mut self, now: std::time::Instant) -> DropWaitTick {
+        let waited = now.saturating_duration_since(self.since);
+        if waited >= DROP_WAIT_LIMIT {
+            DropWaitTick::AutoCancel
+        } else if waited >= DROP_WAIT_TOAST && !self.toasted {
+            self.toasted = true;
+            DropWaitTick::Toast
+        } else {
+            DropWaitTick::Hold
+        }
+    }
+}
+
+/// What to do for a drop still held at `now`, or once it is no longer held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropWaitTick {
+    /// Still held, and the 2s toast is not due (or already showing).
+    Hold,
+    /// The wait ended because the drop flushed or the user cancelled it.
+    Clear,
+    /// Show "Waiting to drop into X…" with Cancel, and keep it up.
+    Toast,
+    /// 15s elapsed: drop the queue and tell the user.
+    AutoCancel,
+}
+
+/// Advance a held-drop wait with a controllable clock. `held` is true
+/// while the queue is non-empty and a dialog or navigation is blocking
+/// [`flush_drops`].
+pub fn tick_held_drop(
+    wait: &mut Option<DropWait>,
+    held: bool,
+    now: std::time::Instant,
+) -> DropWaitTick {
+    if !held {
+        return if wait.take().is_some() {
+            DropWaitTick::Clear
+        } else {
+            DropWaitTick::Hold
+        };
+    }
+    wait.get_or_insert_with(|| DropWait::start(now)).tick(now)
+}
+
+fn drops_held(st: &Shared) -> bool {
+    let s = st.borrow();
+    !s.dropped.borrow().is_empty() && (s.ctl.dialog.is_some() || s.ctl.nav_in_flight())
+}
+
+fn drop_wait_name_from(st: &Shared) -> String {
+    let s = st.borrow();
+    let dropped = s.dropped.borrow();
+    drop_wait_name(&dropped, &s.ctl.dir, s.ctl.nav_target())
+}
+
+fn tick_drop_wait(ui: &AppWindow, st: &Shared, now: std::time::Instant) {
+    let held = drops_held(st);
+    let tick = {
+        let mut s = st.borrow_mut();
+        tick_held_drop(&mut s.drop_wait, held, now)
+    };
+    match tick {
+        DropWaitTick::Hold => {}
+        DropWaitTick::Clear => {
+            let hide = {
+                let s = st.borrow();
+                s.drop_wait_toast_gen != 0 && s.toast_gen == s.drop_wait_toast_gen
+            };
+            st.borrow_mut().drop_wait_toast_gen = 0;
+            if hide {
+                ui.set_toast_on(false);
+                ui.set_toast_action("".into());
+            }
+        }
+        DropWaitTick::Toast => {
+            let name = drop_wait_name_from(st);
+            show_toast_sticky(
+                ui,
+                st,
+                "info",
+                drop_wait_toast(&name),
+                Vec::new(),
+                false,
+                DROP_WAIT_CANCEL,
+            );
+            let gen = st.borrow().toast_gen;
+            st.borrow_mut().drop_wait_toast_gen = gen;
+        }
+        DropWaitTick::AutoCancel => {
+            let name = drop_wait_name_from(st);
+            st.borrow().dropped.borrow_mut().clear();
+            let mut s = st.borrow_mut();
+            s.drop_wait = None;
+            s.drop_wait_toast_gen = 0;
+            drop(s);
+            show_toast(
+                ui,
+                st,
+                "info",
+                drop_wait_cancelled(&name),
+                Vec::new(),
+                false,
+                "",
+            );
+        }
+    }
+}
+
+/// Stop a hung drop so a later flush cannot complete it. The 2s toast
+/// goes away; the 15s cancelled notice is not shown, because the user
+/// already chose Cancel.
+fn cancel_drop_wait(ui: &AppWindow, st: &Shared) {
+    st.borrow().dropped.borrow_mut().clear();
+    let mut s = st.borrow_mut();
+    s.drop_wait = None;
+    s.drop_wait_toast_gen = 0;
+    drop(s);
+    ui.set_toast_on(false);
+    ui.set_toast_action("".into());
+}
+
 /// The one-time neutral notice for a folder without a live watch.
 pub fn watch_fallback_notice(dir: &Path) -> (String, Vec<String>) {
     (
@@ -2903,6 +3087,7 @@ pub fn watch_fallback_notice(dir: &Path) -> (String, Vec<String>) {
 fn poll_watch(ui: &AppWindow, st: &Shared) {
     flush_drops(ui, st);
     let now = std::time::Instant::now();
+    tick_drop_wait(ui, st, now);
     let warn = arm_watch(st, now);
     if let Some(dir) = warn {
         show_toast(
@@ -4442,26 +4627,13 @@ fn show_toast(
     pinned: bool,
     action: &str,
 ) {
-    let gen = {
-        let mut s = st.borrow_mut();
-        s.toast_gen += 1;
-        s.toast_open = false;
-        s.toast_all = details.clone();
-        s.toast_pinned = pinned;
-        s.toast_gen
-    };
-    ui.set_toast_tone(tone.into());
-    ui.set_toast_glyph(toast_glyph(tone).into());
-    ui.set_toast_text(text.into());
-    set_toast_rows(ui, &detail_rows(&details, pinned, false));
-    ui.set_toast_action(action.into());
-    ui.set_toast_open(false);
-    ui.set_toast_on(true);
+    bind_toast(ui, st, tone, text, details, pinned, action);
     let secs = if action.is_empty() && st.borrow().toast_all.is_empty() {
         4
     } else {
         8
     };
+    let gen = st.borrow().toast_gen;
     let w = ui.as_weak();
     let st = st.clone();
     slint::Timer::single_shot(Duration::from_secs(secs), move || {
@@ -4473,6 +4645,44 @@ fn show_toast(
             }
         }
     });
+}
+
+/// A toast that stays until something else replaces it or the caller hides it.
+fn show_toast_sticky(
+    ui: &AppWindow,
+    st: &Shared,
+    tone: &str,
+    text: String,
+    details: Vec<String>,
+    pinned: bool,
+    action: &str,
+) {
+    bind_toast(ui, st, tone, text, details, pinned, action);
+}
+
+fn bind_toast(
+    ui: &AppWindow,
+    st: &Shared,
+    tone: &str,
+    text: String,
+    details: Vec<String>,
+    pinned: bool,
+    action: &str,
+) {
+    {
+        let mut s = st.borrow_mut();
+        s.toast_gen += 1;
+        s.toast_open = false;
+        s.toast_all = details.clone();
+        s.toast_pinned = pinned;
+    }
+    ui.set_toast_tone(tone.into());
+    ui.set_toast_glyph(toast_glyph(tone).into());
+    ui.set_toast_text(text.into());
+    set_toast_rows(ui, &detail_rows(&details, pinned, false));
+    ui.set_toast_action(action.into());
+    ui.set_toast_open(false);
+    ui.set_toast_on(true);
 }
 
 /// Details shown before "+N more"; the pinned line doesn't count.
@@ -6072,6 +6282,140 @@ mod tests {
             "a self-drop is mentioned even when other items copy"
         );
         assert_eq!(drop_notice(1, 2, 0), None);
+    }
+
+    #[test]
+    fn a_hung_drop_toasts_at_two_seconds_and_auto_cancels_at_fifteen() {
+        let t0 = std::time::Instant::now();
+        let mut wait = None;
+        assert_eq!(tick_held_drop(&mut wait, true, t0), DropWaitTick::Hold);
+        assert_eq!(
+            tick_held_drop(
+                &mut wait,
+                true,
+                t0 + DROP_WAIT_TOAST - Duration::from_millis(1)
+            ),
+            DropWaitTick::Hold
+        );
+        assert_eq!(
+            tick_held_drop(&mut wait, true, t0 + DROP_WAIT_TOAST),
+            DropWaitTick::Toast
+        );
+        assert_eq!(
+            tick_held_drop(&mut wait, true, t0 + DROP_WAIT_TOAST),
+            DropWaitTick::Hold,
+            "the 2s toast is shown once"
+        );
+        assert_eq!(
+            tick_held_drop(
+                &mut wait,
+                true,
+                t0 + DROP_WAIT_LIMIT - Duration::from_millis(1)
+            ),
+            DropWaitTick::Hold
+        );
+        assert_eq!(
+            tick_held_drop(&mut wait, true, t0 + DROP_WAIT_LIMIT),
+            DropWaitTick::AutoCancel
+        );
+    }
+
+    #[test]
+    fn a_hung_drop_auto_cancels_even_if_the_two_second_tick_was_missed() {
+        let t0 = std::time::Instant::now();
+        // The wait started at t0; the first observed tick is already at 15s.
+        let mut wait = Some(DropWait::start(t0));
+        assert_eq!(
+            tick_held_drop(&mut wait, true, t0 + DROP_WAIT_LIMIT),
+            DropWaitTick::AutoCancel
+        );
+    }
+
+    #[test]
+    fn cancelling_a_hung_drop_clears_the_queue_and_does_not_auto_cancel() {
+        let t0 = std::time::Instant::now();
+        let mut wait = Some(DropWait::start(t0));
+        let mut dropped: Vec<DroppedPath> = vec![(PathBuf::from("/tmp/shot.png"), None)];
+        assert_eq!(
+            tick_held_drop(&mut wait, true, t0 + DROP_WAIT_TOAST),
+            DropWaitTick::Toast
+        );
+        // The Cancel action: empty the queue and end the wait so a later
+        // flush cannot complete the drop, and 15s does not speak for us.
+        dropped.clear();
+        assert_eq!(
+            tick_held_drop(&mut wait, false, t0 + DROP_WAIT_TOAST),
+            DropWaitTick::Clear
+        );
+        assert!(dropped.is_empty());
+        assert!(wait.is_none());
+        assert_eq!(
+            tick_held_drop(&mut wait, false, t0 + DROP_WAIT_LIMIT),
+            DropWaitTick::Hold,
+            "a cancelled drop is not auto-cancelled later"
+        );
+    }
+
+    #[test]
+    fn a_hung_drop_that_proceeds_clears_the_wait_without_cancelling() {
+        let t0 = std::time::Instant::now();
+        let mut wait = None;
+        tick_held_drop(&mut wait, true, t0 + DROP_WAIT_TOAST);
+        assert_eq!(
+            tick_held_drop(
+                &mut wait,
+                false,
+                t0 + DROP_WAIT_TOAST + Duration::from_secs(1)
+            ),
+            DropWaitTick::Clear
+        );
+        assert!(wait.is_none());
+        assert_eq!(
+            tick_held_drop(&mut wait, false, t0 + DROP_WAIT_LIMIT),
+            DropWaitTick::Hold
+        );
+    }
+
+    #[test]
+    fn hung_drop_copy_names_the_folder_being_opened() {
+        assert_eq!(
+            drop_wait_toast("raw-exports"),
+            "Waiting to drop into raw-exports…"
+        );
+        assert!(drop_wait_toast("raw-exports").contains('…'));
+        assert_eq!(
+            drop_wait_cancelled("raw-exports"),
+            "Cancelled the drop into raw-exports"
+        );
+        assert_eq!(DROP_WAIT_CANCEL, "Cancel");
+
+        let open = PathBuf::from("/home/sky/Pictures");
+        let nav = PathBuf::from("/home/sky/raw-exports");
+        let mid_nav = vec![(PathBuf::from("/tmp/shot.png"), None)];
+        assert_eq!(
+            drop_wait_name(&mid_nav, &open, Some(&nav)),
+            "raw-exports",
+            "X is the folder the navigation is opening"
+        );
+        let frozen = vec![(
+            PathBuf::from("/tmp/shot.png"),
+            Some(PathBuf::from("/home/sky/Downloads")),
+        )];
+        assert_eq!(
+            drop_wait_name(&frozen, &open, Some(&nav)),
+            "raw-exports",
+            "even a frozen dest waits on the folder being opened"
+        );
+        assert_eq!(
+            drop_wait_name(&frozen, &open, None),
+            "Downloads",
+            "a dialog-held drop names its frozen destination"
+        );
+        assert_eq!(
+            drop_wait_name(&mid_nav, &open, None),
+            "Pictures",
+            "an unresolved drop names the open folder"
+        );
     }
 
     #[test]
