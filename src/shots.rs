@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::rc::Rc;
 
-use slint::{ModelRc, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::error::{Error, Result};
 use crate::theme::Theme;
@@ -104,6 +104,11 @@ pub fn paint(view: &str, theme: &Theme, size: (u32, u32), out: &Path) -> Result<
         ui.set_harness(false);
         apply_scene(&ui, view);
         fileops_scene(&ui, view);
+        // The list's columns follow its width, as the app's resize hook
+        // sets them; without this a small frame keeps the 800px columns.
+        ui.window()
+            .set_size(slint::PhysicalSize::new(size.0, size.1));
+        ui.global::<crate::Columns>().set_row_w(ui.get_content_w());
     }
     crate::render::snapshot(&ui, size, out)
 }
@@ -177,6 +182,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         "15 items · 1 hidden · 1 selected (6.2 MB)".into()
     });
     ui.set_status_right("812 GB free of 1.8 TB".into());
+    ui.set_status_free_short("812 GB free".into());
     ui.set_crumbs(if view == "breadcrumb-overflow" {
         "…  ›  Pictures  ›  tatooine-trip  ›  2026".into()
     } else {

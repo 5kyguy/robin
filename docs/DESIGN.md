@@ -78,8 +78,18 @@ Glyph sizes: 14 in rows and the sidebar (FolderSidebar glyph 14 in an 18px box) 
 └─────────────┴──────── status bar 26 ───────────────────────────┘
 ```
 
+### Resizing
+1280×800 is the reference: every frame at that size is drawn as specified above. Smaller windows keep the same parts and shrink, elide, wrap, scroll, or move them; nothing new is drawn for them.
+- **Floor.** The window asks for at least 480×360. Every view below is laid out to stay usable down to that size.
+- **Shell.** The sidebar folds to its rail on its own; list columns shrink and Type drops out before a name is cut; the breadcrumb field takes what the toolbar buttons leave; the status bar shows the short free-space text. In the progress strip the label (280) and the figures (228) shrink and elide, and the bar is dropped once it would be under 48.
+- **Dialogs** are their spec width or the window − 32, whichever is smaller, and never taller than the window − 32. Name lists and the refused-move list scroll; the buttons always show. Conflict cards share the dialog's width and the buttons stay right-aligned.
+- **Context menus** that would run off the right or bottom edge open left of or above the pointer, 8 inside the window, and scroll when taller than it. Toasts, the drag label and the path completion dropdown are capped to the window; an expanded toast's list scrolls in the room above the status bar.
+- **Shortcut overlay:** min(760, window − 32) × min(520, window − 32). Its sections sit in three columns from a 700px panel, two from 420, otherwise one, and scroll under the filter.
+- **Viewer.** The top bar is min(560, window − 32) and the toolbar min(300, window − 32). A filmstrip wider than the window − 32 is cut at its ends and slid so the current tile stays centred. From a 720px window the info panel docks and the picture fits beside it; narrower, it floats at the right below the top bar and above the toolbar, or above the filmstrip while the strip shows so the current tile stays visible (min(300, window − 32) wide), and its facts scroll. Where they would touch, the zoom chip drops under the top bar and the minimap rises above the toolbar or filmstrip. The video transport is window − 120, or window − 32 below 600 (the width the picture has, when the info panel docks).
+- **Statistics** scrolls. FILE TYPES sits beside the 655px treemap card while it keeps 300, otherwise under it at full width; the treemap stretches to its card. CACHE and TRASH sit side by side while each keeps 360, otherwise stack. A disk row under 560 moves its free-space line under the bar.
+
 ### Places sidebar (FolderSidebar.qml)
-- Width 232. Drag the 6px handle on the right edge (FolderSidebar width 6) to resize it between 180 and 360. `Ctrl+B` collapses it to a 52px glyph rail, and below a 760px window width it auto-collapses (Main.qml `width >= 760`). Collapsing and expanding use the spring.
+- Width 232. Drag the 6px handle on the right edge (FolderSidebar width 6) to resize it between 180 and 360. `Ctrl+B` collapses it to a 52px glyph rail, and below a 720px window width it auto-collapses. Collapsing and expanding use the spring.
 - Fill `surface`. Right edge is a 1px `divider` line.
 - Padding is 8. Each section has a header row 24px tall in `t-label` style.
 - Sections, in order:

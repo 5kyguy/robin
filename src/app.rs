@@ -655,8 +655,10 @@ impl Controller {
         let Some(v) = self.viewer.as_mut() else {
             return Action::None;
         };
-        let info = if v.info { 332.0 } else { 0.0 };
-        let view = ((window.0 - info).max(1.0), window.1.max(1.0));
+        let view = (
+            (window.0 - info_dock(v.info, window.0)).max(1.0),
+            window.1.max(1.0),
+        );
         self.view_geom.set((image, view));
         let before = v.pan;
         v.pan_by((0.0, 0.0), image, view);
@@ -3653,6 +3655,22 @@ fn remember_prefs(s: &State) {
 /// Filmstrip tiles shown at once (DESIGN §5).
 pub const STRIP_TILES: usize = 11;
 
+/// The viewer's info panel docks beside the picture from this window
+/// width up; narrower, it floats over the picture. Mirrors `info-docked`
+/// in app.slint.
+pub const INFO_DOCK_MIN: f32 = 720.0;
+
+/// How much width the open info panel takes from the picture in a
+/// window `width` wide: 300 plus its 16px inset either side when docked,
+/// nothing when it floats.
+pub fn info_dock(info: bool, width: f32) -> f32 {
+    if info && width >= INFO_DOCK_MIN {
+        332.0
+    } else {
+        0.0
+    }
+}
+
 /// A decoded picture, or why there is none.
 type Decoded = std::result::Result<Arc<image::RgbaImage>, crate::picture::Why>;
 
@@ -4393,7 +4411,7 @@ fn sync_still(ui: &AppWindow, s: &State, path: &Path) -> Option<(u32, u32)> {
     };
     let quiet = !ready;
     let size = ui.window().size().to_logical(ui.window().scale_factor());
-    let view_w = size.width - if v.info { 332.0 } else { 0.0 };
+    let view_w = size.width - info_dock(v.info, size.width);
     let view = (view_w.max(1.0), size.height.max(1.0));
     match &pic {
         Ok(img) => {
@@ -4439,6 +4457,7 @@ fn sync_viewer_tail(ui: &AppWindow, s: &State, name: &str, dims: Option<(u32, u3
     };
     let mut pics = s.pics.borrow_mut();
     let window = v.strip_window(STRIP_TILES);
+    ui.set_view_tile_at(v.index.saturating_sub(window.start) as i32);
     let mut tiles = Vec::new();
     let mut missing = Vec::new();
     for i in window {
@@ -8259,6 +8278,22 @@ mod tests {
             Action::None,
             "already inside"
         );
+    }
+
+    #[test]
+    fn the_info_panel_takes_width_only_where_it_docks() {
+        let mut c = setup("viewer-info-dock");
+        select(&mut c, "a.jpg");
+        c.key(keys::RETURN, false, false);
+        c.view_geom.set(((1000.0, 800.0), (0.0, 0.0)));
+        c.viewer.as_mut().unwrap().info = true;
+        c.viewer_resized((1280.0, 800.0));
+        assert_eq!(c.view_geom.get().1, (948.0, 800.0), "docked beside");
+        c.viewer_resized((719.0, 500.0));
+        assert_eq!(c.view_geom.get().1, (719.0, 500.0), "floats over");
+        c.viewer.as_mut().unwrap().info = false;
+        c.viewer_resized((1280.0, 800.0));
+        assert_eq!(c.view_geom.get().1, (1280.0, 800.0), "closed");
     }
 
     #[test]

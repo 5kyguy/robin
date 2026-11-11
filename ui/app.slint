@@ -398,10 +398,15 @@ component JobRow inherits Rectangle {
     property <length> btn: 28px;
     property <length> action-w: failed ? 112px : btn * 2 + 2px;
     property <length> action-x: self.width - 8px - action-w;
-    property <length> stats-w: 228px;
+    // Label, bar and figures share what the actions leave. At the 1280
+    // reference they get 280 / flex / 228; a narrower strip shrinks the
+    // label and figures (both elide), and the bar goes before they do.
+    property <length> avail: max(0px, action-x - 8px - 40px);
+    property <length> label-w: min(280px, avail * 0.38);
+    property <length> stats-w: min(228px, avail * 0.34);
     property <length> stats-x: action-x - 8px - stats-w;
-    property <length> label-w: 280px;
     property <length> bar-x: 40px + label-w + 12px;
+    property <length> bar-w: stats-x - 12px - bar-x;
     Text {
         text: glyph;
         x: 12px;
@@ -425,10 +430,10 @@ component JobRow inherits Rectangle {
         vertical-alignment: center;
         overflow: elide;
     }
-    Rectangle {
+    if bar-w >= 48px: Rectangle {
         x: bar-x;
         y: (parent.height - 4px) / 2;
-        width: max(stats-x - 12px - bar-x, 200px);
+        width: bar-w;
         height: 4px;
         border-radius: 2px;
         background: ink.with-alpha(0.12);
@@ -806,6 +811,8 @@ export component AppWindow inherits Window {
     in property <bool> view-spinner: false;
     in property <string> view-dir;
     in property <[ViewTile]> view-tiles;
+    // The current item's place in view-tiles.
+    in property <int> view-tile-at;
     in property <[Fact]> view-facts;
     callback view-close();
     callback view-go(int);
@@ -967,6 +974,10 @@ export component AppWindow inherits Window {
     forward-focus: keys;
 
     title: "Robin";
+    // The smallest window every view is laid out for (DESIGN §2,
+    // Resizing). The harness frame is a theme swatch, not a view.
+    min-width: harness ? 0px : 480px;
+    min-height: harness ? 0px : 360px;
     default-font-family: "JetBrainsMono Nerd Font";
     default-font-size: 12px;
     background: bg;
@@ -1806,7 +1817,10 @@ export component AppWindow inherits Window {
         // the items scroll past 240px so the toast never covers the list.
         property <length> pin-h: toast-pin != "" ? line-h : 0px;
         property <length> rows-h: toast-details.length * line-h + (toast-more > 0 ? line-h : 0px);
-        property <length> list-h: toast-expanded ? min(240px, rows-h) : rows-h;
+        // Never taller than the space between the toolbar and the toast's
+        // own spot above the status bar; the rest scrolls.
+        property <length> room: max(0px, parent.height - toolbar-h - status-h - 32px - 52px - 24px - pin-h);
+        property <length> list-h: min(toast-expanded ? min(240px, rows-h) : rows-h, room);
         height: open ? 52px + 12px + pin-h + list-h + 12px : 52px;
         x: side-w + (parent.width - side-w - self.width) / 2;
         y: parent.height - status-h - 16px - self.height;
@@ -1914,10 +1928,12 @@ export component AppWindow inherits Window {
         // Menus open over the window as it is; dialogs get the scrim.
         background: overlay == "menu-file" || overlay == "menu-bg" ? transparent : #000000.with-alpha(0.6);
         if overlay == "delete" || overlay == "trash" || overlay == "trash-no": Rectangle {
-            width: 440px;
+            // 440 wide, or 16 clear of each window edge when that is less.
+            width: min(440px, parent.width - 32px);
             // Title, note, up to six name lines ("and N more"), the trash
-            // confirm's "Don't ask again" row, buttons.
-            height: 150px + max(1, confirm-names-count) * 15px + (overlay == "trash" ? 26px : 0px);
+            // confirm's "Don't ask again" row, buttons. A short window
+            // scrolls the names; the buttons always show.
+            height: min(150px + max(1, confirm-names-count) * 15px + (overlay == "trash" ? 26px : 0px), parent.height - 32px);
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: surface;
@@ -1944,14 +1960,20 @@ export component AppWindow inherits Window {
                     font-size: 13px;
                     font-weight: 700;
                     color: text;
+                    overflow: elide;
                 }
                 Text {
                     text: overlay == "delete" ? "This can't be undone." : overlay == "trash-no" ? "Robin will not copy these files home." : "You can restore them from Trash.";
                     font-size: 12px;
                     color: muted;
+                    overflow: elide;
                 }
-                Text { text: confirm-names; font-size: 11px; color: muted; }
-                Rectangle { vertical-stretch: 1; }
+                Flickable {
+                    vertical-stretch: 1;
+                    min-height: 0px;
+                    viewport-height: names-text.preferred-height;
+                    names-text := Text { text: confirm-names; font-size: 11px; color: muted; width: parent.width; overflow: elide; }
+                }
                 if overlay == "trash": HorizontalLayout {
                     spacing: 8px;
                     height: 18px;
@@ -2010,10 +2032,11 @@ export component AppWindow inherits Window {
             if overlay == "delete": Rectangle { x: 0px; y: 0px; width: parent.width; height: 3px; background: danger; }
         }
         if overlay == "move-refused": Rectangle {
-            width: 460px;
-            // The list shows up to 14 lines and scrolls past that.
+            width: min(460px, parent.width - 32px);
+            // The list shows up to 14 lines and scrolls past that, or past
+            // what a short window leaves once the buttons are placed.
             property <length> list-h: (refusal-lines.length + refusal-notes) * 18px;
-            height: 160px + min(list-h, 252px);
+            height: min(160px + min(list-h, 252px), parent.height - 32px);
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: surface;
@@ -2031,7 +2054,9 @@ export component AppWindow inherits Window {
                     wrap: word-wrap;
                 }
                 Flickable {
-                    height: min(list-h, 252px);
+                    vertical-stretch: 1;
+                    min-height: 0px;
+                    preferred-height: min(list-h, 252px);
                     viewport-height: list-h;
                     VerticalLayout {
                         for line in refusal-lines: VerticalLayout {
@@ -2040,7 +2065,6 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
                     alignment: end;
                     spacing: 8px;
@@ -2069,15 +2093,24 @@ export component AppWindow inherits Window {
         }
         if overlay == "menu-file" || overlay == "menu-bg": Rectangle {
             // From the pointer: a file row, or empty space in the list.
-            x: overlay == "menu-file" ? 280px : 620px;
-            y: overlay == "menu-file" ? 150px : 300px;
-            width: 248px;
-            height: menu-list.preferred-height;
+            // Kept 8 inside the window: a menu that would run off the right
+            // or bottom edge opens up or left of the pointer instead, and
+            // one taller than the window scrolls.
+            property <length> at-x: overlay == "menu-file" ? 280px : 620px;
+            property <length> at-y: overlay == "menu-file" ? 150px : 300px;
+            width: min(248px, parent.width - 16px);
+            height: min(menu-list.preferred-height, parent.height - 16px);
+            x: at-x + self.width + 8px <= parent.width ? at-x : max(8px, min(at-x, parent.width - 8px) - self.width);
+            y: at-y + self.height + 8px <= parent.height ? at-y : max(8px, min(at-y, parent.height - 8px) - self.height);
+            clip: true;
             background: surface;
             border-radius: 10px;
             border-width: 1px;
             border-color: hairline;
+            Flickable {
+            viewport-height: menu-list.preferred-height;
             menu-list := VerticalLayout {
+                width: parent.width;
                 padding: 4px;
                 spacing: 0px;
                 for item in menu-items: Rectangle {
@@ -2105,6 +2138,7 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+            }
         }
     }
 
@@ -2116,10 +2150,13 @@ export component AppWindow inherits Window {
         background: #000000.with-alpha(0.6);
         TouchArea { }
         Rectangle {
-            width: 480px;
+            // 480 wide, or 16 clear of each window edge; the two cards
+            // share what is left, and the buttons stay right-aligned.
+            width: min(480px, parent.width - 32px);
             height: 328px;
             x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
+            y: max(0px, (parent.height - self.height) / 2);
+            property <length> card-w: (self.width - 48px) / 2;
             background: surface;
             border-radius: 10px;
             border-width: 1px;
@@ -2139,12 +2176,12 @@ export component AppWindow inherits Window {
             Rectangle {
                 x: 16px;
                 y: 48px;
-                width: 216px;
+                width: card-w;
                 height: 146px;
                 border-radius: 6px;
                 border-width: 1px;
                 border-color: hairline;
-                Text { text: conflict-name; x: 8px; y: 6px; width: 200px; height: 16px; font-size: 11px; color: text; overflow: elide; }
+                Text { text: conflict-name; x: 8px; y: 6px; width: parent.width - 16px; height: 16px; font-size: 11px; color: text; overflow: elide; }
                 if !live: Image {
                     x: 8px;
                     y: 26px;
@@ -2158,20 +2195,20 @@ export component AppWindow inherits Window {
                 if conflict-existing-badge != "": Text { text: conflict-existing-badge; x: 8px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
                 if conflict-existing-badge2 != "": Rectangle { x: 64px; y: 94px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
                 if conflict-existing-badge2 != "": Text { text: conflict-existing-badge2; x: 64px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
-                Text { text: conflict-existing-size; x: 80px; y: 28px; width: 128px; height: 16px; font-size: 11px; color: muted; }
-                Text { text: conflict-existing-date; x: 80px; y: 46px; width: 128px; height: 16px; font-size: 11px; color: muted; }
-                Text { text: conflict-kind; x: 80px; y: 64px; width: 128px; height: 16px; font-size: 11px; color: muted; }
-                Text { text: "Existing"; x: 8px; y: 116px; width: 200px; height: 16px; font-size: 11px; color: muted; }
+                Text { text: conflict-existing-size; x: 80px; y: 28px; width: parent.width - 88px; height: 16px; font-size: 11px; color: muted; overflow: elide; }
+                Text { text: conflict-existing-date; x: 80px; y: 46px; width: parent.width - 88px; height: 16px; font-size: 11px; color: muted; overflow: elide; }
+                Text { text: conflict-kind; x: 80px; y: 64px; width: parent.width - 88px; height: 16px; font-size: 11px; color: muted; overflow: elide; }
+                Text { text: "Existing"; x: 8px; y: 116px; width: parent.width - 16px; height: 16px; font-size: 11px; color: muted; }
             }
             Rectangle {
-                x: 248px;
+                x: 32px + card-w;
                 y: 48px;
-                width: 216px;
+                width: card-w;
                 height: 146px;
                 border-radius: 6px;
                 border-width: 1px;
                 border-color: hairline;
-                Text { text: conflict-name; x: 8px; y: 6px; width: 200px; height: 16px; font-size: 11px; color: text; overflow: elide; }
+                Text { text: conflict-name; x: 8px; y: 6px; width: parent.width - 16px; height: 16px; font-size: 11px; color: text; overflow: elide; }
                 if !live: Image {
                     x: 8px;
                     y: 26px;
@@ -2185,19 +2222,20 @@ export component AppWindow inherits Window {
                 if conflict-incoming-badge != "": Text { text: conflict-incoming-badge; x: 8px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
                 if conflict-incoming-badge2 != "": Rectangle { x: 64px; y: 94px; width: 52px; height: 14px; border-radius: 2px; background: accent; }
                 if conflict-incoming-badge2 != "": Text { text: conflict-incoming-badge2; x: 64px; y: 94px; width: 52px; height: 14px; font-size: 9px; font-weight: 700; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
-                Text { text: conflict-incoming-size; x: 80px; y: 28px; width: 128px; height: 16px; font-size: 11px; color: muted; }
-                Text { text: conflict-incoming-date; x: 80px; y: 46px; width: 128px; height: 16px; font-size: 11px; color: muted; }
-                Text { text: conflict-kind; x: 80px; y: 64px; width: 128px; height: 16px; font-size: 11px; color: muted; }
-                Text { text: "Incoming"; x: 8px; y: 116px; width: 200px; height: 16px; font-size: 11px; color: muted; }
+                Text { text: conflict-incoming-size; x: 80px; y: 28px; width: parent.width - 88px; height: 16px; font-size: 11px; color: muted; overflow: elide; }
+                Text { text: conflict-incoming-date; x: 80px; y: 46px; width: parent.width - 88px; height: 16px; font-size: 11px; color: muted; overflow: elide; }
+                Text { text: conflict-kind; x: 80px; y: 64px; width: parent.width - 88px; height: 16px; font-size: 11px; color: muted; overflow: elide; }
+                Text { text: "Incoming"; x: 8px; y: 116px; width: parent.width - 16px; height: 16px; font-size: 11px; color: muted; }
             }
             Text {
                 text: conflict-hint;
                 x: 16px;
                 y: 202px;
-                width: 448px;
+                width: parent.width - 32px;
                 height: 16px;
                 font-size: 11px;
                 color: muted;
+                overflow: elide;
             }
             // What Cancel doesn't take back, on its own line; 16px clear
             // of the right edge.
@@ -2235,13 +2273,14 @@ export component AppWindow inherits Window {
                 text: conflict-apply-label;
                 x: 36px;
                 y: 244px;
-                width: 330px;
+                width: min(330px, parent.width - 52px);
                 height: 18px;
                 font-size: 12px;
                 color: text;
                 vertical-alignment: center;
+                overflow: elide;
             }
-            TouchArea { x: 12px; y: 240px; width: 248px; height: 26px; clicked => { root.dialog-button(4); } }
+            TouchArea { x: 12px; y: 240px; width: min(248px, parent.width - 24px); height: 26px; clicked => { root.dialog-button(4); } }
             if live: Rectangle {
                 x: 16px;
                 y: 280px;
@@ -2254,7 +2293,7 @@ export component AppWindow inherits Window {
                 TouchArea { clicked => { root.dialog-button(0); } }
             }
             Rectangle {
-                x: 176px;
+                x: parent.width - 16px - 96px - 8px - 88px - 8px - 88px;
                 y: 280px;
                 width: 88px;
                 height: 32px;
@@ -2265,7 +2304,7 @@ export component AppWindow inherits Window {
                 TouchArea { clicked => { root.dialog-button(1); } }
             }
             Rectangle {
-                x: 272px;
+                x: parent.width - 16px - 96px - 8px - 88px;
                 y: 280px;
                 width: 88px;
                 height: 32px;
@@ -2276,7 +2315,7 @@ export component AppWindow inherits Window {
                 TouchArea { clicked => { root.dialog-button(2); } }
             }
             Rectangle {
-                x: 368px;
+                x: parent.width - 16px - 96px;
                 y: 280px;
                 width: 96px;
                 height: 32px;
@@ -2294,7 +2333,16 @@ export component AppWindow inherits Window {
     if !harness && view-on: Rectangle {
         clip: true;
         background: #000000;
-        property <length> open-w: view-info ? self.width - 332px : self.width;
+        // From 720 up the info panel docks and the picture fits beside it;
+        // narrower, it floats over the picture between the top bar and the
+        // toolbar. Mirrored by `app::info_dock`.
+        property <bool> info-docked: self.width >= 720px;
+        property <length> open-w: view-info && info-docked ? self.width - 332px : self.width;
+        // The chrome's sizes, for keeping the HUD and minimap clear of it.
+        property <length> bar-w: min(560px, open-w - 32px);
+        property <length> tools-w: min(300px, open-w - 32px);
+        property <length> strip-full: view-tiles.length * 76px + 8px;
+        property <length> strip-w: min(strip-full, open-w - 32px);
         Rectangle { background: bg.with-alpha(0.30); }
         // Drags pan (the controller ignores them at fit); any move wakes
         // the chrome.
@@ -2394,7 +2442,7 @@ export component AppWindow inherits Window {
         if view-chrome: Rectangle {
             y: 16px;
             x: (open-w - self.width) / 2;
-            width: min(560px, open-w - 32px);
+            width: bar-w;
             height: 40px;
             background: bg.with-alpha(0.86);
             border-radius: 10px;
@@ -2425,13 +2473,19 @@ export component AppWindow inherits Window {
         if view-chrome && view-strip && view-tiles.length > 1: Rectangle {
             y: parent.height - 16px - 46px - 12px - self.height;
             x: (open-w - self.width) / 2;
-            width: view-tiles.length * 76px + 8px;
+            // A strip wider than the window is cut at its rounded ends and
+            // slid so the current tile stays in view, centred when it can be.
+            width: strip-w;
             height: 60px;
             background: bg.with-alpha(0.86);
             border-radius: 10px;
             border-width: 1px;
             border-color: hairline;
+            clip: true;
+            property <length> at: 6px + view-tile-at * 76px + 36px;
             HorizontalLayout {
+                x: max(parent.width - strip-full, min(0px, parent.width / 2 - parent.at));
+                width: strip-full;
                 padding: 6px;
                 spacing: 4px;
                 for t[i] in view-tiles: FilmTile {
@@ -2443,7 +2497,7 @@ export component AppWindow inherits Window {
         if view-chrome && !view-playing: Rectangle {
             y: parent.height - 16px - 46px;
             x: (open-w - self.width) / 2;
-            width: 300px;
+            width: tools-w;
             height: 46px;
             background: bg.with-alpha(0.86);
             border-radius: 10px;
@@ -2451,7 +2505,7 @@ export component AppWindow inherits Window {
             border-color: hairline;
             HorizontalLayout {
                 alignment: center;
-                spacing: 18px;
+                spacing: parent.width < 300px ? 10px : 18px;
                 for k in [{g: "󰁍", k: "h"}, {g: "−", k: "-"}, {g: "fit", k: "0"}, {g: "1:1", k: "1"}, {g: "+", k: "+"}, {g: "󰑙", k: "r"}, {g: "󰁔", k: "l"}]: Text {
                     text: k.g; font-size: 14px; color: text; vertical-alignment: center;
                     TouchArea { clicked => { root.view-key(k.k); } }
@@ -2459,11 +2513,12 @@ export component AppWindow inherits Window {
             }
         }
         // The transport (ViewerTransport) replaces the toolbar while a
-        // video or audio file plays: 46 tall, window − 120 wide.
+        // video or audio file plays: 46 tall, window − 120 wide, or 16 clear
+        // of each side below 600 (DESIGN §2 Resizing), as the mock below.
         if view-chrome && view-playing && view-note == "": Rectangle {
             y: parent.height - 16px - 46px;
             x: (open-w - self.width) / 2;
-            width: max(320px, open-w - 120px);
+            width: open-w >= 600px ? open-w - 120px : open-w - 32px;
             height: 46px;
             background: bg.with-alpha(0.86);
             border-radius: 10px;
@@ -2691,7 +2746,9 @@ export component AppWindow inherits Window {
         }
         if view-zoom != "": Rectangle {
             x: open-w - 16px - self.width;
-            y: 16px;
+            // Under the top bar when a narrow window would put them side by
+            // side and touching.
+            y: view-chrome && (open-w + bar-w) / 2 + 8px > self.x ? 16px + 40px + 8px : 16px;
             width: 64px;
             height: 28px;
             background: bg.with-alpha(0.86);
@@ -2712,7 +2769,14 @@ export component AppWindow inherits Window {
             property <length> vh: parent.height;
             property <length> iy: (vh - ih) / 2 + view-pan-y * 1px;
             x: open-w - 16px - 120px;
-            y: parent.height - 16px - 80px;
+            // Above the toolbar and filmstrip when the chrome is up and
+            // reaches under it (narrow windows).
+            property <bool> under-tools: (open-w + tools-w) / 2 + 8px > self.x;
+            property <bool> under-strip: strip-on && (open-w + strip-w) / 2 + 8px > self.x;
+            y: !view-chrome ? parent.height - 16px - 80px
+                : under-strip ? parent.height - 16px - 46px - 12px - 60px - 8px - 80px
+                : under-tools ? parent.height - 16px - 46px - 8px - 80px
+                : parent.height - 16px - 80px;
             width: 120px;
             height: 80px;
             background: #000000;
@@ -2737,15 +2801,22 @@ export component AppWindow inherits Window {
             }
         }
         if view-info: Rectangle {
-            x: parent.width - 16px - 300px;
-            y: 16px;
-            width: 300px;
-            height: parent.height - 32px;
+            width: min(300px, parent.width - 32px);
+            x: parent.width - 16px - self.width;
+            // Floating, it keeps the top bar, the toolbar and the filmstrip
+            // (with its current tile) clear.
+            y: info-docked || !view-chrome ? 16px : 16px + 40px + 8px;
+            height: max(0px, parent.height - self.y - (info-docked || !view-chrome ? 16px : strip-on ? 16px + 46px + 12px + 60px + 8px : 16px + 46px + 8px));
             background: bg.with-alpha(0.92);
             border-radius: 10px;
             border-width: 1px;
             border-color: hairline;
-            VerticalLayout {
+            clip: true;
+            // Facts past the panel's height scroll.
+            Flickable {
+            viewport-height: facts.preferred-height;
+            facts := VerticalLayout {
+                width: parent.width;
                 padding: 16px;
                 spacing: 0px;
                 alignment: start;
@@ -2755,11 +2826,16 @@ export component AppWindow inherits Window {
                 Text { text: "FILE"; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; height: 20px; }
                 for f in view-facts: MetaRow { key: f.key; value: f.value; ink: root.text; muted-ink: root.muted; }
             }
+            }
         }
     }
     if !harness && viewer != "": Rectangle {
         clip: true;
-        property <length> open-w: viewer == "info" ? parent.width - 328px : parent.width;
+        // Same rules as the live viewer above: the panel docks from 720 up.
+        property <bool> info-docked: parent.width >= 720px;
+        property <length> open-w: viewer == "info" && info-docked ? parent.width - 328px : parent.width;
+        property <length> strip-w: min(844px, open-w - 32px);
+        property <length> tools-w: min(420px, open-w - 32px);
         background: #000000;
         Rectangle { background: bg.with-alpha(0.30); width: parent.width; height: parent.height; }
         if viewer == "image" || viewer == "hidden" || viewer == "info" || viewer == "slideshow": Image {
@@ -2789,7 +2865,7 @@ export component AppWindow inherits Window {
         if viewer != "hidden" && viewer != "slideshow": Rectangle {
             y: 16px;
             x: (open-w - self.width) / 2;
-            width: 560px;
+            width: min(560px, open-w - 32px);
             height: 40px;
             background: bg.with-alpha(0.86);
             border-radius: 10px;
@@ -2810,13 +2886,17 @@ export component AppWindow inherits Window {
         if viewer != "hidden" && viewer != "slideshow": Rectangle {
             y: parent.height - 138px;
             x: (open-w - self.width) / 2;
-            width: 844px;
+            width: strip-w;
             height: 60px;
             background: bg.with-alpha(0.86);
             border-radius: 10px;
             border-width: 1px;
             border-color: hairline;
+            clip: true;
             HorizontalLayout {
+                // The current (sixth) tile stays centred.
+                x: max(parent.width - 844px, min(0px, parent.width / 2 - 422px));
+                width: 844px;
                 padding: 6px;
                 spacing: 4px;
                 FilmTile { shot: @image-url("../assets/viewer/tile-a.png"); current: false; ring: root.accent; }
@@ -2835,8 +2915,9 @@ export component AppWindow inherits Window {
         if viewer != "hidden" && viewer != "slideshow" && viewer != "video" && viewer != "scrub" && viewer != "resume": Rectangle {
             y: parent.height - 16px - 46px;
             x: (open-w - self.width) / 2;
-            width: 420px;
+            width: tools-w;
             height: 46px;
+            clip: true;
             background: bg.with-alpha(0.86);
             border-radius: 10px;
             border-width: 1px;
@@ -2849,8 +2930,9 @@ export component AppWindow inherits Window {
         }
         if viewer == "video" || viewer == "scrub" || viewer == "resume": Rectangle {
             y: parent.height - 16px - 46px;
-            x: 60px;
-            width: parent.width - 120px;
+            // Window − 120 (DESIGN §5); a narrow window keeps 16 a side.
+            width: parent.width >= 600px ? parent.width - 120px : parent.width - 32px;
+            x: (parent.width - self.width) / 2;
             height: 46px;
             background: bg.with-alpha(0.86);
             border-radius: 10px;
@@ -2858,7 +2940,7 @@ export component AppWindow inherits Window {
             border-color: hairline;
             property <length> track-h: viewer == "scrub" ? 5px : 3px;
             property <length> track-x: 156px;
-            property <length> track-w: self.width - 276px;
+            property <length> track-w: max(0px, self.width - 276px);
             Text {
                 text: viewer == "video" ? "󰐊" : "󰏤";
                 x: 12px;
@@ -2923,15 +3005,20 @@ export component AppWindow inherits Window {
             }
         }
         if viewer == "info": Rectangle {
-            x: parent.width - 16px - 300px;
-            y: 72px;
-            width: 300px;
-            height: parent.height - 88px;
+            width: min(300px, parent.width - 32px);
+            x: parent.width - 16px - self.width;
+            y: info-docked ? 72px : 64px;
+            // Floating, it stops above the filmstrip (138 from the bottom).
+            height: max(0px, parent.height - self.y - (info-docked ? 16px : 138px + 8px));
             background: bg.with-alpha(0.92);
             border-radius: 10px;
             border-width: 1px;
             border-color: hairline;
-            VerticalLayout {
+            clip: true;
+            Flickable {
+            viewport-height: mock-facts.preferred-height;
+            mock-facts := VerticalLayout {
+                width: parent.width;
                 padding: 16px;
                 spacing: 0px;
                 alignment: start;
@@ -2955,10 +3042,13 @@ export component AppWindow inherits Window {
                 Text { text: "LOCATION"; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; height: 20px; }
                 MetaRow { key: "Coords"; value: "33.98, 7.60"; ink: root.text; muted-ink: root.muted; }
             }
+            }
         }
         if viewer == "zoom": Rectangle {
             x: parent.width - 16px - 120px;
-            y: parent.height - 16px - 80px;
+            // Lifted above the filmstrip when a narrow window puts them
+            // under each other.
+            y: (open-w + strip-w) / 2 + 8px > self.x ? parent.height - 138px - 8px - 80px : parent.height - 16px - 80px;
             width: 120px;
             height: 80px;
             background: #000000;
@@ -2991,9 +3081,9 @@ export component AppWindow inherits Window {
             Text { text: "400%"; font-size: 11px; color: text; horizontal-alignment: center; vertical-alignment: center; }
         }
         if viewer == "resume": Rectangle {
-            x: (parent.width - 280px) / 2;
+            width: min(280px, parent.width - 32px);
+            x: (parent.width - self.width) / 2;
             y: parent.height - 194px;
-            width: 280px;
             height: 40px;
             background: bg.with-alpha(0.86);
             border-radius: 10px;
@@ -3015,13 +3105,33 @@ export component AppWindow inherits Window {
         width: parent.width - side-w - 1px;
         height: parent.height;
         property <length> pad: 20px;
-        property <length> tree-w: 655px;
-        property <length> map-w: 623px;
+        property <length> page-w: self.width;
+        property <length> inner: page-w - pad * 2;
+        // The treemap card keeps its 655 with FILE TYPES beside it while
+        // that leaves FILE TYPES 300; narrower, FILE TYPES moves under it
+        // and the treemap takes the full width. The page scrolls.
+        property <bool> side-by-side: inner >= 655px + 12px + 300px;
+        property <length> tree-w: side-by-side ? 655px : inner;
+        property <length> map-w: tree-w - 32px;
         property <length> map-h: 300px;
+        // The cells are laid out for 623×300 (app::map_cells) and
+        // stretched across the card's width.
+        property <float> map-k: map-w / 623px;
         property <length> disks-h: 44px + max(1, stat-disks.length) * 42px;
         property <length> mid-y: 48px + disks-h + 12px;
         property <length> mid-h: 356px;
-        property <length> bot-y: mid-y + mid-h + 12px;
+        property <length> types-x: side-by-side ? pad + tree-w + 12px : pad;
+        property <length> types-y: side-by-side ? mid-y : mid-y + mid-h + 12px;
+        property <length> types-w: side-by-side ? inner - tree-w - 12px : inner;
+        property <length> types-h: side-by-side ? mid-h : 68px + max(1, stat-types.length) * 24px + 8px;
+        property <length> bot-y: types-y + types-h + 12px;
+        // CACHE and TRASH sit side by side while each gets 360.
+        property <bool> bot-pair: inner >= 360px * 2 + 12px;
+        property <length> bot-w: bot-pair ? (inner - 12px) / 2 : inner;
+        property <length> content-h: bot-y + (bot-pair ? 96px : 96px * 2 + 12px) + pad;
+        Flickable {
+        viewport-width: self.width;
+        viewport-height: max(self.height, content-h);
         Text {
             text: "󰄨  Statistics";
             x: pad;
@@ -3035,9 +3145,10 @@ export component AppWindow inherits Window {
         }
         Text {
             text: stat-scanned;
-            x: parent.width - pad - 320px;
+            x: page-w - pad - self.width;
             y: 14px;
-            width: 320px;
+            width: max(0px, min(320px, inner - 150px));
+            overflow: elide;
             height: 24px;
             font-size: 11px;
             color: muted;
@@ -3047,13 +3158,14 @@ export component AppWindow inherits Window {
             TouchArea { clicked => { root.stats-rescan(); } }
         }
         if stat-scanning: Rectangle {
-            x: parent.width - pad - 320px;
+            x: page-w - pad - self.width;
             y: 14px;
-            width: 320px;
+            width: max(0px, min(320px, inner - 150px));
             height: 24px;
             Text {
                 text: "Scanning… " + stat-scan-count + " files";
                 width: parent.width - 28px;
+                overflow: elide;
                 height: parent.height;
                 font-size: 11px;
                 color: muted;
@@ -3073,7 +3185,7 @@ export component AppWindow inherits Window {
         Rectangle {
             x: pad;
             y: 48px;
-            width: parent.width - pad * 2;
+            width: inner;
             height: disks-h;
             background: surface;
             border-radius: 10px;
@@ -3086,20 +3198,24 @@ export component AppWindow inherits Window {
                 y: 40px + i * 42px;
                 width: parent.width;
                 height: 36px;
+                // Narrow: the free-space line moves under the bar, and the
+                // bar takes the room the line had.
+                property <bool> tight: self.width < 560px;
+                property <length> meter-w: tight ? self.width - 160px - 16px - 72px - 8px : self.width - 160px - 280px;
                 Text { text: "󰋊"; x: 16px; y: 0px; width: 18px; height: 36px; font-size: 14px; color: muted; vertical-alignment: center; }
                 Text { text: d.name; x: 42px; y: -2px; width: 110px; height: 18px; font-size: 12px; color: text; overflow: elide; }
                 Text { text: d.mount; x: 42px; y: 14px; width: 110px; height: 16px; font-size: 11px; color: muted; overflow: elide; }
                 Meter {
                     x: 160px;
-                    y: 14px;
-                    width: parent.width - 160px - 280px;
+                    y: parent.tight ? 8px : 14px;
+                    width: max(0px, parent.meter-w);
                     height: 8px;
                     amount: d.amount;
                     fill: d.level == 2 ? root.danger : d.level == 1 ? root.warning : root.accent;
                     track: root.text.with-alpha(0.12);
                 }
-                Text { text: d.pct; x: parent.width - 268px; y: -4px; width: 72px; height: 28px; font-size: 22px; font-weight: 700; color: text; horizontal-alignment: right; }
-                Text { text: d.free; x: parent.width - 188px; y: 2px; width: 172px; height: 20px; font-size: 11px; color: muted; overflow: elide; }
+                Text { text: d.pct; x: parent.tight ? parent.width - 16px - 72px : parent.width - 268px; y: -4px; width: 72px; height: 28px; font-size: 22px; font-weight: 700; color: text; horizontal-alignment: right; }
+                Text { text: d.free; x: parent.tight ? 160px : parent.width - 188px; y: parent.tight ? 18px : 2px; width: parent.tight ? max(0px, parent.meter-w) : 172px; height: parent.tight ? 16px : 20px; font-size: 11px; color: muted; overflow: elide; }
             }
         }
         Rectangle {
@@ -3152,9 +3268,9 @@ export component AppWindow inherits Window {
                 height: map-h;
                 background: stat-has-results ? surface : transparent;
                 for cell in map-cells: Rectangle {
-                    x: cell.x;
+                    x: cell.x * map-k;
                     y: cell.y;
-                    width: cell.w;
+                    width: cell.w * map-k;
                     height: cell.h;
                     background: root.accent.with-alpha(cell.shade);
                     border-radius: 3px;
@@ -3166,7 +3282,7 @@ export component AppWindow inherits Window {
                     TouchArea {
                         width: parent.width;
                         height: parent.height;
-                        property <bool> labeled: (cell.w >= 48px && cell.h >= 28px) || self.has-hover;
+                        property <bool> labeled: (cell.w * map-k >= 48px && cell.h >= 28px) || self.has-hover;
                         if labeled: Text {
                             text: cell.name;
                             x: 8px;
@@ -3193,10 +3309,10 @@ export component AppWindow inherits Window {
             if stat-scanning && stat-has-results: Rectangle { width: parent.width; height: parent.height; border-radius: 10px; background: root.bg.with-alpha(0.55); TouchArea { } }
         }
         Rectangle {
-            x: pad + tree-w + 12px;
-            y: mid-y;
-            width: parent.width - pad - tree-w - 12px - pad;
-            height: mid-h;
+            x: types-x;
+            y: types-y;
+            width: types-w;
+            height: types-h;
             background: stat-has-results ? surface : transparent;
             border-radius: 10px;
             border-width: 1px;
@@ -3211,7 +3327,7 @@ export component AppWindow inherits Window {
         Rectangle {
             x: pad;
             y: bot-y;
-            width: (parent.width - pad * 2 - 12px) / 2;
+            width: bot-w;
             height: 96px;
             background: stat-has-results ? surface : transparent;
             border-radius: 10px;
@@ -3237,9 +3353,9 @@ export component AppWindow inherits Window {
             if stat-scanning && stat-has-results: Rectangle { width: parent.width; height: parent.height; border-radius: 10px; background: root.bg.with-alpha(0.55); TouchArea { } }
         }
         Rectangle {
-            x: pad + (parent.width - pad * 2 - 12px) / 2 + 12px;
-            y: bot-y;
-            width: (parent.width - pad * 2 - 12px) / 2;
+            x: bot-pair ? pad + bot-w + 12px : pad;
+            y: bot-pair ? bot-y : bot-y + 96px + 12px;
+            width: bot-w;
             height: 96px;
             background: stat-has-results ? surface : transparent;
             border-radius: 10px;
@@ -3268,6 +3384,7 @@ export component AppWindow inherits Window {
             }
             if stat-scanning && stat-has-results: Rectangle { width: parent.width; height: parent.height; border-radius: 10px; background: root.bg.with-alpha(0.55); TouchArea { } }
         }
+        }
         if stats-mode == "empty-trash": Rectangle {
             x: 0px;
             y: 0px;
@@ -3275,8 +3392,8 @@ export component AppWindow inherits Window {
             height: parent.height;
             background: #000000.with-alpha(0.6);
             Rectangle {
-                width: 440px;
-                height: 220px;
+                width: min(440px, parent.width - 32px);
+                height: min(220px, parent.height - 32px);
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
                 background: surface;
@@ -3320,7 +3437,7 @@ export component AppWindow inherits Window {
 
     // Neutral completion toast. Skipped entries are listed, never dropped.
     if !harness && drag-label != "": Rectangle {
-        width: drag-line.preferred-width + 58px;
+        width: min(drag-line.preferred-width + 58px, parent.width - side-w - 32px);
         height: 36px;
         x: side-w + (parent.width - side-w - self.width) / 2;
         y: parent.height - status-h - 16px - self.height;
@@ -3329,14 +3446,14 @@ export component AppWindow inherits Window {
         border-width: 1px;
         border-color: accent;
         Text { text: drag-glyph; x: 14px; y: 0px; width: 18px; height: parent.height; font-size: 14px; color: accent; vertical-alignment: center; }
-        drag-line := Text { text: drag-label; x: 40px; y: 0px; height: parent.height; font-size: 12px; color: text; vertical-alignment: center; }
+        drag-line := Text { text: drag-label; x: 40px; y: 0px; width: parent.width - 54px; height: parent.height; font-size: 12px; color: text; vertical-alignment: center; overflow: elide; }
     }
 
     // Only as tall as its rows: 28 each, at most 8, under the field.
     if !harness && overlay == "path-complete" && completions.length > 0: Rectangle {
         x: side-w + 1px + 8px + icon-box * 3 + 4px + 12px;
         y: toolbar-h - (toolbar-h - 30px) / 2 + 2px;
-        width: 360px;
+        width: min(360px, parent.width - self.x - 8px);
         height: min(8, completions.length) * 28px + 8px;
         background: surface;
         border-radius: 6px;
@@ -3363,14 +3480,25 @@ export component AppWindow inherits Window {
     if !harness && overlay == "shortcuts": Rectangle {
         background: #000000.with-alpha(0.6);
         Rectangle {
-            width: 760px;
-            height: 520px;
+            // 760×520, or 16 clear of each window edge. Narrower than the
+            // three columns need, the sections flow into two columns, then
+            // one, and the list scrolls under the filter.
+            width: min(760px, parent.width - 32px);
+            height: min(520px, parent.height - 32px);
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: bg.with-alpha(0.86);
             border-radius: 10px;
             border-width: 1px;
             border-color: hairline;
+            clip: true;
+            property <int> cols: self.width >= 700px ? 3 : self.width >= 420px ? 2 : 1;
+            property <length> col-w: (self.width - 32px - (cols - 1) * 16px) / cols;
+            // A section is its 20px header plus 22px rows, 4 apart.
+            property <length> h0: key-sections.length > 0 ? 24px + key-sections[0].rows.length * 26px : 0px;
+            property <length> h1: key-sections.length > 1 ? 24px + key-sections[1].rows.length * 26px : 0px;
+            property <length> h2: key-sections.length > 2 ? 24px + key-sections[2].rows.length * 26px : 0px;
+            property <length> list-h: cols == 3 ? max(h0, h1, h2) : cols == 2 ? max(h0, h1) + 16px + h2 : h0 + h1 + h2 + 32px;
             // The filter field across the top.
             Rectangle {
                 x: 16px;
@@ -3392,20 +3520,26 @@ export component AppWindow inherits Window {
                         color: key-filter != "" ? text : muted;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
+                        overflow: elide;
                     }
                     Text { text: "Esc"; font-size: 11px; color: muted; vertical-alignment: center; }
                 }
             }
-            HorizontalLayout {
+            Flickable {
                 x: 16px;
                 y: 62px;
                 width: parent.width - 32px;
-                height: parent.height - 62px - 16px;
-                spacing: 16px;
-                for section in key-sections: VerticalLayout {
+                height: max(0px, parent.height - 62px - 16px);
+                viewport-width: self.width;
+                viewport-height: list-h;
+                for section[i] in key-sections: VerticalLayout {
+                    x: cols == 3 ? i * (col-w + 16px) : cols == 2 ? Math.mod(i, 2) * (col-w + 16px) : 0px;
+                    y: cols == 3 ? 0px
+                        : cols == 2 ? (i >= 2 ? max(h0, h1) + 16px : 0px)
+                        : (i == 0 ? 0px : i == 1 ? h0 + 16px : h0 + h1 + 32px);
+                    width: col-w;
                     alignment: start;
                     spacing: 4px;
-                    width: (760px - 32px - 32px) / 3;
                     Text { text: section.title; height: 20px; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; }
                     for row in section.rows: HorizontalLayout {
                         height: 22px;
