@@ -2910,14 +2910,14 @@ pub const DROP_WAIT_LIMIT: Duration = Duration::from_secs(15);
 /// later flush cannot complete the copy.
 pub const DROP_WAIT_CANCEL: &str = "Cancel";
 
-/// 2s notice: `X` is the folder being opened, typographic ellipsis.
+/// 2s notice: typographic ellipsis; `X` is the drop destination.
 pub fn drop_wait_toast(name: &str) -> String {
-    format!("Waiting for {name} to open…")
+    format!("Waiting to drop into {name}…")
 }
 
 /// 15s notice after the drop is cancelled because it never proceeded.
 pub fn drop_wait_cancelled(name: &str) -> String {
-    format!("Cancelled waiting for {name} to open")
+    format!("Cancelled the drop into {name}")
 }
 
 /// The folder name used as `X` in hung-drop toasts: the in-flight
@@ -2969,7 +2969,7 @@ pub enum DropWaitTick {
     Hold,
     /// The wait ended because the drop flushed or the user cancelled it.
     Clear,
-    /// Show "Waiting for X to open…" with Cancel, and keep it up.
+    /// Show "Waiting to drop into X…" with Cancel, and keep it up.
     Toast,
     /// 15s elapsed: drop the queue and tell the user.
     AutoCancel,
@@ -6380,12 +6380,12 @@ mod tests {
     fn hung_drop_copy_names_the_folder_being_opened() {
         assert_eq!(
             drop_wait_toast("raw-exports"),
-            "Waiting for raw-exports to open…"
+            "Waiting to drop into raw-exports…"
         );
         assert!(drop_wait_toast("raw-exports").contains('…'));
         assert_eq!(
             drop_wait_cancelled("raw-exports"),
-            "Cancelled waiting for raw-exports to open"
+            "Cancelled the drop into raw-exports"
         );
         assert_eq!(DROP_WAIT_CANCEL, "Cancel");
 
