@@ -2920,16 +2920,15 @@ pub fn drop_wait_cancelled(name: &str) -> String {
     format!("Cancelled the drop into {name}")
 }
 
-/// The folder name used as `X` in hung-drop toasts: the in-flight
-/// navigation's target if any, otherwise the first frozen drop
-/// destination, otherwise the open folder.
+/// The folder name used as `X` in hung-drop toasts: the first frozen
+/// drop destination if any, otherwise the in-flight navigation's target
+/// (an unresolved mid-navigation drop lands there if the read succeeds),
+/// otherwise the open folder.
 pub fn drop_wait_name(dropped: &[DroppedPath], open: &Path, nav_target: Option<&Path>) -> String {
-    if let Some(target) = nav_target {
-        return crate::ops::folder_name(target);
-    }
     let dest = dropped
         .iter()
         .find_map(|(_, d)| d.as_deref())
+        .or(nav_target)
         .unwrap_or(open);
     crate::ops::folder_name(dest)
 }
@@ -6377,7 +6376,7 @@ mod tests {
     }
 
     #[test]
-    fn hung_drop_copy_names_the_folder_being_opened() {
+    fn hung_drop_copy_names_the_drop_destination() {
         assert_eq!(
             drop_wait_toast("raw-exports"),
             "Waiting to drop into raw-exports…"
@@ -6395,7 +6394,7 @@ mod tests {
         assert_eq!(
             drop_wait_name(&mid_nav, &open, Some(&nav)),
             "raw-exports",
-            "X is the folder the navigation is opening"
+            "an unresolved dest names the folder the drop will land in"
         );
         let frozen = vec![(
             PathBuf::from("/tmp/shot.png"),
@@ -6403,8 +6402,8 @@ mod tests {
         )];
         assert_eq!(
             drop_wait_name(&frozen, &open, Some(&nav)),
-            "raw-exports",
-            "even a frozen dest waits on the folder being opened"
+            "Downloads",
+            "a frozen dest wins over the folder being opened"
         );
         assert_eq!(
             drop_wait_name(&frozen, &open, None),
@@ -6414,7 +6413,7 @@ mod tests {
         assert_eq!(
             drop_wait_name(&mid_nav, &open, None),
             "Pictures",
-            "an unresolved drop names the open folder"
+            "an unresolved drop with no navigation names the open folder"
         );
     }
 
