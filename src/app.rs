@@ -101,7 +101,7 @@ impl Dialog {
 }
 
 /// What the window should do after the controller handled an input.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     None,
     /// Repaint rows and overlays.
@@ -115,8 +115,13 @@ pub enum Action {
     CancelJob,
     /// Reply to the job thread's conflict question; `None` cancels the job.
     Answer(Option<ConflictChoice>),
-    /// Start a program detached, e.g. xdg-open on a video.
+    /// Start a program detached, e.g. xdg-open from the viewer's
+    /// open-with.
     Launch(Vec<OsString>),
+    /// Tell the playing video or audio file to do something.
+    Player(crate::player::Cmd),
+    /// Enter or leave fullscreen (Enter, F11, the transport's button).
+    Fullscreen,
     /// Delete Robin's thumbnails under this cache root, then rescan stats.
     ClearThumbs(PathBuf),
 }
@@ -270,6 +275,9 @@ pub struct Controller {
     pub name_budget: std::cell::Cell<usize>,
     /// The media viewer, while it is open over the browser.
     pub viewer: Option<crate::viewer::Viewer>,
+    /// The playing file's transport as last read back from the player;
+    /// `None` when nothing plays.
+    pub transport: Option<crate::player::Transport>,
     /// The open image's pixel size and the viewer's canvas size, from the
     /// last redraw; zoom steps are taken against them.
     pub view_geom: std::cell::Cell<((f32, f32), (f32, f32))>,
@@ -540,6 +548,7 @@ pub mod keys {
     pub const RIGHT: &str = "\u{F703}";
     pub const HOME: &str = "\u{F729}";
     pub const END: &str = "\u{F72B}";
+    pub const F11: &str = "\u{F70E}";
 }
 
 /// Ctrl+letter arrives either as the letter or as its control character.
@@ -580,8 +589,43 @@ impl Controller {
         }
     }
 
+    /// The video or audio file the viewer is on, which should be
+    /// playing in Robin; `None` on a still or with the viewer closed.
+    pub fn playing(&self) -> Option<PathBuf> {
+        let v = self.viewer.as_ref()?;
+        crate::viewer::playable(Path::new(v.current())).then(|| self.dir.join(v.current()))
+    }
+
+    /// A transport button: sent on to the player while something plays.
+    pub fn viewer_play(&self, cmd: crate::player::Cmd) -> Action {
+        match self.playing() {
+            Some(_) => Action::Player(cmd),
+            None => Action::None,
+        }
+    }
+
+    /// A viewer key on a playing file, or None for the usual viewer keys
+    /// (arrows and h/l still step through the folder).
+    fn play_key(&self, text: &str, shift: bool) -> Option<Action> {
+        use crate::player::Cmd;
+        self.playing()?;
+        let cmd = match text {
+            " " if !shift => Cmd::Toggle,
+            "j" => Cmd::SeekBy(-5.0),
+            "k" => Cmd::SeekBy(5.0),
+            "," => Cmd::Frame(-1),
+            "." => Cmd::Frame(1),
+            "m" => Cmd::Mute,
+            // Zoom and turn are for stills.
+            "+" | "=" | "-" | "0" | "1" | "r" | "R" => return Some(Action::None),
+            _ => return None,
+        };
+        Some(Action::Player(cmd))
+    }
+
     /// Hand the open item to the desktop's default app (xdg-open): the
-    /// way out for videos and for pictures Robin can't show.
+    /// top bar's open-with, and the way out for files Robin can't show
+    /// or play.
     pub fn viewer_external(&self) -> Action {
         match self.viewer.as_ref() {
             Some(v) => Action::Launch(crate::delegate::argv(
@@ -634,11 +678,17 @@ impl Controller {
         }
     }
 
-    /// The chrome's idle timer ran out: hide it again if still zoomed.
+    /// The chrome's idle timer ran out: hide it again if still zoomed,
+    /// or while a video plays.
     pub fn viewer_idle(&mut self) -> Action {
         let (image, view) = self.view_geom.get();
+        let playing = self.playing().is_some()
+            && self
+                .transport
+                .as_ref()
+                .is_some_and(|t| !t.paused && !t.failed && t.video != (0, 0));
         match self.viewer.as_mut() {
-            Some(v) if !v.chrome_hidden && v.zoomed(image, view) => {
+            Some(v) if !v.chrome_hidden && (playing || v.zoomed(image, view)) => {
                 v.chrome_hidden = true;
                 Action::Redraw
             }
@@ -733,6 +783,7 @@ impl Controller {
             columns: std::cell::Cell::new(1),
             name_budget: std::cell::Cell::new(0),
             viewer: None,
+            transport: None,
             view_geom: std::cell::Cell::new(((0.0, 0.0), (0.0, 0.0))),
             trash_asked: false,
             skip_trash_confirm: false,
@@ -1337,16 +1388,20 @@ impl Controller {
         if self.dialog.is_some() {
             return self.dialog_key(text, shift);
         }
-        if let Some(v) = self.viewer.as_mut() {
+        if self.viewer.is_some() {
             if ctrl {
                 // Ctrl+R, Ctrl+Q and friends are the app's, not the viewer's.
                 return Action::None;
             }
-            let video =
-                crate::viewer::media(Path::new(v.current())) == Some(crate::viewer::Media::Video);
-            if video && text == keys::RETURN {
-                return self.viewer_external();
+            if text == keys::RETURN || text == keys::F11 {
+                return Action::Fullscreen;
             }
+            if let Some(action) = self.play_key(text, shift) {
+                return action;
+            }
+            let Some(v) = self.viewer.as_mut() else {
+                return Action::None;
+            };
             // Shift+Space steps back, as Space steps on.
             let text = if shift && text == " " { "h" } else { text };
             let (image, view) = self.view_geom.get();
@@ -2028,6 +2083,10 @@ struct State {
     prefs_saved: std::cell::Cell<crate::prefs::ViewPrefs>,
     /// Decoded viewer images and filmstrip thumbnails, by path.
     pics: RefCell<Pics>,
+    /// The video or audio file playing in the viewer.
+    play: RefCell<Option<Playback>>,
+    /// Where partly played files were left, in Robin's cache.
+    positions: RefCell<crate::player::Positions>,
     /// Rows already built for the current listing, filled in chunks so a
     /// 100k-entry folder doesn't stall the UI thread, flash an empty pane,
     /// or drop the scroll position and selection.
@@ -2668,6 +2727,8 @@ pub fn run(dir: PathBuf) -> Result<i32> {
     let ui = build(Launch::system(dir))?;
     ui.show().map_err(|e| Error::Message(e.to_string()))?;
     slint::run_event_loop().map_err(|e| Error::Message(e.to_string()))?;
+    // Remember where a playing file was left.
+    with_state(|_, st| stop_playback(&st.borrow()));
     Ok(0)
 }
 
@@ -2693,6 +2754,7 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     apply_theme(&ui, &launch.theme);
     ui.set_harness(false);
     ui.set_compact(launch.compact);
+    let cache_dir = launch.env.cache_dir();
     let mut ctl = Controller::new(launch.dir, launch.env);
     ctl.compact = launch.compact;
     let saved = launch.prefs.as_deref().map(crate::prefs::ViewPrefs::load);
@@ -2735,6 +2797,10 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         prefs_saved: std::cell::Cell::new(saved.unwrap_or_else(crate::prefs::ViewPrefs::fresh)),
         prefs_path: launch.prefs,
         pics: RefCell::default(),
+        play: RefCell::default(),
+        positions: RefCell::new(crate::player::Positions::load(
+            crate::player::Positions::path(cache_dir.clone()),
+        )),
         rows_fill: RefCell::default(),
         files_model: RefCell::new(None),
         labels_model: RefCell::new(None),
@@ -2907,17 +2973,13 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
                 apply(&ui, &st_vw, action);
             }
             // Each move restarts the idle clock.
-            let (w, st) = (ui.as_weak(), st_vw.clone());
-            st_vw.borrow().chrome_timer.start(
-                slint::TimerMode::SingleShot,
-                Duration::from_millis(2500),
-                move || {
-                    let action = st.borrow_mut().ctl.viewer_idle();
-                    if let Some(ui) = w.upgrade() {
-                        apply(&ui, &st, action);
-                    }
-                },
-            );
+            arm_chrome_idle(&ui, &st_vw);
+        }
+    });
+    let (w_vt, st_vt) = (ui.as_weak(), state.clone());
+    ui.on_view_transport(move |what, value| {
+        if let Some(ui) = w_vt.upgrade() {
+            transport_control(&ui, &st_vt, &what, value);
         }
     });
     ui.on_view_external(move || {
@@ -3925,10 +3987,309 @@ pub fn file_facts(
     facts
 }
 
+/// The file playing in the viewer, and what was last shown of it.
+struct Playback {
+    path: PathBuf,
+    mpv: std::result::Result<crate::mpv::Mpv, crate::mpv::Why>,
+    /// Polls mpv about 60 times a second while the event loop runs.
+    _timer: slint::Timer,
+    frame: Option<slint::Image>,
+    frame_size: (u32, u32),
+    last: crate::player::Transport,
+    /// Where this file was left last time, if anywhere.
+    saved: Option<f64>,
+    /// The resume question was settled (asked, or not worth asking).
+    asked: bool,
+    /// The "Resume at …?" prompt is up, offering this position.
+    prompt: Option<f64>,
+    prompt_timer: Option<slint::Timer>,
+}
+
+/// How often a playing file is polled for frames and transport state.
+const PLAY_TICK: Duration = Duration::from_millis(16);
+/// The resume prompt goes after this, like an action toast.
+const RESUME_PROMPT: Duration = Duration::from_secs(8);
+
+/// Stop whatever plays, remembering where it was left.
+fn stop_playback(s: &State) {
+    let Some(p) = s.play.borrow_mut().take() else {
+        return;
+    };
+    if let Ok(m) = &p.mpv {
+        let t = m.state();
+        if !t.failed && t.dur > 0.0 {
+            s.positions.borrow_mut().set(&p.path, t.pos, t.dur);
+        }
+    }
+}
+
+/// Start `path` playing if it isn't already, and show it: its latest
+/// frame, the transport, or why it can't play. Returns the picture size.
+fn sync_playback(ui: &AppWindow, s: &State, path: &Path) -> Option<(u32, u32)> {
+    let same = s.play.borrow().as_ref().map(|p| p.path.as_path()) == Some(path);
+    if !same {
+        stop_playback(s);
+        let scripted = SCRIPTED.with(|x| x.get());
+        let mpv = crate::mpv::Mpv::open(path, scripted);
+        let timer = slint::Timer::default();
+        if mpv.is_ok() && !scripted {
+            timer.start(slint::TimerMode::Repeated, PLAY_TICK, || {
+                with_state(|ui, st| tick_playback(&ui, st));
+            });
+        }
+        let saved = s.positions.borrow().get(path);
+        *s.play.borrow_mut() = Some(Playback {
+            path: path.to_path_buf(),
+            mpv,
+            _timer: timer,
+            frame: None,
+            frame_size: (0, 0),
+            last: crate::player::Transport::default(),
+            saved,
+            asked: false,
+            prompt: None,
+            prompt_timer: None,
+        });
+    }
+    let play = s.play.borrow();
+    let p = play.as_ref()?;
+    ui.set_view_spinner(false);
+    ui.set_view_scale(0.0);
+    ui.set_view_zoom(SharedString::new());
+    let why = match &p.mpv {
+        Err(why) => Some(*why),
+        Ok(_) if p.last.failed => Some(crate::mpv::Why::Unplayable),
+        Ok(_) => None,
+    };
+    let loaded = p.mpv.as_ref().is_ok_and(|m| m.loaded());
+    let audio = loaded && !p.last.picture;
+    ui.set_view_audio(crate::viewer::media(path) == Some(crate::viewer::Media::Audio) || audio);
+    if let Some(why) = why {
+        ui.set_view_loading(false);
+        ui.set_view_placeholder(slint::Image::default());
+        ui.set_view_image(slint::Image::default());
+        ui.set_view_px_w(0.0);
+        ui.set_view_px_h(0.0);
+        ui.set_view_note(why.line().into());
+        ui.set_view_resume(SharedString::new());
+        s.ctl.view_geom.set(((0.0, 0.0), s.ctl.view_geom.get().1));
+        return None;
+    }
+    ui.set_view_note(SharedString::new());
+    // Until the first frame, the filmstrip's cached frame stands in.
+    let waiting = p.frame.is_none() && !audio;
+    let placeholder = if waiting {
+        s.pics
+            .borrow()
+            .tiles
+            .get(path)
+            .and_then(|t| t.as_ref())
+            .map(|(blurred, _)| blurred.clone())
+            .unwrap_or_default()
+    } else {
+        slint::Image::default()
+    };
+    ui.set_view_loading(waiting);
+    ui.set_view_placeholder(placeholder);
+    show_playback(ui, p);
+    (p.last.video != (0, 0)).then_some(p.last.video)
+}
+
+/// The frame and transport properties: cheap enough for every tick.
+fn show_playback(ui: &AppWindow, p: &Playback) {
+    let t = &p.last;
+    match (&p.frame, t.video) {
+        (Some(img), (w, h)) if w > 0 && h > 0 => {
+            ui.set_view_image(img.clone());
+            ui.set_view_px_w(w as f32);
+            ui.set_view_px_h(h as f32);
+        }
+        _ => {
+            ui.set_view_image(slint::Image::default());
+            ui.set_view_px_w(0.0);
+            ui.set_view_px_h(0.0);
+        }
+    }
+    ui.set_view_paused(t.paused);
+    ui.set_view_clock(t.clock().into());
+    ui.set_view_progress(t.progress());
+    ui.set_view_duration(t.dur as f32);
+    ui.set_view_volume((t.volume / 100.0) as f32);
+    ui.set_view_muted(t.muted);
+    ui.set_view_speed(t.speed_label().into());
+    ui.set_view_loop(t.looping);
+    ui.set_view_subs(t.subs);
+    ui.set_view_resume(match p.prompt {
+        Some(at) => crate::player::resume_line(at, t.dur).into(),
+        None => SharedString::new(),
+    });
+}
+
+/// The viewer's canvas in device pixels: frames are rendered this big
+/// at most.
+fn play_view(ui: &AppWindow, info: bool) -> (u32, u32) {
+    let size = ui.window().size();
+    let scale = ui.window().scale_factor();
+    let info = if info { (332.0 * scale) as u32 } else { 0 };
+    (size.width.saturating_sub(info).max(2), size.height.max(2))
+}
+
+/// Read back from mpv: new frame, transport, the resume question.
+fn tick_playback(ui: &AppWindow, st: &Shared) {
+    let info = st.borrow().ctl.viewer.as_ref().is_some_and(|v| v.info);
+    let view = play_view(ui, info);
+    let (state, resync, started) = {
+        let s = st.borrow();
+        let mut play = s.play.borrow_mut();
+        let Some(p) = play.as_mut() else { return };
+        let Ok(m) = p.mpv.as_mut() else { return };
+        let was_loaded = m.loaded();
+        m.poll();
+        let t = m.state();
+        let mut resync = m.loaded() != was_loaded || t.failed != p.last.failed;
+        if t.video != (0, 0) {
+            let size = crate::mpv::render_size(t.video, view);
+            let force = size != p.frame_size;
+            if let Some(px) = m.frame(size.0, size.1, force) {
+                let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                    &px, size.0, size.1,
+                );
+                resync |= p.frame.is_none();
+                p.frame = Some(slint::Image::from_rgba8(buf));
+                p.frame_size = size;
+            }
+        }
+        resync |= t.video != p.last.video || t.picture != p.last.picture;
+        let started = p.last.paused && !t.paused || (!was_loaded && m.loaded() && !t.paused);
+        if !p.asked && m.loaded() && t.dur > 0.0 {
+            p.asked = true;
+            p.prompt = p.saved.and_then(|at| crate::player::resume_at(at, t.dur));
+            if p.prompt.is_some() && !SCRIPTED.with(|x| x.get()) {
+                let timer = slint::Timer::default();
+                timer.start(slint::TimerMode::SingleShot, RESUME_PROMPT, || {
+                    with_state(|ui, st| close_resume(&ui, st));
+                });
+                p.prompt_timer = Some(timer);
+            }
+        }
+        p.last = t.clone();
+        if !resync {
+            show_playback(ui, p);
+        }
+        (t, resync, started)
+    };
+    st.borrow_mut().ctl.transport = Some(state);
+    if resync {
+        sync_viewer(ui, &st.borrow());
+    }
+    // Playing: the chrome fades after the usual idle time.
+    if started {
+        arm_chrome_idle(ui, st);
+    }
+}
+
+fn close_resume(ui: &AppWindow, st: &Shared) {
+    let s = st.borrow();
+    let mut play = s.play.borrow_mut();
+    if let Some(p) = play.as_mut() {
+        p.prompt = None;
+        p.prompt_timer = None;
+        ui.set_view_resume(SharedString::new());
+    }
+}
+
+/// Send `cmd` to the playing file and show the result straight away.
+fn play_cmd(ui: &AppWindow, st: &Shared, cmd: crate::player::Cmd) {
+    {
+        let s = st.borrow();
+        let play = s.play.borrow();
+        if let Some(Playback { mpv: Ok(m), .. }) = play.as_ref() {
+            m.send(cmd);
+        }
+    }
+    if matches!(cmd, crate::player::Cmd::Resume(_)) {
+        close_resume(ui, st);
+    }
+    tick_playback(ui, st);
+}
+
+/// A transport control: ("toggle"|"seek"|…, value) from the UI.
+fn transport_control(ui: &AppWindow, st: &Shared, what: &str, value: f32) {
+    use crate::player::Cmd;
+    let value = f64::from(value);
+    let cmd = match what {
+        "toggle" => Cmd::Toggle,
+        "seek" => Cmd::SeekTo(value),
+        "volume" => Cmd::Volume(value * 100.0),
+        "mute" => Cmd::Mute,
+        "speed" => Cmd::Speed,
+        "loop" => Cmd::Loop,
+        "subs" => Cmd::Subs,
+        "full" => return apply(ui, st, Action::Fullscreen),
+        "resume" => {
+            let at = st.borrow().play.borrow().as_ref().and_then(|p| p.prompt);
+            match at {
+                Some(at) => Cmd::Resume(at),
+                None => return,
+            }
+        }
+        "resume-close" => return close_resume(ui, st),
+        _ => return,
+    };
+    let action = st.borrow().ctl.viewer_play(cmd);
+    apply(ui, st, action);
+}
+
+/// Hide the chrome after 2500ms without the pointer moving (DESIGN §5),
+/// when the viewer is zoomed or a video plays.
+fn arm_chrome_idle(ui: &AppWindow, st: &Shared) {
+    let (w, st2) = (ui.as_weak(), st.clone());
+    st.borrow().chrome_timer.start(
+        slint::TimerMode::SingleShot,
+        Duration::from_millis(2500),
+        move || {
+            let action = st2.borrow_mut().ctl.viewer_idle();
+            if let Some(ui) = w.upgrade() {
+                apply(&ui, &st2, action);
+            }
+        },
+    );
+}
+
+/// Drive the player in a render script, where no event loop runs: poll
+/// until `done` holds (or a few seconds pass).
+pub fn land_playback(done: impl Fn(&crate::player::Transport) -> bool) {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < Duration::from_secs(5) {
+        let mut ok = false;
+        let mut live = false;
+        with_state(|ui, st| {
+            tick_playback(&ui, st);
+            let s = st.borrow();
+            let play = s.play.borrow();
+            if let Some(p) = play.as_ref() {
+                live = p.mpv.is_ok() && !p.last.failed;
+                let loaded = p.mpv.as_ref().is_ok_and(|m| m.loaded());
+                ok = loaded && done(&p.last) && (p.frame.is_some() || !p.last.picture);
+            }
+        });
+        if ok || !live {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A transport control in a render script, as a click would send it.
+pub fn script_transport(what: &str, value: f32) {
+    with_state(|ui, st| transport_control(&ui, st, what, value));
+}
+
 fn sync_viewer(ui: &AppWindow, s: &State) {
     let ctl = &s.ctl;
     let Some(v) = ctl.viewer.as_ref() else {
         ui.set_view_on(false);
+        stop_playback(s);
         let mut pics = s.pics.borrow_mut();
         if pics.full.is_some() || pics.want.is_some() || !pics.tiles.is_empty() {
             pics.close();
@@ -3936,6 +4297,35 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
         return;
     };
     let path = ctl.dir.join(v.current());
+    let name = v.current().to_string_lossy().into_owned();
+    ui.set_view_on(true);
+    ui.set_view_name(name.clone().into());
+    ui.set_view_counter(v.counter().into());
+    ui.set_view_info(v.info);
+    ui.set_view_strip(v.strip);
+    ui.set_view_video(crate::viewer::media(&path) == Some(crate::viewer::Media::Video));
+    ui.set_view_chrome(!v.chrome_hidden);
+    ui.set_view_pan_x(v.pan.0);
+    ui.set_view_pan_y(v.pan.1);
+    let playable = crate::viewer::playable(&path);
+    ui.set_view_playing(playable);
+    let dims = if playable {
+        sync_playback(ui, s, &path)
+    } else {
+        stop_playback(s);
+        ui.set_view_audio(false);
+        ui.set_view_resume(SharedString::new());
+        sync_still(ui, s, &path)
+    };
+    sync_viewer_tail(ui, s, &name, dims);
+}
+
+/// The open still: decode it (off the UI thread), turn it, and show it
+/// or why it can't be shown. Returns its pixel size once decoded.
+fn sync_still(ui: &AppWindow, s: &State, path: &Path) -> Option<(u32, u32)> {
+    let ctl = &s.ctl;
+    let v = ctl.viewer.as_ref()?;
+    let path = path.to_path_buf();
     let mut pics = s.pics.borrow_mut();
     let ready = pics.full.as_ref().map(|f| &f.0) == Some(&path);
     if !ready && pics.want.as_ref() != Some(&path) {
@@ -4005,17 +4395,7 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
     let size = ui.window().size().to_logical(ui.window().scale_factor());
     let view_w = size.width - if v.info { 332.0 } else { 0.0 };
     let view = (view_w.max(1.0), size.height.max(1.0));
-    let name = v.current().to_string_lossy().into_owned();
-    ui.set_view_on(true);
-    ui.set_view_name(name.clone().into());
-    ui.set_view_counter(v.counter().into());
-    ui.set_view_info(v.info);
-    ui.set_view_strip(v.strip);
-    ui.set_view_video(crate::viewer::media(&path) == Some(crate::viewer::Media::Video));
-    ui.set_view_chrome(!v.chrome_hidden);
-    ui.set_view_pan_x(v.pan.0);
-    ui.set_view_pan_y(v.pan.1);
-    let dims = match &pic {
+    match &pic {
         Ok(img) => {
             let (w, h) = img.dimensions();
             ctl.view_geom.set(((w as f32, h as f32), view));
@@ -4048,7 +4428,16 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
             ui.set_view_zoom(SharedString::new());
             None
         }
+    }
+}
+
+/// The filmstrip and the info panel's facts, for stills and players alike.
+fn sync_viewer_tail(ui: &AppWindow, s: &State, name: &str, dims: Option<(u32, u32)>) {
+    let ctl = &s.ctl;
+    let Some(v) = ctl.viewer.as_ref() else {
+        return;
     };
+    let mut pics = s.pics.borrow_mut();
     let window = v.strip_window(STRIP_TILES);
     let mut tiles = Vec::new();
     let mut missing = Vec::new();
@@ -4067,6 +4456,7 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
             shot,
             current: i == v.index,
             video: crate::viewer::media(&p) == Some(crate::viewer::Media::Video),
+            audio: crate::viewer::media(&p) == Some(crate::viewer::Media::Audio),
         });
     }
     // One batch of tiles at a time, so scrubbing can't pile them up.
@@ -4094,7 +4484,7 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
         };
         crate::model::format_modified(secs(e.mtime), now, off)
     });
-    let facts: Vec<crate::Fact> = file_facts(&name, entry.map_or(0, |e| e.len), dims, modified)
+    let facts: Vec<crate::Fact> = file_facts(name, entry.map_or(0, |e| e.len), dims, modified)
         .into_iter()
         .map(|(key, value)| crate::Fact {
             key: key.into(),
@@ -4584,6 +4974,12 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
             }
         }
         Action::Launch(argv) => launch(ui, st, argv),
+        Action::Player(cmd) => play_cmd(ui, st, cmd),
+        Action::Fullscreen => {
+            let full = !ui.window().is_fullscreen();
+            ui.window().set_fullscreen(full);
+            ui.set_view_full(full);
+        }
         Action::ClearThumbs(cache) => clear_thumbs(ui, st, cache),
         Action::Answer(choice) => {
             if let Some(tx) = st.borrow_mut().reply.take() {
@@ -6011,7 +6407,7 @@ mod tests {
         assert_eq!(full(&dir.join("x.heic")).unwrap_err(), Why::Unreadable);
         fs::write(dir.join("x.mp4"), b"v").unwrap();
         assert_eq!(full(&dir.join("x.mp4")).unwrap_err(), Why::Video);
-        assert_eq!(Why::Video.line(), "No built-in video player yet");
+        assert_eq!(Why::Video.line(), "A video, not a still");
         assert_eq!(Why::Unreadable.line(), "Can't read this file");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -6090,15 +6486,87 @@ mod tests {
     }
 
     #[test]
-    fn return_on_a_video_hands_it_to_the_default_player() {
+    fn opening_a_video_plays_it_in_the_viewer_with_the_default_player_secondary() {
+        use crate::player::Cmd;
         let mut c = setup("viewer-video");
         fs::write(c.dir.join("clip.mp4"), b"v").unwrap();
         c.reload().unwrap();
+        // A double-click opens the row as Return does.
+        assert_eq!(c.open_viewer(&"clip.mp4".into()), Action::Redraw);
+        assert_eq!(c.playing(), Some(c.dir.join("clip.mp4")), "plays in Robin");
+        c.close_viewer();
+        assert_eq!(c.playing(), None, "closing stops it");
         select(&mut c, "clip.mp4");
-        c.key(keys::RETURN, false, false);
+        assert_eq!(c.key(keys::RETURN, false, false), Action::Redraw);
+        assert_eq!(c.playing(), Some(c.dir.join("clip.mp4")));
+        // Return is fullscreen now, never a hand-off to another app.
+        assert_eq!(c.key(keys::RETURN, false, false), Action::Fullscreen);
+        assert_eq!(c.key(keys::F11, false, false), Action::Fullscreen);
+        // The transport's keys (DESIGN §5).
+        assert_eq!(c.key(" ", false, false), Action::Player(Cmd::Toggle));
+        assert_eq!(c.key("j", false, false), Action::Player(Cmd::SeekBy(-5.0)));
+        assert_eq!(c.key("k", false, false), Action::Player(Cmd::SeekBy(5.0)));
+        assert_eq!(c.key(",", false, false), Action::Player(Cmd::Frame(-1)));
+        assert_eq!(c.key(".", false, false), Action::Player(Cmd::Frame(1)));
+        assert_eq!(c.key("m", false, false), Action::Player(Cmd::Mute));
+        assert_eq!(c.key("+", false, false), Action::None, "no zoom on video");
+        assert_eq!(c.viewer.as_ref().unwrap().zoom, crate::viewer::Zoom::Fit);
+        assert_eq!(c.viewer_play(Cmd::Speed), Action::Player(Cmd::Speed));
+        // [Open in default player] stays as the secondary open-with.
         let want = Action::Launch(vec!["xdg-open".into(), c.dir.join("clip.mp4").into()]);
         assert_eq!(c.viewer_external(), want);
-        assert_eq!(c.key(keys::RETURN, false, false), want);
+        assert_eq!(c.key(keys::ESCAPE, false, false), Action::Redraw);
+        assert_eq!(c.viewer_play(Cmd::Toggle), Action::None, "nothing plays");
+    }
+
+    #[test]
+    fn audio_plays_in_the_viewer_and_stills_keep_their_keys() {
+        use crate::player::Cmd;
+        let mut c = setup("viewer-audio");
+        fs::write(c.dir.join("song.flac"), b"a").unwrap();
+        c.reload().unwrap();
+        select(&mut c, "song.flac");
+        c.key(keys::RETURN, false, false);
+        assert_eq!(c.playing(), Some(c.dir.join("song.flac")));
+        assert_eq!(c.key(" ", false, false), Action::Player(Cmd::Toggle));
+        // Stepping onto a still stops playback; Space steps on again.
+        let v = c.viewer.as_ref().unwrap();
+        let still = v.items.iter().position(|n| n == "a.jpg").unwrap();
+        c.viewer.as_mut().unwrap().go(still);
+        assert_eq!(c.playing(), None);
+        assert_eq!(c.key(" ", false, false), Action::Redraw);
+    }
+
+    #[test]
+    fn the_chrome_fades_while_a_video_plays_but_not_when_paused_or_audio() {
+        let mut c = setup("viewer-idle-video");
+        fs::write(c.dir.join("clip.mp4"), b"v").unwrap();
+        fs::write(c.dir.join("song.flac"), b"a").unwrap();
+        c.reload().unwrap();
+        c.open_viewer(&"clip.mp4".into());
+        let playing = crate::player::Transport {
+            video: (640, 360),
+            picture: true,
+            dur: 10.0,
+            ..Default::default()
+        };
+        c.transport = Some(crate::player::Transport {
+            paused: true,
+            ..playing.clone()
+        });
+        assert_eq!(c.viewer_idle(), Action::None, "paused: chrome stays");
+        c.transport = Some(playing.clone());
+        assert_eq!(c.viewer_idle(), Action::Redraw);
+        assert!(c.viewer.as_ref().unwrap().chrome_hidden);
+        assert_eq!(c.viewer_wake(), Action::Redraw);
+        c.close_viewer();
+        c.open_viewer(&"song.flac".into());
+        c.transport = Some(crate::player::Transport {
+            video: (0, 0),
+            picture: false,
+            ..playing
+        });
+        assert_eq!(c.viewer_idle(), Action::None, "nothing to look at");
     }
 
     #[test]

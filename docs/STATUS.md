@@ -80,7 +80,7 @@ Executed against libmpv 0.37. A 32×24 red clip was loaded with `vo=libmpv` and 
 
 `rgb0`'s fourth byte is padding, not alpha, and libmpv documents it as uninitialized. `slint::Image::from_rgba8` treats that byte as alpha, so Robin sets it to 255 after every frame. Otherwise the video is invisible.
 
-The buffer was not uploaded into a Slint window in this spike. The v1 mapping is a `SharedPixelBuffer<Rgba8Pixel>` handed to `Image::from_rgba8` on each frame. The OpenGL render API plus Slint's borrowed GL texture is faster and is deferred: sharing Slint's GL context has a history of breaking the UI's own drawing. GStreamer is not required.
+The buffer was not uploaded into a Slint window in this spike. The v1 mapping is a `SharedPixelBuffer<Rgba8Pixel>` handed to `Image::from_rgba8` on each frame. That is now wired (`src/mpv.rs`, checked against libmpv 0.40): libmpv is `dlopen`ed at run time, frames are rendered at the video's size or the viewer's, whichever is smaller, with `MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME` off so the UI thread never waits on a frame, and the window polls mpv every 16ms. The OpenGL render API plus Slint's borrowed GL texture is faster and is deferred: sharing Slint's GL context has a history of breaking the UI's own drawing. GStreamer is not required.
 
 ## Glyphs
 
@@ -107,4 +107,4 @@ TOML is U+E6B2. It is the only nerd-font glyph whose name is toml, and it is in 
 
 - OS drag-out waits on winit. In-app drag does not.
 - A translucent top-level window was not verified on Hyprland.
-- libmpv software render works. Uploading that buffer into a Slint `Image` is still to be wired when the viewer is built.
+- libmpv is a run-time dependency for in-app playback. Without it, videos and audio show "Playing in Robin needs libmpv" and [Open in default player].

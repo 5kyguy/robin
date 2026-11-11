@@ -100,6 +100,8 @@ export struct ViewTile {
     current: bool,
     // A video: shows its cached frame, or the video icon without one.
     video: bool,
+    // An audio file: the music icon (or its cover, if a frame is cached).
+    audio: bool,
 }
 
 export struct Fact {
@@ -523,6 +525,7 @@ component FilmTile inherits Rectangle {
     in property <bool> current;
     in property <color> ring;
     in property <bool> video: false;
+    in property <bool> audio: false;
     in property <color> ink: #888888;
     width: 72px;
     height: 48px;
@@ -539,7 +542,7 @@ component FilmTile inherits Rectangle {
     // No picture yet (loading) or ever (unreadable): the video icon or
     // the file icon; never a blank tile.
     if shot.width == 0: Text {
-        text: video ? "󰕧" : "󰈟";
+        text: audio ? "󰎆" : video ? "󰕧" : "󰈟";
         width: parent.width;
         height: parent.height;
         font-size: 20px;
@@ -808,6 +811,26 @@ export component AppWindow inherits Window {
     callback view-go(int);
     callback view-key(string);
     callback view-external();
+    // Playback (src/mpv.rs): a video or audio file plays in the viewer
+    // and the transport replaces the toolbar (DESIGN §5).
+    in property <bool> view-playing: false;
+    // Playing with no picture (audio without cover art): a music glyph.
+    in property <bool> view-audio: false;
+    in property <bool> view-paused: false;
+    in property <string> view-clock: "00:00 / 00:00";
+    in property <float> view-progress: 0;
+    in property <float> view-duration: 0;
+    in property <float> view-volume: 1;
+    in property <bool> view-muted: false;
+    in property <string> view-speed: "1.0×";
+    in property <bool> view-loop: false;
+    in property <bool> view-subs: false;
+    in property <bool> view-full: false;
+    // "Resume at 02:14?", or empty.
+    in property <string> view-resume;
+    // ("toggle"|"seek"|"volume"|"mute"|"speed"|"loop"|"subs"|"full"|
+    // "resume"|"resume-close", value).
+    callback view-transport(string, float);
     callback view-pan(float, float);
     callback view-wake();
     in property <string> stats-mode: "";
@@ -2294,7 +2317,9 @@ export component AppWindow inherits Window {
             changed mouse-y => { root.view-wake(); }
         }
         // The pixel size is already turned (src/app.rs turns the pixels).
-        property <float> fit: view-px-w <= 0 || view-px-h <= 0 ? 1 : min(1, (open-w / 1px) / view-px-w, (self.height / 1px) / view-px-h);
+        // Stills never upscale past 100%; a playing video fills the window.
+        property <float> fit-any: view-px-w <= 0 || view-px-h <= 0 ? 1 : min((open-w / 1px) / view-px-w, (self.height / 1px) / view-px-h);
+        property <float> fit: view-playing ? fit-any : min(1, fit-any);
         property <float> drawn: view-scale > 0 ? view-scale : fit;
         Image {
             source: view-image;
@@ -2335,22 +2360,34 @@ export component AppWindow inherits Window {
             color: muted;
             rotation-angle: mod(animation-tick() / 1ms, 1000) / 1000 * 360deg;
         }
+        if view-audio && view-note == "": VerticalLayout {
+            x: 0px;
+            width: open-w;
+            alignment: center;
+            spacing: 12px;
+            Text { text: "󰎆"; font-size: 72px; color: muted; horizontal-alignment: center; }
+            Text { text: view-name; font-size: 13px; color: text; horizontal-alignment: center; overflow: elide; }
+        }
         if view-note != "": VerticalLayout {
             x: 0px;
             width: open-w;
             alignment: center;
             spacing: 10px;
-            Text { text: view-video ? "󰕧" : "󰈟"; font-size: 40px; color: muted; horizontal-alignment: center; }
+            Text { text: view-audio ? "󰎆" : view-video ? "󰕧" : "󰈟"; font-size: 40px; color: muted; horizontal-alignment: center; }
             Text { text: view-note; font-size: 13px; color: muted; horizontal-alignment: center; }
             HorizontalLayout {
                 alignment: center;
+                // Secondary: playing in Robin is the main path, this is
+                // the way out when it can't.
                 Rectangle {
                     width: 200px;
                     height: 34px;
                     border-radius: 6px;
-                    background: ext-touch.has-hover ? accent.with-alpha(0.85) : accent;
-                    Text { text: "Open in default player"; font-size: 12px; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
-                    ext-touch := TouchArea { clicked => { root.view-external(); } }
+                    background: ext-touch.has-hover ? hover : surface;
+                    border-width: 1px;
+                    border-color: hairline;
+                    Text { text: "Open in default player"; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                    ext-touch := TouchArea { mouse-cursor: pointer; clicked => { root.view-external(); } }
                 }
             }
         }
@@ -2373,6 +2410,12 @@ export component AppWindow inherits Window {
                 }
                 Text { text: view-name; font-size: 13px; font-weight: 700; color: text; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
                 Text { text: view-counter; font-size: 11px; color: muted; vertical-alignment: center; }
+                // Open with: the desktop's default player, secondary to
+                // playing here.
+                if view-playing: Text {
+                    text: "󰏌"; font-size: 16px; width: 20px; color: open-touch.has-hover ? accent : text; vertical-alignment: center;
+                    open-touch := TouchArea { mouse-cursor: pointer; clicked => { root.view-external(); } }
+                }
                 Text {
                     text: "󰋽"; font-size: 16px; width: 20px; color: view-info ? accent : text; vertical-alignment: center;
                     TouchArea { clicked => { root.view-key("i"); } }
@@ -2392,12 +2435,12 @@ export component AppWindow inherits Window {
                 padding: 6px;
                 spacing: 4px;
                 for t[i] in view-tiles: FilmTile {
-                    shot: t.shot; current: t.current; ring: root.accent; video: t.video; ink: root.muted;
+                    shot: t.shot; current: t.current; ring: root.accent; video: t.video; audio: t.audio; ink: root.muted;
                     TouchArea { clicked => { root.view-go(i); } }
                 }
             }
         }
-        if view-chrome: Rectangle {
+        if view-chrome && !view-playing: Rectangle {
             y: parent.height - 16px - 46px;
             x: (open-w - self.width) / 2;
             width: 300px;
@@ -2413,6 +2456,237 @@ export component AppWindow inherits Window {
                     text: k.g; font-size: 14px; color: text; vertical-alignment: center;
                     TouchArea { clicked => { root.view-key(k.k); } }
                 }
+            }
+        }
+        // The transport (ViewerTransport) replaces the toolbar while a
+        // video or audio file plays: 46 tall, window − 120 wide.
+        if view-chrome && view-playing && view-note == "": Rectangle {
+            y: parent.height - 16px - 46px;
+            x: (open-w - self.width) / 2;
+            width: max(320px, open-w - 120px);
+            height: 46px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            property <length> track-x: 156px;
+            property <length> track-w: max(40px, self.width - track-x - 196px);
+            property <bool> lifted: scrub.has-hover || scrub.pressed;
+            property <length> track-h: lifted ? 5px : 3px;
+            animate track-h { duration: 100ms; easing: ease-out; }
+            property <bool> vol-open: false;
+            Text {
+                text: view-paused ? "󰐊" : "󰏤";
+                x: 12px;
+                width: 20px;
+                height: parent.height;
+                font-size: 16px;
+                color: text;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                TouchArea { mouse-cursor: pointer; clicked => { root.view-transport("toggle", 0); } }
+            }
+            Text {
+                text: view-clock;
+                x: 40px;
+                width: 108px;
+                height: parent.height;
+                font-size: 11px;
+                color: muted;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                x: track-x;
+                y: (parent.height - track-h) / 2;
+                width: track-w;
+                height: track-h;
+                border-radius: 2px;
+                background: text.with-alpha(0.20);
+                Rectangle { x: 0px; y: 0px; width: parent.width * view-progress; height: parent.height; background: accent; border-radius: 2px; }
+            }
+            Rectangle {
+                x: track-x + track-w * view-progress - 6px;
+                y: (parent.height - 12px) / 2;
+                width: 12px;
+                height: 12px;
+                border-radius: 6px;
+                background: text;
+                border-width: 2px;
+                border-color: accent;
+            }
+            // A taller hit area than the 3px track; click or drag seeks.
+            scrub := TouchArea {
+                x: track-x - 6px;
+                y: (parent.height - 24px) / 2;
+                width: track-w + 12px;
+                height: 24px;
+                mouse-cursor: pointer;
+                property <float> at: max(0, min(1, (self.mouse-x - 6px) / track-w));
+                pointer-event(e) => {
+                    if e.kind == PointerEventKind.down && e.button == PointerEventButton.left {
+                        root.view-transport("seek", self.at);
+                    }
+                }
+                moved => {
+                    if self.pressed {
+                        root.view-transport("seek", self.at);
+                    }
+                }
+            }
+            // The hover time over the track.
+            if scrub.has-hover && view-duration > 0: Rectangle {
+                property <float> t: scrub.at * view-duration;
+                property <int> h: floor(t / 3600);
+                property <int> m: mod(floor(t / 60), 60);
+                property <int> sec: mod(floor(t), 60);
+                x: max(0px, min(parent.width - self.width, track-x + track-w * scrub.at - self.width / 2));
+                y: -30px;
+                width: 52px;
+                height: 22px;
+                background: bg.with-alpha(0.86);
+                border-radius: 2px;
+                border-width: 1px;
+                border-color: hairline;
+                Text {
+                    text: (view-duration >= 3600 ? h + ":" + (m < 10 ? "0" : "") + m : (h * 60 + m < 10 ? "0" : "") + (h * 60 + m)) + ":" + (sec < 10 ? "0" : "") + sec;
+                    font-size: 11px;
+                    color: text;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            Text {
+                text: view-muted || view-volume <= 0 ? "󰖁" : "󰕾";
+                x: parent.width - 184px;
+                width: 24px;
+                height: parent.height;
+                font-size: 16px;
+                color: vol-open ? accent : text;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                TouchArea { mouse-cursor: pointer; clicked => { vol-open = !vol-open; } }
+            }
+            // The volume slider popover, above its button.
+            if vol-open: Rectangle {
+                x: parent.width - 184px - 4px;
+                y: -8px - self.height;
+                width: 32px;
+                height: 120px;
+                background: bg.with-alpha(0.86);
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: hairline;
+                property <float> level: view-muted ? 0 : view-volume;
+                Rectangle {
+                    x: (parent.width - 3px) / 2;
+                    y: 12px;
+                    width: 3px;
+                    height: parent.height - 24px;
+                    border-radius: 2px;
+                    background: text.with-alpha(0.20);
+                    Rectangle { y: parent.height * (1 - level); width: parent.width; height: parent.height * level; background: accent; border-radius: 2px; }
+                }
+                Rectangle {
+                    x: (parent.width - 12px) / 2;
+                    y: 12px + (parent.height - 24px) * (1 - level) - 6px;
+                    width: 12px;
+                    height: 12px;
+                    border-radius: 6px;
+                    background: text;
+                    border-width: 2px;
+                    border-color: accent;
+                }
+                TouchArea {
+                    property <float> at: max(0, min(1, 1 - (self.mouse-y - 12px) / (self.height - 24px)));
+                    pointer-event(e) => {
+                        if e.kind == PointerEventKind.down {
+                            root.view-transport("volume", self.at);
+                        }
+                    }
+                    moved => {
+                        if self.pressed {
+                            root.view-transport("volume", self.at);
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                x: parent.width - 152px;
+                y: (parent.height - 22px) / 2;
+                width: 44px;
+                height: 22px;
+                border-radius: 4px;
+                background: speed-touch.has-hover ? hover : transparent;
+                Text { text: view-speed; font-size: 11px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                speed-touch := TouchArea { mouse-cursor: pointer; clicked => { root.view-transport("speed", 0); } }
+            }
+            Text {
+                text: "󰑖";
+                x: parent.width - 100px;
+                width: 24px;
+                height: parent.height;
+                font-size: 16px;
+                color: view-loop ? accent : text;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                TouchArea { mouse-cursor: pointer; clicked => { root.view-transport("loop", 0); } }
+            }
+            Text {
+                text: "󰨖";
+                x: parent.width - 68px;
+                width: 24px;
+                height: parent.height;
+                font-size: 16px;
+                color: view-subs ? accent : text;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                TouchArea { mouse-cursor: pointer; clicked => { root.view-transport("subs", 0); } }
+            }
+            Text {
+                text: view-full ? "󰊔" : "󰊓";
+                x: parent.width - 36px;
+                width: 24px;
+                height: parent.height;
+                font-size: 16px;
+                color: text;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                TouchArea { mouse-cursor: pointer; clicked => { root.view-transport("full", 0); } }
+            }
+        }
+        // "Resume at 02:14?": a toast over the viewer, above the strip.
+        if view-resume != "": Rectangle {
+            x: (open-w - self.width) / 2;
+            y: parent.height - 16px - 46px - 16px - (strip-on ? 72px : 0px) - self.height;
+            width: min(320px, open-w - 32px);
+            height: 40px;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            Text { text: "󰋽"; x: 14px; width: 18px; height: parent.height; font-size: 14px; color: accent; vertical-alignment: center; }
+            Text { text: view-resume; x: 38px; width: parent.width - 38px - 104px; height: parent.height; font-size: 13px; color: text; overflow: elide; vertical-alignment: center; }
+            Text {
+                text: "Resume";
+                x: parent.width - 100px;
+                width: 60px;
+                height: parent.height;
+                font-size: 12px;
+                color: accent;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                TouchArea { mouse-cursor: pointer; clicked => { root.view-transport("resume", 0); } }
+            }
+            Text {
+                text: "󰅖";
+                x: parent.width - 30px;
+                width: 18px;
+                height: parent.height;
+                font-size: 14px;
+                color: muted;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                TouchArea { mouse-cursor: pointer; clicked => { root.view-transport("resume-close", 0); } }
             }
         }
         if view-zoom != "": Rectangle {

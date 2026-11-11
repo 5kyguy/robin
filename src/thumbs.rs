@@ -358,6 +358,26 @@ fn night(width: u32, height: u32) -> image::RgbImage {
     })
 }
 
+/// `n` RGBA frames for the fixture's speeder-run clip: the night glow
+/// sweeping left to right, so a played clip visibly moves.
+pub fn fixture_clip_frames(n: usize, width: u32, height: u32) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|i| {
+            let at = i as f32 / n.max(1) as f32 - 0.5;
+            image::RgbaImage::from_fn(width, height, |x, y| {
+                let t = y as f32 / height as f32;
+                let dx = x as f32 / width as f32 - 0.5 - at * 0.6;
+                let glow = (1.0 - (dx * dx + (t - 0.55).powi(2)) * 8.0).clamp(0.0, 1.0);
+                let r = (8.0 + glow * 30.0) as u8;
+                let g = (22.0 + glow * 90.0) as u8;
+                let b = (36.0 + glow * 110.0) as u8;
+                image::Rgba([r, g, b, 255])
+            })
+            .into_raw()
+        })
+        .collect()
+}
+
 fn sky(width: u32, height: u32, shift: i32) -> image::RgbImage {
     image::RgbImage::from_fn(width, height, |x, y| {
         let t = y as f32 / height as f32;

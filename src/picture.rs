@@ -35,7 +35,8 @@ impl Why {
         match self {
             Why::TooLarge(w, h) => format!("Too large to preview ({w}×{h})"),
             Why::Unreadable => "Can't read this file".into(),
-            Why::Video => "No built-in video player yet".into(),
+            // Never shown in the viewer, which plays videos (mpv.rs).
+            Why::Video => "A video, not a still".into(),
         }
     }
 }

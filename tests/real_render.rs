@@ -42,6 +42,9 @@ fn scripted_views_render_through_the_real_app() {
         ("view-info", 900),
         ("view-turn", 900),
         ("view-video", 900),
+        ("view-scrub", 900),
+        ("view-resume", 900),
+        ("view-audio", 900),
         ("view-loading", 900),
         ("view-pan", 900),
         ("view-wake", 900),
@@ -70,6 +73,46 @@ fn scripted_views_render_through_the_real_app() {
         let img = image::open(&out).unwrap();
         assert_eq!((img.width(), img.height()), (width, 500), "{view}");
         robin::fixture::remove(&fixture).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Return on a video plays it inside Robin: with libmpv installed the
+/// frame is the clip's picture; without it (or with ROBIN_NO_MPV set) the
+/// viewer says why and offers the default player instead.
+#[test]
+fn return_on_a_video_shows_its_frames_in_the_viewer() {
+    let set = |k| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    if !set("DISPLAY") && !set("WAYLAND_DISPLAY") {
+        eprintln!("no display; skipping");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("robin-play-render-{}", std::process::id()));
+    // Blue in the clip's glow, left of centre; the plain canvas otherwise.
+    let blue_at = |no_mpv: bool| {
+        let tag = if no_mpv { "off" } else { "on" };
+        let out = dir.join(format!("view-video-{tag}.png"));
+        let fixture = dir.join(format!("home-{tag}"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_robin"));
+        cmd.args(["--render", "view-video", "--size", "900x500", "--fixture"])
+            .arg(&fixture)
+            .arg("--out")
+            .arg(&out);
+        if no_mpv {
+            cmd.env("ROBIN_NO_MPV", "1");
+        }
+        assert!(cmd.status().unwrap().success(), "{tag}");
+        let img = image::open(&out).unwrap().to_rgb8();
+        robin::fixture::remove(&fixture).unwrap();
+        img.get_pixel(360, 225)[2]
+    };
+    let off = blue_at(true);
+    assert!(off < 60, "no libmpv: plain canvas, got {off}");
+    if robin::mpv::available() {
+        let on = blue_at(false);
+        assert!(on > 90, "libmpv: the clip's frame, got {on}");
+    } else {
+        eprintln!("libmpv not installed; only the fallback was checked");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
