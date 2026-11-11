@@ -21,6 +21,24 @@ shows the time for today and the date before that. The open folder
 refreshes by itself when other apps change it, keeping the selection
 and scroll position.
 
+## Video and audio
+
+Opening a video or audio file (double-click or Enter) plays it in
+Robin's viewer, with the transport in place of the toolbar: play and
+pause, the time, a scrub track, volume, speed, loop, subtitles and
+fullscreen. Space plays and pauses, `j`/`k` seek 5 seconds, `,`/`.`
+step a frame, `m` mutes, and Enter or F11 toggle fullscreen. Robin
+remembers where a file was left and offers to resume it. The top bar's
+open-with button still hands the file to the desktop's default player.
+
+Playback needs **libmpv** (`libmpv.so.2`; the `mpv` package on Arch,
+`libmpv2` on Debian and Ubuntu). Robin loads it at run time, so it
+builds and runs without it; without libmpv the viewer says so and
+offers [Open in default player] instead. Set `ROBIN_NO_MPV=1` to try
+that path on a machine that has libmpv. Robin never reads mpv's config
+or scripts and never writes its watch-later files; resume positions
+are kept in `$XDG_CACHE_HOME/robin/resume`.
+
 ## Drag and drop with other apps
 
 **Drag and drop with other apps doesn't work on Wayland yet, including

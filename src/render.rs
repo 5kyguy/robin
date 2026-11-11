@@ -48,6 +48,9 @@ pub fn scripted(view: &str) -> bool {
             | "view-info"
             | "view-turn"
             | "view-video"
+            | "view-scrub"
+            | "view-resume"
+            | "view-audio"
             | "view-loading"
             | "view-pan"
             | "view-wake"
@@ -171,7 +174,8 @@ fn paint_in(
     let home = &crate::fixture::home(root);
     let start = match view {
         "start-denied" => home.join("secret"),
-        "view-video" => home.join("Videos"),
+        "view-video" | "view-scrub" | "view-resume" => home.join("Videos"),
+        "view-audio" => home.join("Music"),
         _ => home.join("Pictures"),
     };
     if view.starts_with("view-") {
@@ -181,6 +185,7 @@ fn paint_in(
         if view == "view-strip-video" {
             seed_strip_videos(home)?;
         }
+        seed_media(view, home)?;
         crate::fixture::freeze_times(root, FIXTURE_MTIME)?;
     }
     let mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(root))?;
@@ -299,10 +304,31 @@ fn paint_in(
             // Turns are made on a worker too.
             app::land_reads();
         }
-        "view-video" => {
+        // Return on the clip plays it in the viewer; the script pauses it
+        // at 01:12 of 04:30 so the frame and the clock are fixed.
+        "view-video" | "view-scrub" | "view-resume" => {
             select_row(&ui, "speeder-run.mp4");
             type_keys(&ui, "\n");
             app::land_reads();
+            app::land_playback(|t| t.dur > 0.0);
+            if view != "view-resume" {
+                app::script_transport("toggle", 0.0);
+                app::script_transport("seek", (72.0 / CLIP_SECS) as f32);
+                app::land_playback(|t| t.paused && (t.pos - 72.0).abs() < 1.0);
+            }
+            if view == "view-scrub" {
+                hover_scrub(&ui, size, 0.5);
+            }
+        }
+        // An audio file plays with a music glyph and the same transport.
+        "view-audio" => {
+            select_row(&ui, "cantina-band.wav");
+            type_keys(&ui, "\n");
+            app::land_reads();
+            app::land_playback(|t| t.dur > 0.0);
+            app::script_transport("toggle", 0.0);
+            app::script_transport("seek", (24.5 / 96.0) as f32);
+            app::land_playback(|t| t.paused && t.pos > 24.0);
         }
         "trash-empty-confirm" => ui.invoke_trash_empty(),
         // The sidebar's Statistics row; the scan lands like any read.
@@ -335,6 +361,60 @@ fn paint_in(
         _ => {}
     }
     snapshot(&ui, size, out)
+}
+
+/// Length of the fixture's speeder-run clip, as in the mock frames.
+const CLIP_SECS: f64 = 270.0;
+
+/// Real media for the player scenes: a cantina-band tone, and with
+/// libmpv installed a 04:30 speeder-run clip (YUV4MPEG2, one frame per
+/// 3s) in place of the fixture's stand-in bytes, plus for view-resume a
+/// saved position at 02:14. Without libmpv the viewer explains.
+fn seed_media(view: &str, home: &Path) -> Result<()> {
+    if !matches!(
+        view,
+        "view-video" | "view-scrub" | "view-resume" | "view-audio"
+    ) {
+        return Ok(());
+    }
+    let io = |p: &Path, e| crate::Error::io(p, e);
+    let tone = home.join("Music/cantina-band.wav");
+    if let Some(dir) = tone.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+    }
+    crate::mpv::write_wav(&tone, 96, 330.0).map_err(|e| io(&tone, e))?;
+    // The clip is 11 MB: only worth writing when it can be played.
+    if !crate::mpv::available() {
+        return Ok(());
+    }
+    let clip = home.join("Videos/speeder-run.mp4");
+    let frames = crate::thumbs::fixture_clip_frames((CLIP_SECS / 3.0) as usize, 384, 216);
+    let frames: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+    crate::mpv::write_y4m(&clip, 384, 216, &frames, (1, 3)).map_err(|e| io(&clip, e))?;
+    if view == "view-resume" {
+        let env = crate::ops::Env::for_home(home);
+        let mut saved =
+            crate::player::Positions::load(crate::player::Positions::path(env.cache_dir()));
+        saved.set(&clip, 134.0, CLIP_SECS);
+    }
+    Ok(())
+}
+
+/// Move the pointer over the transport's scrub track at `at` (0..1), so
+/// the track lifts and the hover time shows.
+fn hover_scrub(ui: &AppWindow, size: (u32, u32), at: f32) {
+    // The transport is window − 120 wide and centred; the track starts
+    // 156 in and leaves 196 for the buttons on the right.
+    let (w, h) = (size.0 as f32, size.1 as f32);
+    let bar = (w - 120.0).max(320.0);
+    let left = (w - bar) / 2.0;
+    let track_w = (bar - 156.0 - 196.0).max(40.0);
+    let x = left + 156.0 + track_w * at;
+    let y = h - 16.0 - 23.0;
+    ui.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(x, y),
+        });
 }
 
 /// Two videos beside the dune photos: one with a frame already in the

@@ -7,6 +7,7 @@ arch=('x86_64')
 url="https://github.com/5kyguy/robin"
 license=('GPL-3.0-only')
 depends=('fontconfig' 'libxkbcommon')
+optdepends=('mpv: play video and audio inside Robin (libmpv)')
 makedepends=('cargo' 'rust')
 source=("$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP')

@@ -13,6 +13,19 @@ pub const ZOOM_MAX: f32 = 16.0;
 pub enum Media {
     Image,
     Video,
+    Audio,
+}
+
+impl Media {
+    /// Played in the viewer with the transport, not decoded as a still.
+    pub fn playable(self) -> bool {
+        matches!(self, Media::Video | Media::Audio)
+    }
+}
+
+/// `name` is a video or audio file the viewer plays.
+pub fn playable(name: &Path) -> bool {
+    media(name).is_some_and(Media::playable)
 }
 
 /// What the viewer can show, by extension. Stills the decoder can't read
@@ -24,6 +37,7 @@ pub fn media(name: &Path) -> Option<Media> {
             Some(Media::Image)
         }
         "mp4" | "m4v" | "mkv" | "webm" | "mov" | "avi" => Some(Media::Video),
+        "mp3" | "flac" | "ogg" | "opus" | "wav" | "m4a" | "aac" => Some(Media::Audio),
         _ => None,
     }
 }
@@ -326,6 +340,9 @@ mod tests {
         );
         assert_eq!(media(Path::new("x.MKV")), Some(Media::Video));
         assert_eq!(media(Path::new("README")), None);
+        assert_eq!(media(Path::new("song.FLAC")), Some(Media::Audio));
+        assert!(playable(Path::new("c.mp4")) && playable(Path::new("t.opus")));
+        assert!(!playable(Path::new("a.jpg")));
     }
 
     #[test]
