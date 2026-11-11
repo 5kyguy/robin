@@ -794,6 +794,11 @@ impl Controller {
         !self.forward.is_empty()
     }
 
+    /// Whether the up button has somewhere to go: anywhere but `/`.
+    pub fn can_up(&self) -> bool {
+        self.dir.parent().is_some()
+    }
+
     /// The toolbar's up button: the parent folder, as Backspace does.
     pub fn go_up(&self) -> Action {
         match self.dir.parent() {
@@ -4415,6 +4420,7 @@ fn redraw(ui: &AppWindow, s: &State) {
     ui.set_hidden_on(ctl.listing.show_hidden());
     ui.set_can_back(ctl.can_back());
     ui.set_can_forward(ctl.can_forward());
+    ui.set_can_up(ctl.can_up());
     ui.set_tile(ctl.tile());
     let content_w = ui.get_content_w();
     ctl.fit(content_w);
@@ -5238,8 +5244,15 @@ mod tests {
         travel(&mut c, Step::Back);
         assert_eq!(c.dir, raw);
 
-        let root = Controller::new(PathBuf::from("/"), c.env.clone());
+        assert!(c.can_up(), "up is lit below /");
+        let mut root = Controller::new(PathBuf::from("/"), c.env.clone());
+        assert!(!root.can_up(), "up dims at /");
         assert_eq!(root.go_up(), Action::None, "nothing above /");
+        assert_eq!(
+            root.key(keys::BACKSPACE, false, false),
+            Action::None,
+            "Backspace at / does nothing either"
+        );
     }
 
     #[test]
