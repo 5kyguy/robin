@@ -109,6 +109,9 @@ pub enum Action {
     Run(Job),
     Open(Dialog),
     Navigate(PathBuf),
+    /// The toolbar's back or forward button: a step through the folder
+    /// history.
+    Travel(Step),
     CancelJob,
     /// Reply to the job thread's conflict question; `None` cancels the job.
     Answer(Option<ConflictChoice>),
@@ -277,6 +280,12 @@ pub struct Controller {
     pub skip_trash_confirm: bool,
     /// The open trash confirm's "Don't ask again" box.
     pub dont_ask: bool,
+    /// Folders left behind by navigation, most recent last: the back
+    /// button's stack.
+    back: Vec<PathBuf>,
+    /// Folders stepped back out of, most recent last: the forward
+    /// button's stack. A new navigation clears it.
+    forward: Vec<PathBuf>,
 }
 
 /// Grid tile widths (S/M/L) per density, from the spec's density table.
@@ -399,6 +408,16 @@ struct PendingNav {
     target: PathBuf,
     started: std::time::Instant,
     shown: bool,
+    /// Set when this navigation is a step back or forward through the
+    /// history rather than a new place.
+    step: Option<Step>,
+}
+
+/// A step through the folder history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Back,
+    Forward,
 }
 
 /// Why a folder is read: a navigation keeps the old folder on screen and
@@ -718,6 +737,8 @@ impl Controller {
             trash_asked: false,
             skip_trash_confirm: false,
             dont_ask: false,
+            back: Vec::new(),
+            forward: Vec::new(),
         }
     }
 
@@ -729,6 +750,15 @@ impl Controller {
     /// `begin_navigate` at a given time. A navigation that supersedes one
     /// already shown as pending retargets the breadcrumb right away.
     pub fn begin_navigate_at(&mut self, dir: PathBuf, now: std::time::Instant) -> ReadTicket {
+        self.begin_nav(dir, None, now)
+    }
+
+    fn begin_nav(
+        &mut self,
+        dir: PathBuf,
+        step: Option<Step>,
+        now: std::time::Instant,
+    ) -> ReadTicket {
         let shown = self.nav.as_ref().is_some_and(|n| n.shown);
         let ticket = self.ticket(dir.clone(), ReadKind::Navigate);
         self.nav = Some(PendingNav {
@@ -736,8 +766,81 @@ impl Controller {
             target: dir,
             started: now,
             shown,
+            step,
         });
         ticket
+    }
+
+    /// Step back or forward through the folder history; `None` when
+    /// there is nowhere to go. The stacks only change once the read
+    /// lands, so a step that fails or is superseded loses nothing.
+    pub fn begin_travel(&mut self, step: Step, now: std::time::Instant) -> Option<ReadTicket> {
+        let target = self.history(step).last()?.clone();
+        Some(self.begin_nav(target, Some(step), now))
+    }
+
+    fn history(&self, step: Step) -> &Vec<PathBuf> {
+        match step {
+            Step::Back => &self.back,
+            Step::Forward => &self.forward,
+        }
+    }
+
+    /// Whether the back button has somewhere to go.
+    pub fn can_back(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    /// Whether the forward button has somewhere to go.
+    pub fn can_forward(&self) -> bool {
+        !self.forward.is_empty()
+    }
+
+    /// Whether the up button has somewhere to go: anywhere but `/`.
+    pub fn can_up(&self) -> bool {
+        self.dir.parent().is_some()
+    }
+
+    /// The toolbar's up button: the parent folder, as Backspace does.
+    pub fn go_up(&self) -> Action {
+        match self.dir.parent() {
+            Some(p) => Action::Navigate(p.to_path_buf()),
+            None => Action::None,
+        }
+    }
+
+    /// Record a move from `old` to the open folder in the history.
+    /// `step` is the navigation's own step; a refresh that walked up out
+    /// of a vanished folder is no navigation and records nothing.
+    fn record_move(&mut self, old: PathBuf, kind: ReadKind, step: Option<Step>) {
+        if kind == ReadKind::Navigate {
+            match step {
+                None => {
+                    self.back.push(old);
+                    self.forward.clear();
+                }
+                Some(Step::Back) => {
+                    if self.back.last() == Some(&self.dir) {
+                        self.back.pop();
+                    }
+                    self.forward.push(old);
+                }
+                Some(Step::Forward) => {
+                    if self.forward.last() == Some(&self.dir) {
+                        self.forward.pop();
+                    }
+                    self.back.push(old);
+                }
+            }
+        }
+        // Never offer a step to the folder already open, nor two steps
+        // to the same folder in a row.
+        for stack in [&mut self.back, &mut self.forward] {
+            while stack.last() == Some(&self.dir) {
+                stack.pop();
+            }
+            stack.dedup();
+        }
     }
 
     /// Mark navigation `gen` as pending once it has taken
@@ -895,7 +998,11 @@ impl Controller {
             return Landed::Stale;
         }
         self.in_flight = None;
-        self.nav = None;
+        let step = self
+            .nav
+            .take()
+            .filter(|_| read.kind == ReadKind::Navigate)
+            .and_then(|n| n.step);
         if read.result.is_ok() {
             self.trash = read.trash.unwrap_or_default();
         }
@@ -908,12 +1015,22 @@ impl Controller {
             if read.kind == ReadKind::Navigate {
                 self.refresh_due = true;
             }
+            // A history step into a folder that is gone drops that entry,
+            // so the button doesn't keep offering it; the next one back
+            // (or forward) is still there.
+            if let Some(step) = step.filter(|_| e.is_gone()) {
+                match step {
+                    Step::Back => self.back.pop(),
+                    Step::Forward => self.forward.pop(),
+                };
+            }
         }
         match read.result {
             Ok((dir, snap)) if dir != self.dir => {
                 let (key, order) = self.listing.sort();
                 let hidden = self.listing.show_hidden();
-                self.dir = dir;
+                let old = std::mem::replace(&mut self.dir, dir);
+                self.record_move(old, read.kind, step);
                 // A new folder starts unfiltered.
                 self.searching = false;
                 self.listing = Listing::default();
@@ -1301,10 +1418,7 @@ impl Controller {
                 Some(name) => self.open_viewer(&name),
                 None => Action::None,
             },
-            keys::BACKSPACE => match self.dir.parent() {
-                Some(p) => Action::Navigate(p.to_path_buf()),
-                None => Action::None,
-            },
+            keys::BACKSPACE => self.go_up(),
             _ => Action::None,
         }
     }
@@ -2693,6 +2807,28 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     let st = state.clone();
     ui.on_search_clear(move || {
         let action = st.borrow_mut().ctl.clear_search();
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_nav_back(move || {
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, Action::Travel(Step::Back));
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_nav_forward(move || {
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, Action::Travel(Step::Forward));
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_nav_up(move || {
+        let action = st.borrow().ctl.go_up();
         if let Some(ui) = w.upgrade() {
             apply(&ui, &st, action);
         }
@@ -4270,6 +4406,9 @@ fn redraw(ui: &AppWindow, s: &State) {
     ui.set_grid(ctl.grid);
     ui.set_compact(ctl.compact);
     ui.set_hidden_on(ctl.listing.show_hidden());
+    ui.set_can_back(ctl.can_back());
+    ui.set_can_forward(ctl.can_forward());
+    ui.set_can_up(ctl.can_up());
     ui.set_tile(ctl.tile());
     let content_w = ui.get_content_w();
     ctl.fit(content_w);
@@ -4381,6 +4520,28 @@ fn redraw(ui: &AppWindow, s: &State) {
     }
 }
 
+/// Start a navigation read: drop targets follow it, and a slow one shows
+/// as pending after `NAV_PENDING_AFTER`.
+fn start_nav(ui: &AppWindow, st: &Shared, ticket: ReadTicket) {
+    ui.set_stats_mode("".into());
+    sync_drop_dest(&st.borrow());
+    let gen = ticket.gen();
+    let retargeted = st.borrow().ctl.nav_pending();
+    if retargeted {
+        redraw(ui, &st.borrow());
+    }
+    start_read(Some(ticket));
+    let st = st.clone();
+    let ui = ui.as_weak();
+    slint::Timer::single_shot(NAV_PENDING_AFTER, move || {
+        let Some(ui) = ui.upgrade() else { return };
+        let mut s = st.borrow_mut();
+        if s.ctl.tick_nav(gen, std::time::Instant::now()) {
+            redraw(&ui, &s);
+        }
+    });
+}
+
 fn apply(ui: &AppWindow, st: &Shared, action: Action) {
     match action {
         Action::None => {}
@@ -4410,24 +4571,17 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
             }
         }
         Action::Navigate(dir) => {
-            ui.set_stats_mode("".into());
             let ticket = st.borrow_mut().ctl.begin_navigate(dir);
-            sync_drop_dest(&st.borrow());
-            let gen = ticket.gen();
-            let retargeted = st.borrow().ctl.nav_pending();
-            if retargeted {
-                redraw(ui, &st.borrow());
+            start_nav(ui, st, ticket);
+        }
+        Action::Travel(step) => {
+            let ticket = st
+                .borrow_mut()
+                .ctl
+                .begin_travel(step, std::time::Instant::now());
+            if let Some(ticket) = ticket {
+                start_nav(ui, st, ticket);
             }
-            start_read(Some(ticket));
-            let st = st.clone();
-            let ui = ui.as_weak();
-            slint::Timer::single_shot(NAV_PENDING_AFTER, move || {
-                let Some(ui) = ui.upgrade() else { return };
-                let mut s = st.borrow_mut();
-                if s.ctl.tick_nav(gen, std::time::Instant::now()) {
-                    redraw(&ui, &s);
-                }
-            });
         }
         Action::Launch(argv) => launch(ui, st, argv),
         Action::ClearThumbs(cache) => clear_thumbs(ui, st, cache),
@@ -4990,6 +5144,185 @@ mod tests {
         let mut c = Controller::new(dir, env);
         c.reload().unwrap();
         c
+    }
+
+    /// Navigate to `dir` and land the read.
+    fn go(c: &mut Controller, dir: PathBuf) -> Landed {
+        let ticket = c.begin_navigate(dir);
+        c.land(ticket.perform())
+    }
+
+    /// Step back or forward and land the read.
+    fn travel(c: &mut Controller, step: Step) -> Landed {
+        let ticket = c
+            .begin_travel(step, std::time::Instant::now())
+            .expect("somewhere to go");
+        c.land(ticket.perform())
+    }
+
+    #[test]
+    fn back_and_forward_walk_the_folder_history() {
+        let mut c = setup("hist-walk");
+        let pics = c.dir.clone();
+        let raw = pics.join("raw-exports");
+        assert!(
+            !c.can_back() && !c.can_forward(),
+            "a fresh window has no history"
+        );
+        assert!(c
+            .begin_travel(Step::Back, std::time::Instant::now())
+            .is_none());
+
+        assert!(matches!(
+            go(&mut c, raw.clone()),
+            Landed::Shown { moved: true }
+        ));
+        assert!(c.can_back() && !c.can_forward());
+
+        assert!(matches!(
+            travel(&mut c, Step::Back),
+            Landed::Shown { moved: true }
+        ));
+        assert_eq!(c.dir, pics);
+        assert!(!c.can_back() && c.can_forward());
+
+        assert!(matches!(
+            travel(&mut c, Step::Forward),
+            Landed::Shown { moved: true }
+        ));
+        assert_eq!(c.dir, raw);
+        assert!(c.can_back() && !c.can_forward());
+    }
+
+    #[test]
+    fn a_new_navigation_after_back_clears_forward() {
+        let mut c = setup("hist-branch");
+        let pics = c.dir.clone();
+        fs::create_dir(pics.join("other")).unwrap();
+        go(&mut c, pics.join("raw-exports"));
+        travel(&mut c, Step::Back);
+        assert!(c.can_forward());
+        go(&mut c, pics.join("other"));
+        assert!(!c.can_forward(), "forward is gone once the path branches");
+        travel(&mut c, Step::Back);
+        assert_eq!(c.dir, pics);
+        assert!(!c.can_back());
+    }
+
+    #[test]
+    fn up_and_backspace_go_to_the_parent_and_count_as_navigation() {
+        let mut c = setup("hist-up");
+        let pics = c.dir.clone();
+        let raw = pics.join("raw-exports");
+        go(&mut c, raw.clone());
+        assert_eq!(c.go_up(), Action::Navigate(pics.clone()));
+        // Backspace stays "parent", not history-back.
+        travel(&mut c, Step::Back);
+        go(&mut c, raw.clone());
+        assert_eq!(
+            c.key(keys::BACKSPACE, false, false),
+            Action::Navigate(pics.clone())
+        );
+        let Action::Navigate(up) = c.go_up() else {
+            panic!("no parent")
+        };
+        go(&mut c, up);
+        assert_eq!(c.dir, pics);
+        // Back from the parent returns to the child it came up from.
+        travel(&mut c, Step::Back);
+        assert_eq!(c.dir, raw);
+
+        assert!(c.can_up(), "up is lit below /");
+        let mut root = Controller::new(PathBuf::from("/"), c.env.clone());
+        assert!(!root.can_up(), "up dims at /");
+        assert_eq!(root.go_up(), Action::None, "nothing above /");
+        assert_eq!(
+            root.key(keys::BACKSPACE, false, false),
+            Action::None,
+            "Backspace at / does nothing either"
+        );
+    }
+
+    #[test]
+    fn stepping_back_into_a_vanished_folder_drops_only_that_entry() {
+        let mut c = setup("hist-gone");
+        let pics = c.dir.clone();
+        let raw = pics.join("raw-exports");
+        let deep = raw.join("deep");
+        fs::create_dir(&deep).unwrap();
+        go(&mut c, raw.clone());
+        go(&mut c, deep.clone());
+        go(&mut c, pics.clone());
+        // back: [Pictures, raw-exports, deep]
+        fs::remove_dir(&deep).unwrap();
+        assert!(matches!(travel(&mut c, Step::Back), Landed::Failed(_)));
+        assert_eq!(c.dir, pics, "a failed step stays put");
+        assert!(!c.can_forward(), "nothing was stepped out of");
+        assert!(matches!(
+            travel(&mut c, Step::Back),
+            Landed::Shown { moved: true }
+        ));
+        assert_eq!(c.dir, raw, "the entry before the vanished one is kept");
+    }
+
+    #[test]
+    fn walking_up_from_a_vanished_folder_records_no_history() {
+        let mut c = setup("hist-walkup");
+        let pics = c.dir.clone();
+        let raw = pics.join("raw-exports");
+        go(&mut c, raw.clone());
+        fs::remove_dir(&raw).unwrap();
+        let ticket = c.begin_refresh().expect("idle");
+        assert!(matches!(
+            c.land(ticket.perform()),
+            Landed::Shown { moved: true }
+        ));
+        assert_eq!(c.dir, pics);
+        // The only entry was Pictures, now open: back has nowhere to go,
+        // and the vanished folder is not offered as forward.
+        assert!(!c.can_back() && !c.can_forward());
+    }
+
+    #[test]
+    fn reopening_the_open_folder_or_searching_adds_no_history() {
+        let mut c = setup("hist-same");
+        let pics = c.dir.clone();
+        go(&mut c, pics.clone());
+        assert!(!c.can_back(), "the open folder is not a new place");
+        c.open_search();
+        c.listing.set_query("a");
+        assert!(
+            !c.can_back(),
+            "a search filters the folder; it isn't a place"
+        );
+        go(&mut c, pics.join("raw-exports"));
+        assert!(!c.searching, "a new folder starts unfiltered");
+        travel(&mut c, Step::Back);
+        assert_eq!(c.dir, pics);
+        assert!(!c.searching && c.listing.query().is_empty());
+    }
+
+    #[test]
+    fn a_superseded_step_leaves_the_history_alone() {
+        let mut c = setup("hist-super");
+        let pics = c.dir.clone();
+        let raw = pics.join("raw-exports");
+        fs::create_dir(raw.join("deep")).unwrap();
+        go(&mut c, raw.clone());
+        let step = c
+            .begin_travel(Step::Back, std::time::Instant::now())
+            .unwrap();
+        let next = c.begin_navigate(raw.join("deep"));
+        assert!(matches!(c.land(step.perform()), Landed::Stale));
+        assert!(matches!(
+            c.land(next.perform()),
+            Landed::Shown { moved: true }
+        ));
+        assert!(!c.can_forward());
+        travel(&mut c, Step::Back);
+        assert_eq!(c.dir, raw);
+        travel(&mut c, Step::Back);
+        assert_eq!(c.dir, pics);
     }
 
     #[test]

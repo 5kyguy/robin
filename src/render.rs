@@ -27,6 +27,7 @@ pub fn scripted(view: &str) -> bool {
         view,
         "browser-list"
             | "nav-pending"
+            | "nav-history"
             | "start-denied"
             | "sidebar-device"
             | "sidebar-trash"
@@ -244,6 +245,37 @@ fn paint_in(
     match view {
         // Pick a restorable item, as a click would.
         "trash-view" => select_row(&ui, "q3-budget.ods"),
+        // The toolbar's up, back and forward buttons, clicked as a person
+        // would: up to home, back to Pictures, forward to home, back
+        // again. Ends in Pictures with back dimmed and forward lit.
+        "nav-history" => {
+            let steps = [
+                ("", "~  ›  Pictures", false, false),
+                ("up", "~", true, false),
+                ("back", "~  ›  Pictures", false, true),
+                ("forward", "~", true, false),
+                ("back", "~  ›  Pictures", false, true),
+            ];
+            for (click, crumbs, back, forward) in steps {
+                match click {
+                    "up" => ui.invoke_nav_up(),
+                    "back" => ui.invoke_nav_back(),
+                    "forward" => ui.invoke_nav_forward(),
+                    _ => {}
+                }
+                app::land_reads();
+                let got = (
+                    ui.get_crumbs().to_string(),
+                    ui.get_can_back(),
+                    ui.get_can_forward(),
+                );
+                if got != (crumbs.to_string(), back, forward) {
+                    return Err(crate::Error::Message(format!(
+                        "nav-history: wanted {crumbs:?} back={back} forward={forward}, got {got:?}"
+                    )));
+                }
+            }
+        }
         // The grid button, then a tile click.
         "grid-view" => {
             ui.invoke_set_grid(true);

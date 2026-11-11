@@ -839,6 +839,15 @@ export component AppWindow inherits Window {
     in property <string> search-scope: "";
     callback search-open();
     callback search-clear();
+    // The toolbar's back, forward and up buttons. Back and forward dim
+    // to 0.42 when the folder history has nowhere to go, and up does at
+    // `/`; renders keep them lit.
+    in property <bool> can-back: true;
+    in property <bool> can-forward: true;
+    in property <bool> can-up: true;
+    callback nav-back();
+    callback nav-forward();
+    callback nav-up();
     in property <string> dialog-title: "";
     in property <string> dialog-body: "";
     in property <[Place]> places;
@@ -1143,7 +1152,13 @@ export component AppWindow inherits Window {
                     width: icon-box;
                     height: icon-box;
                     border-radius: 3px;
+                    opacity: can-back ? 1 : 0.42;
                     Text { text: "󰁍"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea {
+                        enabled: can-back;
+                        mouse-cursor: pointer;
+                        clicked => { root.nav-back(); }
+                    }
                 }
                 Rectangle {
                     x: 8px + icon-box + 2px;
@@ -1151,7 +1166,13 @@ export component AppWindow inherits Window {
                     width: icon-box;
                     height: icon-box;
                     border-radius: 3px;
+                    opacity: can-forward ? 1 : 0.42;
                     Text { text: "󰁔"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea {
+                        enabled: can-forward;
+                        mouse-cursor: pointer;
+                        clicked => { root.nav-forward(); }
+                    }
                 }
                 Rectangle {
                     x: 8px + (icon-box + 2px) * 2;
@@ -1159,7 +1180,13 @@ export component AppWindow inherits Window {
                     width: icon-box;
                     height: icon-box;
                     border-radius: 3px;
+                    opacity: can-up ? 1 : 0.42;
                     Text { text: "󰁝"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea {
+                        enabled: can-up;
+                        mouse-cursor: pointer;
+                        clicked => { root.nav-up(); }
+                    }
                 }
                 Rectangle {
                     x: crumb-x;
