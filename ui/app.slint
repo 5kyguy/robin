@@ -727,6 +727,14 @@ export component AppWindow inherits Window {
     callback set-grid(bool);
     callback toggle-hidden();
     callback toggle-density();
+    // The toolbar's back, forward and up buttons. Back and forward dim
+    // to 0.42 when the folder history has nowhere to go; renders keep
+    // them lit.
+    in property <bool> can-back: true;
+    in property <bool> can-forward: true;
+    callback nav-back();
+    callback nav-forward();
+    callback nav-up();
     // The content area's width; the grid's column count follows it.
     out property <length> content-w: root.width - side-w - 1px;
     callback content-resized();
@@ -1144,7 +1152,13 @@ export component AppWindow inherits Window {
                     width: icon-box;
                     height: icon-box;
                     border-radius: 3px;
+                    opacity: can-back ? 1 : 0.42;
                     Text { text: "󰁍"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea {
+                        enabled: can-back;
+                        mouse-cursor: pointer;
+                        clicked => { root.nav-back(); }
+                    }
                 }
                 Rectangle {
                     x: 8px + icon-box + 2px;
@@ -1152,7 +1166,13 @@ export component AppWindow inherits Window {
                     width: icon-box;
                     height: icon-box;
                     border-radius: 3px;
+                    opacity: can-forward ? 1 : 0.42;
                     Text { text: "󰁔"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea {
+                        enabled: can-forward;
+                        mouse-cursor: pointer;
+                        clicked => { root.nav-forward(); }
+                    }
                 }
                 Rectangle {
                     x: 8px + (icon-box + 2px) * 2;
@@ -1161,6 +1181,10 @@ export component AppWindow inherits Window {
                     height: icon-box;
                     border-radius: 3px;
                     Text { text: "󰁝"; font-size: 16px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.nav-up(); }
+                    }
                 }
                 Rectangle {
                     x: crumb-x;

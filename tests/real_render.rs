@@ -30,6 +30,7 @@ fn scripted_views_render_through_the_real_app() {
         ("grid-view-l", 800),
         ("grid-hidden", 800),
         ("list-density", 800),
+        ("nav-history", 800),
         ("search-results", 800),
         ("search-nosearch", 800),
         ("search-letters", 800),
