@@ -79,6 +79,18 @@ fn scripted_views_render_through_the_real_app() {
         assert!(status.success(), "{view}: {status}");
         let img = image::open(&out).unwrap();
         assert_eq!((img.width(), img.height()), (width, 500), "{view}");
+        if (view, width) == ("view-info", 480) {
+            // The floating panel stops above the filmstrip: the current
+            // tile's accent ring (strip at y 366..426) is still drawn.
+            let rgb = img.to_rgb8();
+            let ring = (366..426).any(|y| {
+                (0..width).any(|x| {
+                    let [r, g, b] = rgb.get_pixel(x, y).0;
+                    r < 40 && g > 200 && b > 220
+                })
+            });
+            assert!(ring, "the info panel hides the filmstrip's current tile");
+        }
         robin::fixture::remove(&fixture).unwrap();
     }
     let _ = std::fs::remove_dir_all(&dir);

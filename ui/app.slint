@@ -2513,11 +2513,12 @@ export component AppWindow inherits Window {
             }
         }
         // The transport (ViewerTransport) replaces the toolbar while a
-        // video or audio file plays: 46 tall, window − 120 wide.
+        // video or audio file plays: 46 tall, window − 120 wide, or 16 clear
+        // of each side below 600 (DESIGN §2 Resizing), as the mock below.
         if view-chrome && view-playing && view-note == "": Rectangle {
             y: parent.height - 16px - 46px;
             x: (open-w - self.width) / 2;
-            width: max(320px, open-w - 120px);
+            width: open-w >= 600px ? open-w - 120px : open-w - 32px;
             height: 46px;
             background: bg.with-alpha(0.86);
             border-radius: 10px;
@@ -2802,9 +2803,10 @@ export component AppWindow inherits Window {
         if view-info: Rectangle {
             width: min(300px, parent.width - 32px);
             x: parent.width - 16px - self.width;
-            // Floating, it keeps the top bar and the toolbar clear.
+            // Floating, it keeps the top bar, the toolbar and the filmstrip
+            // (with its current tile) clear.
             y: info-docked || !view-chrome ? 16px : 16px + 40px + 8px;
-            height: max(0px, parent.height - self.y - (info-docked || !view-chrome ? 16px : 16px + 46px + 8px));
+            height: max(0px, parent.height - self.y - (info-docked || !view-chrome ? 16px : strip-on ? 16px + 46px + 12px + 60px + 8px : 16px + 46px + 8px));
             background: bg.with-alpha(0.92);
             border-radius: 10px;
             border-width: 1px;
@@ -3006,7 +3008,8 @@ export component AppWindow inherits Window {
             width: min(300px, parent.width - 32px);
             x: parent.width - 16px - self.width;
             y: info-docked ? 72px : 64px;
-            height: max(0px, parent.height - self.y - (info-docked ? 16px : 16px + 46px + 8px));
+            // Floating, it stops above the filmstrip (138 from the bottom).
+            height: max(0px, parent.height - self.y - (info-docked ? 16px : 138px + 8px));
             background: bg.with-alpha(0.92);
             border-radius: 10px;
             border-width: 1px;
