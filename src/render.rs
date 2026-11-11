@@ -39,7 +39,7 @@ pub fn scripted(view: &str) -> bool {
             | "grid-view-s"
             | "grid-view-l"
             | "grid-hidden"
-            | "list-density"
+            | "prefs-comfortable"
             | "search-results"
             | "search-letters"
             | "search-nosearch"
@@ -191,6 +191,16 @@ fn paint_in(
     if view == "trash-empty" {
         env.home_trash = crate::fixture::empty_trash(root);
     }
+    let prefs = if view == "prefs-comfortable" {
+        let path = root.join("config/robin/view");
+        std::fs::create_dir_all(path.parent().unwrap())
+            .map_err(|e| crate::Error::io(path.clone(), e))?;
+        std::fs::write(&path, "view = list\ntile = medium\ndensity = compact\n")
+            .map_err(|e| crate::Error::io(path.clone(), e))?;
+        Some(path)
+    } else {
+        None
+    };
     let ui = app::build_scripted(Launch {
         dir: start,
         env,
@@ -198,8 +208,15 @@ fn paint_in(
         compact,
         clock: Some((FROZEN_NOW, FROZEN_OFFSET)),
         mounts: Arc::new(mounts),
-        prefs: None,
+        prefs,
     })?;
+    // A view file left by a build that still had the density toggle:
+    // the app stays comfortable whatever it says.
+    if view == "prefs-comfortable" && ui.get_compact() {
+        return Err(crate::Error::Message(
+            "prefs-comfortable: a saved density made the app compact".into(),
+        ));
+    }
     // Size the window before any keys: the viewer fits and zooms to it.
     ui.window()
         .set_size(slint::PhysicalSize::new(size.0, size.1));
@@ -254,8 +271,6 @@ fn paint_in(
             ui.invoke_set_grid(true);
             ui.invoke_toggle_hidden();
         }
-        // The density label flips Comfortable to Compact.
-        "list-density" => ui.invoke_toggle_density(),
         // Slash opens the search; typed keys narrow the listing.
         "search-results" => type_keys(&ui, "/dune"),
         "search-nosearch" => type_keys(&ui, "/kotlin"),

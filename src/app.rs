@@ -257,7 +257,9 @@ pub struct Controller {
     pub grid: bool,
     /// Grid tile size: 0 small, 1 medium, 2 large.
     pub tile_step: usize,
-    /// Compact density: shorter rows, bars and tiles.
+    /// Compact density: shorter rows, bars and tiles. Only the render
+    /// harness sets it (`--density compact`); the app is always
+    /// comfortable and offers no way to switch.
     pub compact: bool,
     /// Tiles per grid line, refit to the content width on every redraw.
     pub columns: std::cell::Cell<usize>,
@@ -1128,7 +1130,6 @@ impl Controller {
         crate::prefs::ViewPrefs {
             grid: self.grid,
             tile_step: self.tile_step,
-            compact: self.compact,
             show_hidden: self.listing.show_hidden(),
             trash_asked: self.trash_asked,
             skip_trash_confirm: self.skip_trash_confirm,
@@ -1138,7 +1139,6 @@ impl Controller {
     pub fn apply_prefs(&mut self, p: crate::prefs::ViewPrefs) {
         self.grid = p.grid;
         self.tile_step = p.tile_step.min(2);
-        self.compact = p.compact;
         self.listing.set_show_hidden(p.show_hidden);
         self.trash_asked = p.trash_asked;
         self.skip_trash_confirm = p.skip_trash_confirm;
@@ -2584,7 +2584,6 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     let saved = launch.prefs.as_deref().map(crate::prefs::ViewPrefs::load);
     if let Some(p) = saved {
         ctl.apply_prefs(p);
-        ui.set_compact(p.compact);
     }
     ctl.clock = launch.clock;
     ctl.mounts = launch.mounts;
@@ -2702,17 +2701,6 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     let st = state.clone();
     ui.on_toggle_hidden(move || {
         st.borrow_mut().ctl.toggle_hidden();
-        if let Some(ui) = w.upgrade() {
-            apply(&ui, &st, Action::Redraw);
-        }
-    });
-    let w = ui.as_weak();
-    let st = state.clone();
-    ui.on_toggle_density(move || {
-        {
-            let mut s = st.borrow_mut();
-            s.ctl.compact = !s.ctl.compact;
-        }
         if let Some(ui) = w.upgrade() {
             apply(&ui, &st, Action::Redraw);
         }
@@ -5452,7 +5440,6 @@ mod tests {
         let p = crate::prefs::ViewPrefs {
             grid: true,
             tile_step: 2,
-            compact: true,
             show_hidden: true,
             trash_asked: true,
             skip_trash_confirm: true,
@@ -5461,6 +5448,15 @@ mod tests {
         assert_eq!(c.prefs(), p);
         c.set_grid(false);
         assert!(!c.prefs().grid);
+    }
+
+    #[test]
+    fn remembered_settings_never_make_the_app_compact() {
+        let mut c = setup("prefs-comfortable");
+        let old = "view = list\ntile = medium\ndensity = compact\n";
+        c.apply_prefs(crate::prefs::ViewPrefs::parse(old));
+        assert!(!c.compact, "a density line from an older build is ignored");
+        assert_eq!(c.tile(), 152.0, "comfortable medium tiles");
     }
 
     fn select(c: &mut Controller, name: &str) {

@@ -52,7 +52,7 @@ Author: Designr. Implementer: Developr. Every value below is final unless a `--r
 Line height is 1.35 times the size. Columns of numbers use tabular figures (JetBrainsMono figures are already fixed-width).
 
 ### Density
-| | Compact | Comfortable (default) |
+| | Compact | Comfortable (the app) |
 |---|---|---|
 | list row | 24 | 30 |
 | sidebar row | 26 | 30 |
@@ -60,6 +60,8 @@ Line height is 1.35 times the size. Columns of numbers use tabular figures (JetB
 | icon button | 28×28 | 34×34 (IconButton 34) |
 | grid tile (S/M/L) | 96/128/176 | 112/152/208 |
 | status bar | 22 | 26 |
+
+The app is always comfortable and has no density control. Compact exists only for the render harness (`--density compact`, `browser-list-compact`).
 
 ### Icon sizes
 Glyph sizes: 14 in rows and the sidebar (FolderSidebar glyph 14 in an 18px box) · 16 on toolbar buttons · 20 in menus at comfortable density · 48 as the grid type glyph on a medium tile (0.32 times the tile width) · 64 in empty states. Icon boxes use `r-icon 4`.
@@ -134,7 +136,7 @@ Only palette roles are used, never per-type hues. The extension shows as a `t-ca
 ### Status bar
 - Height 26, fill `bg`, top `divider`, `t-small` `muted`, horizontal padding 12.
 - Left: `142 items · 3 hidden` or `4 selected (1.2 GB)`.
-- Right: free space on the current mount (`812 GB free of 1.8 TB`), then `Ctrl+H` hidden toggle state as a `󰈈` glyph that is `accent` when shown, then the density toggle.
+- Right: free space on the current mount (`812 GB free of 1.8 TB`), then `Ctrl+H` hidden toggle state as a `󰈈` glyph that is `accent` when shown.
 
 ## 3. States
 All empty and error states are centred in the content area: glyph 64 `muted@60%` → 12 → `t-h1` `text` → 6 → `t-small` `muted` (max 360 wide) → 16 → optional buttons.
@@ -262,7 +264,7 @@ All empty and error states are centred in the content area: glyph 64 `muted@60%`
   - Rows are 44 tall: label `t-body` with a `t-small` `muted` hint, and the control on the right.
   - Toggles are 32×18 pills (on: `accent` track with an `on_accent` knob; off: a `text@20%` track with a `text` knob). The knob moves with the spring.
   - Categories:
-    - General: default view, density, show hidden, sort, folders first, single-click open.
+    - General: default view, show hidden, sort, folders first, single-click open.
     - Viewer: chrome timeout, slideshow interval, filmstrip default, video resume, loop short videos under 15s.
     - Motion: **Reduce motion** (follows `gtk-enable-animations=false` by default; when on, every enter, exit, and spring becomes a 120ms crossfade or a cut, and the skeleton pulse is off).
     - Files: confirm trash, trash on external drives policy, thumbnail sizes, and the max thumbnail file size (default 200 MB).
