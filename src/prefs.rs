@@ -1,6 +1,8 @@
 //! The view settings robin remembers between launches. They are global,
-//! not per folder: the last view mode, tile size, density and whether
-//! hidden files show, plus the trash confirm's "Don't ask again".
+//! not per folder: the last view mode, tile size and whether hidden
+//! files show, plus the trash confirm's "Don't ask again". Density is
+//! not among them: the app is always comfortable, and a `density` line
+//! left by an older build is ignored.
 
 use std::path::{Path, PathBuf};
 
@@ -12,7 +14,6 @@ pub struct ViewPrefs {
     pub grid: bool,
     /// 0, 1 or 2: small, medium, large tiles.
     pub tile_step: usize,
-    pub compact: bool,
     pub show_hidden: bool,
     /// The Move-to-trash confirm has been answered once, so its "Don't
     /// ask again" box starts ticked (DESIGN §4 Delete).
@@ -53,7 +54,6 @@ impl ViewPrefs {
                         _ => 1,
                     }
                 }
-                "density" => p.compact = value == "compact",
                 "hidden" => p.show_hidden = value == "shown",
                 "trash-confirm" => {
                     p.trash_asked = value != "new";
@@ -67,14 +67,9 @@ impl ViewPrefs {
 
     pub fn render(&self) -> String {
         format!(
-            "view = {}\ntile = {}\ndensity = {}\nhidden = {}\ntrash-confirm = {}\n",
+            "view = {}\ntile = {}\nhidden = {}\ntrash-confirm = {}\n",
             if self.grid { "grid" } else { "list" },
             ["small", "medium", "large"][self.tile_step.min(2)],
-            if self.compact {
-                "compact"
-            } else {
-                "comfortable"
-            },
             if self.show_hidden { "shown" } else { "hidden" },
             match (self.trash_asked, self.skip_trash_confirm) {
                 (_, true) => "skip",
@@ -177,13 +172,29 @@ mod tests {
         let p = ViewPrefs {
             grid: true,
             tile_step: 2,
-            compact: true,
             show_hidden: true,
             trash_asked: true,
             skip_trash_confirm: true,
         };
         assert_eq!(ViewPrefs::parse(&p.render()), p);
         assert_eq!(ViewPrefs::parse("garbage\nview = ?"), ViewPrefs::fresh());
+    }
+
+    #[test]
+    fn an_old_density_line_is_ignored_and_never_written() {
+        let old = "view = grid\ntile = small\ndensity = compact\nhidden = shown\n";
+        let p = ViewPrefs::parse(old);
+        assert_eq!(
+            p,
+            ViewPrefs {
+                grid: true,
+                tile_step: 0,
+                show_hidden: true,
+                ..ViewPrefs::fresh()
+            },
+            "the rest of the file still loads"
+        );
+        assert!(!p.render().contains("density"), "{}", p.render());
     }
 
     #[test]
