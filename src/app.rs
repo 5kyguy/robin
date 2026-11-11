@@ -2677,16 +2677,17 @@ fn flush_drops(ui: &AppWindow, st: &Shared) {
         return;
     }
     let by_dest = group_drops(dropped, &st.borrow().ctl.dir);
-    let (mut here, mut jobs) = (0, 0);
+    let (mut here, mut itself, mut jobs) = (0, 0, 0);
     for (dest, paths) in by_dest {
         let plan = ops::external_drop(&paths, &dest);
         here += plan.already_here;
+        itself += plan.into_itself;
         jobs += plan.jobs.len();
         for job in plan.jobs {
             apply(ui, st, Action::Run(job)); // queued behind a running job
         }
     }
-    if let Some((text, details)) = drop_notice(jobs, here) {
+    if let Some((text, details)) = drop_notice(jobs, here, itself) {
         show_toast(ui, st, "", text, details, false, "");
     }
 }
@@ -2709,15 +2710,32 @@ pub fn group_drops(dropped: Vec<DroppedPath>, open: &Path) -> Vec<(PathBuf, Vec<
     by_dest
 }
 
-/// The neutral notice after a drop that copied nothing because
-/// everything was already in the folder.
-pub fn drop_notice(jobs: usize, here: usize) -> Option<(String, Vec<String>)> {
-    (jobs == 0 && here > 0).then(|| {
-        (
+/// The notice after a drop that copied nothing, or that skipped a
+/// folder dropped into itself.
+pub fn drop_notice(jobs: usize, here: usize, itself: usize) -> Option<(String, Vec<String>)> {
+    const SELF: &str = "Can't copy a folder into itself";
+    if itself == 0 {
+        return (jobs == 0 && here > 0).then(|| {
+            (
+                "Nothing to copy".into(),
+                vec![format!("{} already in this folder", ops::count(here))],
+            )
+        });
+    }
+    if jobs == 0 && here == 0 {
+        return Some((SELF.into(), Vec::new()));
+    }
+    if jobs == 0 {
+        return Some((
             "Nothing to copy".into(),
-            vec![format!("{} already in this folder", ops::count(here))],
-        )
-    })
+            vec![
+                format!("{} already in this folder", ops::count(here)),
+                SELF.into(),
+            ],
+        ));
+    }
+    // Some items are copying; mention the self-drop on its own.
+    Some((SELF.into(), Vec::new()))
 }
 
 /// The toast's leading glyph: warning, error, info, or a check for a
@@ -2728,6 +2746,22 @@ pub fn toast_glyph(tone: &str) -> &'static str {
         "danger" => "󰅙",
         "info" => "󰋽",
         _ => "󰄬",
+    }
+}
+
+/// Whether a failed watch should toast that live refresh is unavailable.
+/// A path that is already gone (the folder was just deleted, or is no
+/// longer a directory) walks up to a parent on the next refresh; don't
+/// claim it can't be watched.
+pub fn watch_warns_on_failure(dir: &Path) -> bool {
+    !watch_path_is_gone(dir)
+}
+
+/// The open folder is gone or is no longer a directory.
+fn watch_path_is_gone(dir: &Path) -> bool {
+    match std::fs::symlink_metadata(dir) {
+        Err(e) => e.raw_os_error() == Some(libc::ENOENT),
+        Ok(m) => !m.is_dir(),
     }
 }
 
@@ -2880,6 +2914,13 @@ fn arm_watch(st: &Shared, now: std::time::Instant) -> Option<PathBuf> {
             None
         }
         Err(_) => {
+            if watch_path_is_gone(&dir) {
+                // Just deleted or replaced: the refresh walks up (or
+                // rereads whatever is here now). Don't claim live refresh
+                // is unavailable.
+                s.debounce.push(now);
+                return None;
+            }
             let f = match &mut s.fallback {
                 Some(f) => {
                     f.failed_again(now);
@@ -5633,9 +5674,53 @@ mod tests {
 
     #[test]
     fn a_drop_onto_its_own_folder_says_nothing_was_copied() {
-        assert_eq!(drop_notice(2, 0), None);
-        assert_eq!(drop_notice(2, 1), None, "partial skips stay quiet");
-        assert_eq!(drop_notice(0, 3).unwrap().0, "Nothing to copy");
+        assert_eq!(drop_notice(2, 0, 0), None);
+        assert_eq!(
+            drop_notice(2, 1, 0),
+            None,
+            "partial already-here stays quiet"
+        );
+        assert_eq!(drop_notice(0, 3, 0).unwrap().0, "Nothing to copy");
+        let self_only = drop_notice(0, 0, 1).unwrap();
+        assert_eq!(self_only.0, "Can't copy a folder into itself");
+        assert!(self_only.1.is_empty());
+        let both = drop_notice(0, 2, 1).unwrap();
+        assert_eq!(both.0, "Nothing to copy");
+        assert_eq!(
+            both.1,
+            [
+                "2 items already in this folder",
+                "Can't copy a folder into itself"
+            ]
+        );
+        assert_eq!(
+            drop_notice(1, 0, 1).unwrap().0,
+            "Can't copy a folder into itself",
+            "a self-drop is mentioned even when other items copy"
+        );
+        assert_eq!(drop_notice(1, 2, 0), None);
+    }
+
+    #[test]
+    fn a_just_deleted_folder_does_not_warn_that_live_refresh_is_unavailable() {
+        let dir = std::env::temp_dir().join(format!("robin-watch-gone-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert!(
+            watch_warns_on_failure(&dir),
+            "a folder that is still here still warns"
+        );
+        fs::remove_dir(&dir).unwrap();
+        assert!(
+            !watch_warns_on_failure(&dir),
+            "just deleted: walk up quietly"
+        );
+        fs::write(&dir, b"x").unwrap();
+        assert!(
+            !watch_warns_on_failure(&dir),
+            "replaced by a file: also gone as a folder"
+        );
+        fs::remove_file(&dir).unwrap();
     }
 
     #[test]

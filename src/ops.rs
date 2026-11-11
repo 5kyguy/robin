@@ -153,9 +153,11 @@ pub fn drop_check(op: Op, src: &Path, names: &[OsString], dest: &Path) -> DropCh
 #[derive(Debug, Default)]
 pub struct ExternalDrop {
     pub jobs: Vec<Job>,
-    /// Items skipped because they are already in the destination, or
-    /// are the destination's own ancestors.
+    /// Items skipped because they already live in the destination.
     pub already_here: usize,
+    /// Folders skipped because the destination is the folder itself
+    /// or something inside it.
+    pub into_itself: usize,
 }
 
 /// Files dropped on the window by another app, as copy jobs into `dest`,
@@ -189,11 +191,15 @@ pub fn external_drop(paths: &[PathBuf], dest: &Path) -> ExternalDrop {
     }
     for (src, names) in groups {
         let real_src = std::fs::canonicalize(&src).unwrap_or_else(|_| src.clone());
-        if real_src == real_dest || !drop_allowed(Op::Copy, &src, &names, dest) {
+        if real_src == real_dest {
             out.already_here += names.len();
             continue;
         }
-        out.jobs.push(Job::transfer(Op::Copy, &src, names, dest));
+        match drop_check(Op::Copy, &src, &names, dest) {
+            DropCheck::Ok => out.jobs.push(Job::transfer(Op::Copy, &src, names, dest)),
+            DropCheck::IntoItself => out.into_itself += names.len(),
+            DropCheck::Nothing => out.already_here += names.len(),
+        }
     }
     out
 }
@@ -1811,16 +1817,16 @@ mod tests {
                 .all(|j| j.dest == dest && j.kind == JobKind::Copy),
             "outside drops copy even on the same filesystem"
         );
-        assert!(
-            external_drop(std::slice::from_ref(&root), &dest.join("sub"))
-                .jobs
-                .is_empty()
-        );
+        let into = external_drop(std::slice::from_ref(&root), &dest.join("sub"));
+        assert!(into.jobs.is_empty());
+        assert_eq!(into.into_itself, 1, "dropping a folder into itself");
+        assert_eq!(into.already_here, 0, "not counted as already here");
         // The same folder through a symlinked path is still "already here".
         std::os::unix::fs::symlink(&dest, root.join("dest-link")).unwrap();
         let via_link = external_drop(&[dest.join("here.txt")], &root.join("dest-link"));
         assert!(via_link.jobs.is_empty());
         assert_eq!(via_link.already_here, 1);
+        assert_eq!(via_link.into_itself, 0);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
