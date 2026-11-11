@@ -27,6 +27,7 @@ pub fn scripted(view: &str) -> bool {
         view,
         "browser-list"
             | "nav-pending"
+            | "nav-history"
             | "start-denied"
             | "sidebar-device"
             | "sidebar-trash"
@@ -40,7 +41,6 @@ pub fn scripted(view: &str) -> bool {
             | "grid-view-l"
             | "grid-hidden"
             | "list-density"
-            | "nav-history"
             | "search-results"
             | "search-letters"
             | "search-nosearch"
@@ -228,33 +228,6 @@ fn paint_in(
     match view {
         // Pick a restorable item, as a click would.
         "trash-view" => select_row(&ui, "q3-budget.ods"),
-        // The grid button, then a tile click.
-        "grid-view" => {
-            ui.invoke_set_grid(true);
-            select_row(&ui, "dune-sunset-0413.jpg");
-            // The grid must not keep the list's model alive (100k-entry
-            // folders): fail the render, and the real_render test, if it does.
-            use slint::Model;
-            let (files, lines) = (ui.get_files().row_count(), ui.get_grid_rows().row_count());
-            if files != 0 || lines == 0 {
-                return Err(crate::Error::Message(format!(
-                    "grid mode: {files} list rows, {lines} grid lines"
-                )));
-            }
-        }
-        // Small and large tiles, stepped from medium with Ctrl+- and
-        // Ctrl+= as a person would.
-        "grid-view-s" | "grid-view-l" => {
-            ui.invoke_set_grid(true);
-            let step = if view == "grid-view-s" { "-" } else { "=" };
-            ui.invoke_key(step.into(), true, false, false);
-            select_row(&ui, "dune-sunset-0413.jpg");
-        }
-        // Grid with hidden files shown, from the status bar toggle.
-        "grid-hidden" => {
-            ui.invoke_set_grid(true);
-            ui.invoke_toggle_hidden();
-        }
         // The toolbar's up, back and forward buttons, clicked as a person
         // would: up to home, back to Pictures, forward to home, back
         // again. Ends in Pictures with back dimmed and forward lit.
@@ -285,6 +258,33 @@ fn paint_in(
                     )));
                 }
             }
+        }
+        // The grid button, then a tile click.
+        "grid-view" => {
+            ui.invoke_set_grid(true);
+            select_row(&ui, "dune-sunset-0413.jpg");
+            // The grid must not keep the list's model alive (100k-entry
+            // folders): fail the render, and the real_render test, if it does.
+            use slint::Model;
+            let (files, lines) = (ui.get_files().row_count(), ui.get_grid_rows().row_count());
+            if files != 0 || lines == 0 {
+                return Err(crate::Error::Message(format!(
+                    "grid mode: {files} list rows, {lines} grid lines"
+                )));
+            }
+        }
+        // Small and large tiles, stepped from medium with Ctrl+- and
+        // Ctrl+= as a person would.
+        "grid-view-s" | "grid-view-l" => {
+            ui.invoke_set_grid(true);
+            let step = if view == "grid-view-s" { "-" } else { "=" };
+            ui.invoke_key(step.into(), true, false, false);
+            select_row(&ui, "dune-sunset-0413.jpg");
+        }
+        // Grid with hidden files shown, from the status bar toggle.
+        "grid-hidden" => {
+            ui.invoke_set_grid(true);
+            ui.invoke_toggle_hidden();
         }
         // The density label flips Comfortable to Compact.
         "list-density" => ui.invoke_toggle_density(),

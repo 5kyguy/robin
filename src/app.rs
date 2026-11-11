@@ -2809,14 +2809,6 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     });
     let w = ui.as_weak();
     let st = state.clone();
-    ui.on_toggle_hidden(move || {
-        st.borrow_mut().ctl.toggle_hidden();
-        if let Some(ui) = w.upgrade() {
-            apply(&ui, &st, Action::Redraw);
-        }
-    });
-    let w = ui.as_weak();
-    let st = state.clone();
     ui.on_nav_back(move || {
         if let Some(ui) = w.upgrade() {
             apply(&ui, &st, Action::Travel(Step::Back));
@@ -2835,6 +2827,14 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         let action = st.borrow().ctl.go_up();
         if let Some(ui) = w.upgrade() {
             apply(&ui, &st, action);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_toggle_hidden(move || {
+        st.borrow_mut().ctl.toggle_hidden();
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, Action::Redraw);
         }
     });
     let w = ui.as_weak();

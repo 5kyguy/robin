@@ -727,14 +727,6 @@ export component AppWindow inherits Window {
     callback set-grid(bool);
     callback toggle-hidden();
     callback toggle-density();
-    // The toolbar's back, forward and up buttons. Back and forward dim
-    // to 0.42 when the folder history has nowhere to go; renders keep
-    // them lit.
-    in property <bool> can-back: true;
-    in property <bool> can-forward: true;
-    callback nav-back();
-    callback nav-forward();
-    callback nav-up();
     // The content area's width; the grid's column count follows it.
     out property <length> content-w: root.width - side-w - 1px;
     callback content-resized();
@@ -848,6 +840,14 @@ export component AppWindow inherits Window {
     in property <string> search-scope: "";
     callback search-open();
     callback search-clear();
+    // The toolbar's back, forward and up buttons. Back and forward dim
+    // to 0.42 when the folder history has nowhere to go; renders keep
+    // them lit.
+    in property <bool> can-back: true;
+    in property <bool> can-forward: true;
+    callback nav-back();
+    callback nav-forward();
+    callback nav-up();
     in property <string> dialog-title: "";
     in property <string> dialog-body: "";
     in property <[Place]> places;
