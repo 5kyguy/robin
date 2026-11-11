@@ -13,7 +13,8 @@ fn scripted_views_render_through_the_real_app() {
     }
     let dir = std::env::temp_dir().join(format!("robin-real-render-{}", std::process::id()));
     // (scene, window width). 680 and 700 fold the sidebar to the rail,
-    // where full drives show their amber/red dots; 901 keeps it whole.
+    // where full drives show their amber/red dots; 901 keeps it whole;
+    // 480 is the smallest window the app is laid out for.
     let scenes = [
         ("browser-list", 800),
         ("nav-pending", 800),
@@ -48,6 +49,12 @@ fn scripted_views_render_through_the_real_app() {
         ("stats-real", 1100),
         ("stats-scanning", 1100),
         ("stats-scanning-first", 1100),
+        // The 480px floor: the info panel floats, the filmstrip is cut
+        // to the window, and the statistics cards stack.
+        ("view-info", 480),
+        ("view-image", 480),
+        ("stats-real", 480),
+        ("trash-empty-confirm", 480),
     ];
     for (view, width) in scenes {
         let out = dir.join(format!("{view}-{width}.png"));
