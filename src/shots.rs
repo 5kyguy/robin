@@ -1,8 +1,8 @@
 //! Deterministic frames for `robin --render`.
 //!
 //! The clock is fixed in the strings (2026-10-30 18:58). Animations are not
-//! running; each frame is the end state, except the danger button which stays
-//! locked (opacity 0.42) with Cancel focused.
+//! running; each frame is the end state, so a danger button is already past
+//! its 600ms lock (enabled), with Cancel still focused.
 
 use std::path::Path;
 use std::rc::Rc;
@@ -52,6 +52,7 @@ pub fn known(view: &str) -> bool {
             | "move-refused-unreadable"
             | "move-refused-unreadable-two"
             | "menu-file"
+            | "menu-bg"
             | "shortcuts-browser"
             | "reduce-motion"
             | "theme-black-list"
@@ -122,6 +123,13 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         _ => 152.0,
     };
     ui.set_tile(tile);
+    // The columns the mock grid lines hold, so the line is centred on
+    // them and the last tile isn't pushed past the right edge.
+    ui.set_grid_columns(match view {
+        "browser-grid-s" => 6,
+        "browser-grid-l" => 4,
+        _ => 5,
+    });
     let all_places = places(view);
     ui.set_places(ModelRc::new(Rc::new(VecModel::from(all_places.clone()))));
     ui.set_pinned_places(ModelRc::new(Rc::new(VecModel::from(
@@ -149,7 +157,6 @@ fn apply_scene(ui: &AppWindow, view: &str) {
     ui.set_hidden_on(show_hidden);
     ui.set_files(ModelRc::new(Rc::new(VecModel::from(files(show_hidden)))));
     ui.set_grid_rows(ModelRc::new(Rc::new(VecModel::from(grid_lines(view)))));
-    ui.set_menu_labels(ModelRc::new(Rc::new(VecModel::from(menu()))));
     ui.set_status_left(if show_hidden {
         "16 items · 1 hidden · 1 selected (6.2 MB)".into()
     } else {
@@ -178,7 +185,6 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "permission-denied" => "denied",
             "device-unmounted" => "unmounted",
             "device-ejected" => "ejected",
-            "loading-large-dir" => "loading",
             "search-no-results" => "nosearch",
             _ => "files",
         }
@@ -192,8 +198,35 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         ui.set_state_title("No permission to open ~/secret".into());
         ui.set_state_note("Owned by root (drwx------)".into());
     }
+    if view == "search-no-results" {
+        ui.set_search_hidden_offer(true);
+    }
     if view == "loading-large-dir" {
-        ui.set_state_note("18 240 items".into());
+        // The first batch is on screen while the rest streams in: the bar
+        // under the toolbar runs and the status bar counts what's read.
+        ui.set_reading(true);
+        ui.set_nav_phase(0.45);
+        ui.set_status_left("Reading… 18 240 items".into());
+    }
+    if view == "path-complete" {
+        ui.set_completions(ModelRc::new(Rc::new(VecModel::from(
+            ["Pictures", "Projects", "Public"]
+                .map(slint::SharedString::from)
+                .to_vec(),
+        ))));
+    }
+    match view {
+        "menu-file" => set_menu(ui, crate::menus::file_menu()),
+        "menu-bg" => set_menu(ui, crate::menus::background_menu()),
+        "shortcuts-browser" | "shortcuts-viewer" => {
+            ui.set_key_sections(ModelRc::new(Rc::new(VecModel::from(
+                crate::menus::key_sections(view == "shortcuts-viewer", ""),
+            ))));
+        }
+        _ => {}
+    }
+    if matches!(view, "conflict" | "conflict-all") {
+        ui.set_conflict_note(crate::app::cancel_note(false).into());
     }
     let kept = |path: &str, reason| crate::fsops::KeptEntry {
         path: path.into(),
@@ -276,6 +309,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             | "move-refused-unreadable-two"
             | "move-refused-many" => "move-refused",
             "menu-file" => "menu-file",
+            "menu-bg" => "menu-bg",
             "shortcuts-browser" | "shortcuts-viewer" => "shortcuts",
             _ => "",
         }
@@ -283,7 +317,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
     );
     ui.set_viewer(
         match view {
-            "viewer-image" | "theme-black-viewer" => "image",
+            "viewer-image" | "theme-black-viewer" | "shortcuts-viewer" => "image",
             "viewer-hidden" => "hidden",
             "viewer-zoom-400" => "zoom",
             "viewer-video" => "video",
@@ -974,17 +1008,8 @@ pub(crate) fn set_cell(
     }
 }
 
-fn menu() -> Vec<slint::SharedString> {
-    [
-        "Open",
-        "Rename",
-        "Copy path",
-        "Move to trash",
-        "Delete permanently",
-    ]
-    .into_iter()
-    .map(slint::SharedString::from)
-    .collect()
+fn set_menu(ui: &AppWindow, items: Vec<crate::MenuItem>) {
+    ui.set_menu_items(ModelRc::new(Rc::new(VecModel::from(items))));
 }
 
 /// The views of the wired file operations: cut rows, a drag over a folder,
@@ -1129,7 +1154,20 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
             ui.set_dialog_focus(0);
             ui.set_danger_armed(true);
         }
-        "confirm-delete-permanent" => ui.set_dialog_focus(0),
+        // End state: past the 600ms lock, Cancel still focused.
+        "confirm-delete-permanent" | "stats-empty-trash" => {
+            ui.set_dialog_focus(0);
+            ui.set_danger_armed(true);
+        }
+        "device-ejected" => {
+            // The ejected state comes with a warning toast (DESIGN §3).
+            ui.set_toast_on(true);
+            ui.set_toast_tone("warning".into());
+            ui.set_toast_glyph(crate::app::toast_glyph("warning").into());
+            ui.set_toast_text("SANDISK was removed while it was open".into());
+            ui.set_toast_action("".into());
+            crate::app::set_toast_rows(ui, &crate::app::detail_rows(&[], false, false));
+        }
         "undo" => {
             ui.set_toast_on(true);
             ui.set_toast_tone("".into());

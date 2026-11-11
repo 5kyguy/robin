@@ -469,17 +469,42 @@ pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-/// The Modified column, like Thunar: the time for today, the date for
-/// anything older or in the future (even later today). Missing or
-/// pre-1970 times (`mtime <= 0`) are blank. `offset` gives the local UTC
-/// offset in seconds at a Unix time.
+/// The Modified column, as the spec gives it: `2026-10-30 18:58`, or
+/// relative (`just now`, `12m ago`, `3h ago`) within the last 24 hours.
+/// A time in the future (even later today) gets the full date and time.
+/// Missing or pre-1970 times (`mtime <= 0`) are blank. `offset` gives the
+/// local UTC offset in seconds at a Unix time.
 pub fn format_modified(mtime: i64, now: i64, offset: impl Fn(i64) -> i64) -> String {
     if mtime <= 0 {
         return String::new();
     }
+    let ago = now - mtime;
+    if (0..86_400).contains(&ago) {
+        return match ago {
+            0..=59 => "just now".into(),
+            60..=3_599 => format!("{}m ago", ago / 60),
+            _ => format!("{}h ago", ago / 3_600),
+        };
+    }
     let local = mtime + offset(mtime);
+    let (y, m, d) = civil_from_days(local.div_euclid(86_400));
+    let secs = local.rem_euclid(86_400);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        secs / 3600,
+        secs % 3600 / 60
+    )
+}
+
+/// The time for today, the date for anything older or in the future:
+/// the statistics view's "Scanned 16:10" stamp. `mtime <= 0` is blank.
+pub fn format_clock_or_date(t: i64, now: i64, offset: impl Fn(i64) -> i64) -> String {
+    if t <= 0 {
+        return String::new();
+    }
+    let local = t + offset(t);
     let day = local.div_euclid(86_400);
-    if mtime <= now && day == (now + offset(now)).div_euclid(86_400) {
+    if t <= now && day == (now + offset(now)).div_euclid(86_400) {
         let secs = local.rem_euclid(86_400);
         return format!("{:02}:{:02}", secs / 3600, secs % 3600 / 60);
     }
@@ -859,22 +884,28 @@ mod tests {
     }
 
     #[test]
-    fn modified_shows_the_time_today_and_the_date_before() {
+    fn modified_is_relative_within_a_day_and_a_date_and_time_before() {
         // 2026-10-31 02:30 UTC; a +05:30 zone makes it 08:00 local.
         let now = 1_793_413_800;
         let ist = |_| 19_800;
-        assert_eq!(format_modified(now, now, ist), "08:00");
-        // 00:10 local today is still today.
-        assert_eq!(format_modified(now - 7 * 3600 - 50 * 60, now, ist), "00:10");
-        // 23:50 local yesterday shows its date.
+        assert_eq!(format_modified(now, now, ist), "just now");
+        assert_eq!(format_modified(now - 59, now, ist), "just now");
+        assert_eq!(format_modified(now - 60, now, ist), "1m ago");
+        assert_eq!(format_modified(now - 40 * 60, now, ist), "40m ago");
+        assert_eq!(format_modified(now - 3 * 3600 - 59, now, ist), "3h ago");
+        // Yesterday evening is still within 24 hours.
         assert_eq!(
             format_modified(now - 8 * 3600 - 10 * 60, now, ist),
-            "2026-10-30"
+            "8h ago"
         );
-        // The same instant in UTC is still the 31st.
-        assert_eq!(format_modified(now - 2 * 3600, now, |_| 0), "00:30");
-        assert_eq!(format_modified(1, now, |_| 0), "1970-01-01");
-        assert_eq!(format_modified(951_782_400, now, |_| 0), "2000-02-29");
+        // A day and more: the spec's date and time, in local time.
+        assert_eq!(format_modified(now - 86_400, now, ist), "2026-10-30 08:00");
+        assert_eq!(
+            format_modified(now - 86_400, now, |_| 0),
+            "2026-10-30 02:30"
+        );
+        assert_eq!(format_modified(1, now, |_| 0), "1970-01-01 00:00");
+        assert_eq!(format_modified(951_782_400, now, |_| 0), "2000-02-29 00:00");
     }
 
     #[test]
@@ -997,13 +1028,24 @@ mod tests {
     }
 
     #[test]
-    fn modified_is_blank_before_1970_and_a_date_when_later_today() {
+    fn the_scan_stamp_is_the_time_today_and_the_date_before() {
+        let now = 1_793_413_800; // 08:00 at +05:30
+        let ist = |_| 19_800;
+        assert_eq!(format_clock_or_date(now - 60, now, ist), "07:59");
+        assert_eq!(
+            format_clock_or_date(now - 8 * 3600 - 10 * 60, now, ist),
+            "2026-10-30"
+        );
+        assert_eq!(format_clock_or_date(0, now, ist), "");
+    }
+
+    #[test]
+    fn modified_is_blank_before_1970_and_a_date_when_in_the_future() {
         let now = 1_793_413_800; // 08:00 at +05:30
         let ist = |_| 19_800;
         assert_eq!(format_modified(0, now, ist), "");
         assert_eq!(format_modified(-86_400, now, ist), "");
-        assert_eq!(format_modified(now + 3_600, now, ist), "2026-10-31");
-        assert_eq!(format_modified(now - 60, now, ist), "07:59");
+        assert_eq!(format_modified(now + 3_600, now, ist), "2026-10-31 09:00");
     }
 
     #[test]

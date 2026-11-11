@@ -1,6 +1,6 @@
 //! The view settings robin remembers between launches. They are global,
 //! not per folder: the last view mode, tile size, density and whether
-//! hidden files show.
+//! hidden files show, plus the trash confirm's "Don't ask again".
 
 use std::path::{Path, PathBuf};
 
@@ -14,6 +14,11 @@ pub struct ViewPrefs {
     pub tile_step: usize,
     pub compact: bool,
     pub show_hidden: bool,
+    /// The Move-to-trash confirm has been answered once, so its "Don't
+    /// ask again" box starts ticked (DESIGN §4 Delete).
+    pub trash_asked: bool,
+    /// "Don't ask again" was ticked: Del trashes without the confirm.
+    pub skip_trash_confirm: bool,
 }
 
 impl ViewPrefs {
@@ -50,6 +55,10 @@ impl ViewPrefs {
                 }
                 "density" => p.compact = value == "compact",
                 "hidden" => p.show_hidden = value == "shown",
+                "trash-confirm" => {
+                    p.trash_asked = value != "new";
+                    p.skip_trash_confirm = value == "skip";
+                }
                 _ => {}
             }
         }
@@ -58,7 +67,7 @@ impl ViewPrefs {
 
     pub fn render(&self) -> String {
         format!(
-            "view = {}\ntile = {}\ndensity = {}\nhidden = {}\n",
+            "view = {}\ntile = {}\ndensity = {}\nhidden = {}\ntrash-confirm = {}\n",
             if self.grid { "grid" } else { "list" },
             ["small", "medium", "large"][self.tile_step.min(2)],
             if self.compact {
@@ -67,6 +76,11 @@ impl ViewPrefs {
                 "comfortable"
             },
             if self.show_hidden { "shown" } else { "hidden" },
+            match (self.trash_asked, self.skip_trash_confirm) {
+                (_, true) => "skip",
+                (true, false) => "ask",
+                (false, false) => "new",
+            },
         )
     }
 
@@ -115,6 +129,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_trash_confirm_choice_round_trips() {
+        let fresh = ViewPrefs::fresh();
+        assert!(!fresh.trash_asked && !fresh.skip_trash_confirm);
+        assert_eq!(ViewPrefs::parse(&fresh.render()), fresh);
+        let asked = ViewPrefs {
+            trash_asked: true,
+            ..fresh
+        };
+        assert!(asked.render().contains("trash-confirm = ask"));
+        assert_eq!(ViewPrefs::parse(&asked.render()), asked);
+        let skip = ViewPrefs {
+            trash_asked: true,
+            skip_trash_confirm: true,
+            ..fresh
+        };
+        assert_eq!(ViewPrefs::parse(&skip.render()), skip);
+        // An older file without the line still asks.
+        let old = ViewPrefs::parse("view = grid\n");
+        assert!(!old.skip_trash_confirm && !old.trash_asked);
+    }
+
+    #[test]
     fn load_ignores_symlinks_fifos_and_folders() {
         let dir = std::env::temp_dir().join(format!("robin-prefs-odd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -143,6 +179,8 @@ mod tests {
             tile_step: 2,
             compact: true,
             show_hidden: true,
+            trash_asked: true,
+            skip_trash_confirm: true,
         };
         assert_eq!(ViewPrefs::parse(&p.render()), p);
         assert_eq!(ViewPrefs::parse("garbage\nview = ?"), ViewPrefs::fresh());

@@ -79,6 +79,8 @@ impl Dialog {
                 can_copy: false, ..
             } => 1,
             Dialog::Conflict { .. } => 5,
+            // Cancel, Move to Trash, and the "Don't ask again" box.
+            Dialog::Trash(_) => 3,
             _ => 2,
         }
     }
@@ -266,6 +268,13 @@ pub struct Controller {
     /// The open image's pixel size and the viewer's canvas size, from the
     /// last redraw; zoom steps are taken against them.
     pub view_geom: std::cell::Cell<((f32, f32), (f32, f32))>,
+    /// The Move-to-trash confirm was answered before, so its "Don't ask
+    /// again" box starts ticked.
+    pub trash_asked: bool,
+    /// "Don't ask again" was ticked: Del trashes without asking.
+    pub skip_trash_confirm: bool,
+    /// The open trash confirm's "Don't ask again" box.
+    pub dont_ask: bool,
 }
 
 /// Grid tile widths (S/M/L) per density, from the spec's density table.
@@ -275,6 +284,11 @@ pub const MAX_COLUMNS: usize = 6;
 
 /// How many tiles fit a content area `width` wide: 16 padding each
 /// side and an 8 gap between tiles.
+/// `18240` as `18 240`, as the sidebar and status bar print numbers.
+fn group(n: usize) -> String {
+    crate::stats::group_digits(n as u64)
+}
+
 pub fn fit_columns(width: f32, tile: f32) -> usize {
     let n = ((width - 32.0 + 8.0) / (tile + 8.0)).floor();
     (n.max(1.0) as usize).min(MAX_COLUMNS)
@@ -621,6 +635,19 @@ impl Controller {
 
     /// The item, selection and clipboard summary. Blank when the folder
     /// can't be read: "0 items" would claim it is empty.
+    /// The status bar's left side: `Reading…` until the first read lands,
+    /// `Reading… 18 240 items` while rows are still being built, then the
+    /// usual count and selection.
+    pub fn status_line(&self, filling: bool) -> String {
+        if !self.loaded {
+            return "Reading…".into();
+        }
+        if filling && self.unreadable.is_none() {
+            return format!("Reading… {}", ops::count(self.listing.view().len()));
+        }
+        self.status_left()
+    }
+
     pub fn status_left(&self) -> String {
         if self.unreadable.is_some() {
             return String::new();
@@ -629,16 +656,20 @@ impl Controller {
         let sel = self.listing.selection().len();
         let searching = !self.listing.query().is_empty();
         let mut left = if searching {
-            format!("{n} of {}", ops::count(self.listing.searchable_count()))
+            format!(
+                "{} of {}",
+                group(n),
+                ops::count(self.listing.searchable_count())
+            )
         } else {
             ops::count(n)
         };
         let hidden = self.listing.hidden_count();
         if !searching && !self.listing.show_hidden() && hidden > 0 {
-            left = format!("{left} · {hidden} hidden");
+            left = format!("{left} · {} hidden", group(hidden));
         }
         if sel > 0 {
-            left = format!("{left} · {sel} selected");
+            left = format!("{left} · {} selected", group(sel));
         }
         if let Some(clip) = self.clip.clip() {
             let verb = if clip.mode == ops::ClipMode::Cut {
@@ -682,6 +713,9 @@ impl Controller {
             name_budget: std::cell::Cell::new(0),
             viewer: None,
             view_geom: std::cell::Cell::new(((0.0, 0.0), (0.0, 0.0))),
+            trash_asked: false,
+            skip_trash_confirm: false,
+            dont_ask: false,
         }
     }
 
@@ -986,6 +1020,8 @@ impl Controller {
 
     pub fn open_dialog(&mut self, dialog: Dialog) {
         self.focus = dialog.default_focus();
+        // On by default once the confirm has been answered before.
+        self.dont_ask = self.trash_asked;
         self.armed = !matches!(
             dialog,
             Dialog::Delete(_) | Dialog::EmptyTrash(_) | Dialog::ClearThumbs(_)
@@ -1005,8 +1041,76 @@ impl Controller {
         }
         match ops::trash_choice(&self.dir, &self.env) {
             TrashChoice::Ask => Action::Open(Dialog::TrashNo(names)),
+            // "Don't ask again" was ticked: trash straight away; the
+            // toast's Undo is the way back.
+            _ if self.skip_trash_confirm => {
+                Action::Run(Job::new(JobKind::Trash, &self.dir, names, &self.dir))
+            }
             _ => Action::Open(Dialog::Trash(names)),
         }
+    }
+
+    /// A button under an empty or error state (DESIGN §3).
+    pub fn state_action(&mut self, action: &str) -> Action {
+        match action {
+            "new-folder" => self.new_folder(),
+            "admin" => self.open_as_admin(),
+            "back" => match self.dir.parent() {
+                Some(p) => Action::Navigate(p.to_path_buf()),
+                None => Action::None,
+            },
+            "home" => match self.env.home.clone() {
+                Some(home) => Action::Navigate(home),
+                None => Action::None,
+            },
+            "search-hidden" => {
+                if !self.listing.show_hidden() {
+                    self.toggle_hidden();
+                }
+                Action::Redraw
+            }
+            "clear" => self.clear_search(),
+            _ => Action::None,
+        }
+    }
+
+    /// The empty folder's [New folder]: "New folder", or "New folder 2"
+    /// and so on when that is taken, created and selected.
+    pub fn new_folder(&mut self) -> Action {
+        if self.nav_pending() || self.in_trash() {
+            return Action::None;
+        }
+        let name = (1..1000)
+            .map(|n| {
+                if n == 1 {
+                    "New folder".to_string()
+                } else {
+                    format!("New folder {n}")
+                }
+            })
+            .find(|n| self.dir.join(n).symlink_metadata().is_err());
+        let Some(name) = name else {
+            return Action::None;
+        };
+        let made = DirFd::open(&self.dir).and_then(|fd| {
+            rustix::fs::mkdirat(fd.as_fd(), name.as_str(), rustix::fs::Mode::from(0o777))
+                .map_err(|e| Error::io(self.dir.join(&name), std::io::Error::from(e)))
+        });
+        if made.is_err() {
+            return Action::None;
+        }
+        let _ = self.refresh();
+        self.listing.select_only(name.into());
+        Action::Redraw
+    }
+
+    /// [Open as admin…]: a second Robin on this folder through pkexec,
+    /// which asks for the password itself. Nothing runs until clicked.
+    pub fn open_as_admin(&self) -> Action {
+        let robin = std::env::current_exe()
+            .map(PathBuf::into_os_string)
+            .unwrap_or_else(|_| "robin".into());
+        Action::Launch(vec!["pkexec".into(), robin, self.dir.clone().into()])
     }
 
     /// Ctrl+H. Hidden items that disappear leave the selection, so a
@@ -1026,6 +1130,8 @@ impl Controller {
             tile_step: self.tile_step,
             compact: self.compact,
             show_hidden: self.listing.show_hidden(),
+            trash_asked: self.trash_asked,
+            skip_trash_confirm: self.skip_trash_confirm,
         }
     }
 
@@ -1034,6 +1140,8 @@ impl Controller {
         self.tile_step = p.tile_step.min(2);
         self.compact = p.compact;
         self.listing.set_show_hidden(p.show_hidden);
+        self.trash_asked = p.trash_asked;
+        self.skip_trash_confirm = p.skip_trash_confirm;
     }
 
     pub fn set_grid(&mut self, grid: bool) -> Action {
@@ -1358,12 +1466,19 @@ impl Controller {
             self.dialog = None;
             return Action::Redraw;
         }
+        if index == 2 && matches!(dialog, Dialog::Trash(_)) {
+            self.focus = 2;
+            self.dont_ask = !self.dont_ask;
+            return Action::Redraw;
+        }
         if !self.armed {
             return Action::None;
         }
         self.dialog = None;
         match dialog {
             Dialog::Trash(names) => {
+                self.trash_asked = true;
+                self.skip_trash_confirm = self.dont_ask;
                 Action::Run(Job::new(JobKind::Trash, &self.dir, names, &self.dir))
             }
             Dialog::TrashNo(names) | Dialog::Delete(names) => {
@@ -2176,7 +2291,7 @@ fn scanned_line(ctl: &Controller, at: i64, stale: bool) -> String {
         ctl.clock
             .map_or_else(|| crate::model::local_offset(t), |c| c.1)
     };
-    let when = crate::model::format_modified(at, ctl_now(ctl), offset);
+    let when = crate::model::format_clock_or_date(at, ctl_now(ctl), offset);
     let tail = if stale { "Rescanning…" } else { "Rescan" };
     format!("Scanned {when}  ·  {tail}")
 }
@@ -2274,6 +2389,63 @@ fn crumbs_for(
         }
     }
     crate::model::breadcrumbs_on(dir, home, &devices)
+}
+
+/// The permission-denied body: who owns the folder and its mode, as
+/// `Owned by root (drwx------)`. Blank when the folder can't be stat'ed.
+pub fn denied_note(dir: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(dir) {
+        Ok(m) => format!("Owned by {} ({})", user_name(m.uid()), mode_text(m.mode())),
+        Err(_) => String::new(),
+    }
+}
+
+/// A uid's login name, or the number when it has none.
+fn user_name(uid: u32) -> String {
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: getpwuid_r writes only into pwd and buf, both ours and
+    // sized as passed; out is null or points at pwd.
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if rc != 0 || out.is_null() || pwd.pw_name.is_null() {
+        return uid.to_string();
+    }
+    // SAFETY: on success pw_name is a NUL-terminated string inside buf.
+    unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// `ls -l` style mode: `drwx------`, with setuid, setgid and sticky.
+pub fn mode_text(mode: u32) -> String {
+    let kind = match mode & 0o170_000 {
+        0o040_000 => 'd',
+        0o120_000 => 'l',
+        _ => '-',
+    };
+    let bit = |m: u32, c: char| if mode & m != 0 { c } else { '-' };
+    let special = |x: u32, s: u32, on: char, off: char| match (mode & x != 0, mode & s != 0) {
+        (true, true) => on,
+        (false, true) => off,
+        (true, false) => 'x',
+        (false, false) => '-',
+    };
+    [
+        kind,
+        bit(0o400, 'r'),
+        bit(0o200, 'w'),
+        special(0o100, 0o4000, 's', 'S'),
+        bit(0o040, 'r'),
+        bit(0o020, 'w'),
+        special(0o010, 0o2000, 's', 'S'),
+        bit(0o004, 'r'),
+        bit(0o002, 'w'),
+        special(0o001, 0o1000, 't', 'T'),
+    ]
+    .iter()
+    .collect()
 }
 
 /// A folder's name for a message, rebuilt from its crumbs: the root as
@@ -2506,6 +2678,14 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     let st = state.clone();
     ui.on_search_open(move || {
         let action = st.borrow_mut().ctl.open_search();
+        if let Some(ui) = w.upgrade() {
+            apply(&ui, &st, action);
+        }
+    });
+    let w = ui.as_weak();
+    let st = state.clone();
+    ui.on_state_action(move |which| {
+        let action = st.borrow_mut().ctl.state_action(&which);
         if let Some(ui) = w.upgrade() {
             apply(&ui, &st, action);
         }
@@ -4000,7 +4180,8 @@ fn schedule_row_fill(s: &State) {
 
 /// Build the next chunk of rows into `s.rows_fill` and push them to the
 /// window's models without clearing a list that is already on screen.
-fn fill_rows(ui: &AppWindow, s: &State, budget: usize) {
+/// True while rows are still being built (more chunks queued).
+fn fill_rows(ui: &AppWindow, s: &State, budget: usize) -> bool {
     let ctl = &s.ctl;
     let key = rows_key(ctl, budget);
     let view = ctl.listing.view();
@@ -4008,7 +4189,7 @@ fn fill_rows(ui: &AppWindow, s: &State, budget: usize) {
     let mut fill = s.rows_fill.borrow_mut();
     let same = fill.key == key && fill.dir == ctl.dir;
     if same && fill.filled == fill.total && fill.total == total {
-        return;
+        return false;
     }
     let replace = fill.dir != ctl.dir || s.files_model.borrow().is_none();
     let start = if same { fill.filled } else { 0 };
@@ -4072,6 +4253,7 @@ fn fill_rows(ui: &AppWindow, s: &State, budget: usize) {
     if end < total {
         schedule_row_fill(s);
     }
+    end < total
 }
 
 fn redraw(ui: &AppWindow, s: &State) {
@@ -4097,7 +4279,7 @@ fn redraw(ui: &AppWindow, s: &State) {
     // Fill the visible model in chunks, keeping whatever is already on
     // screen so scroll and selection don't reset and the pane never
     // flashes empty while a large folder streams in.
-    fill_rows(ui, s, budget);
+    let filling = fill_rows(ui, s, budget);
     let (column, desc) = ctl.sort_header();
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
@@ -4115,9 +4297,19 @@ fn redraw(ui: &AppWindow, s: &State) {
             }
             .into(),
         );
-        ui.set_state_note("".into());
+        ui.set_state_note(
+            if denied {
+                denied_note(&ctl.dir)
+            } else {
+                String::new()
+            }
+            .into(),
+        );
     }
-    ui.set_status_left(ctl.status_left().into());
+    // Rows still streaming in: the bar under the toolbar runs and the
+    // status bar says so instead of showing a count that is still growing.
+    ui.set_reading(!ctl.loaded || filling);
+    ui.set_status_left(ctl.status_line(filling).into());
     ui.set_trash_view(ctl.in_trash());
     ui.set_trash_can_restore(matches!(ctl.restore_selected(), Action::Run(_)));
     ui.set_trash_note(ctl.trash_note().into());
@@ -4160,6 +4352,9 @@ fn redraw(ui: &AppWindow, s: &State) {
     }
     ui.set_dialog_focus(ctl.focus);
     ui.set_danger_armed(ctl.armed);
+    ui.set_trash_dont_ask(ctl.dont_ask);
+    // [Search hidden files] only when hidden files were left out.
+    ui.set_search_hidden_offer(!ctl.listing.show_hidden() && ctl.listing.hidden_count() > 0);
     match &ctl.dialog {
         Some(d) => {
             ui.set_overlay(d.overlay().into());
@@ -4425,6 +4620,9 @@ pub fn conflict_props(ui: &AppWindow, ask: &ConflictAsk, apply_all: bool) {
     };
     ui.set_conflict_hint(format!("Keep both saves it as {both}").into());
     ui.set_conflict_note(cancel_note(folders).into());
+    // Replace (or Merge) is the primary button, amber when what it
+    // overwrites is newer than what replaces it.
+    ui.set_conflict_replace_warn(p.existing_mtime > p.incoming_mtime);
     ui.set_conflict_apply_label(apply_label(p.kind, ask.left).into());
     ui.set_conflict_apply(apply_all);
 }
@@ -5253,6 +5451,8 @@ mod tests {
             tile_step: 2,
             compact: true,
             show_hidden: true,
+            trash_asked: true,
+            skip_trash_confirm: true,
         };
         c.apply_prefs(p);
         assert_eq!(c.prefs(), p);
@@ -5567,6 +5767,141 @@ mod tests {
         let want = Action::Launch(vec!["xdg-open".into(), c.dir.join("clip.mp4").into()]);
         assert_eq!(c.viewer_external(), want);
         assert_eq!(c.key(keys::RETURN, false, false), want);
+    }
+
+    #[test]
+    fn dont_ask_again_starts_ticked_after_the_first_answer_and_then_skips_the_confirm() {
+        let mut c = setup("dont-ask");
+        select(&mut c, "a.jpg");
+        let Action::Open(d) = c.key(keys::DELETE, false, false) else {
+            panic!("asks the first time")
+        };
+        c.open_dialog(d);
+        assert!(!c.dont_ask, "off before the first use");
+        assert!(matches!(c.key(keys::RETURN, false, false), Action::Run(_)));
+        assert!(c.trash_asked && !c.skip_trash_confirm);
+        // Second time: the box starts ticked; Tab reaches it and Space
+        // unticks it, so this answer keeps asking.
+        let Action::Open(d) = c.key(keys::DELETE, false, false) else {
+            panic!("still asks")
+        };
+        c.open_dialog(d);
+        assert!(c.dont_ask, "on by default after the first use");
+        c.key(keys::TAB, false, false);
+        assert_eq!(c.focus, 2, "the box is the third stop");
+        c.key(" ", false, false);
+        assert!(!c.dont_ask);
+        assert_eq!(c.button(2), Action::Redraw, "a click ticks it again");
+        assert!(c.dont_ask);
+        assert!(matches!(c.button(1), Action::Run(_)));
+        assert!(c.skip_trash_confirm);
+        assert!(c.prefs().skip_trash_confirm, "remembered");
+        // Now Del trashes straight away; Shift+Del still asks.
+        assert!(matches!(
+            c.key(keys::DELETE, false, false),
+            Action::Run(Job {
+                kind: JobKind::Trash,
+                ..
+            })
+        ));
+        assert!(matches!(
+            c.key(keys::DELETE, false, true),
+            Action::Open(Dialog::Delete(_))
+        ));
+        // Cancel never records an answer.
+        let mut fresh = setup("dont-ask-cancel");
+        select(&mut fresh, "a.jpg");
+        let Action::Open(d) = fresh.key(keys::DELETE, false, false) else {
+            panic!()
+        };
+        fresh.open_dialog(d);
+        fresh.button(2);
+        fresh.button(0);
+        assert!(!fresh.trash_asked && !fresh.skip_trash_confirm);
+    }
+
+    #[test]
+    fn state_buttons_act_on_the_folder() {
+        let mut c = setup("state-actions");
+        let dir = c.dir.clone();
+        assert_eq!(
+            c.state_action("back"),
+            Action::Navigate(dir.parent().unwrap().to_path_buf())
+        );
+        assert_eq!(
+            c.state_action("home"),
+            Action::Navigate(c.env.home.clone().unwrap())
+        );
+        // Open as admin only builds the command; nothing runs here.
+        let Action::Launch(argv) = c.state_action("admin") else {
+            panic!("admin launches")
+        };
+        assert_eq!(argv[0], "pkexec");
+        assert_eq!(argv.last().unwrap(), dir.as_os_str());
+        assert_eq!(c.state_action("mount"), Action::None);
+        // New folder: made, listed and selected; a second one is numbered.
+        assert_eq!(c.state_action("new-folder"), Action::Redraw);
+        assert!(dir.join("New folder").is_dir());
+        assert_eq!(c.state_action("new-folder"), Action::Redraw);
+        assert!(dir.join("New folder 2").is_dir());
+        let picked: Vec<OsString> = c.listing.selection().iter().cloned().collect();
+        assert_eq!(picked, [OsString::from("New folder 2")]);
+        // No-results: search hidden files keeps the query; Clear empties it.
+        fs::write(dir.join(".kotlin-notes"), b"k").unwrap();
+        c.reload().unwrap();
+        c.open_search();
+        c.listing.set_query("kotlin");
+        assert!(c.listing.view().is_empty());
+        c.state_action("search-hidden");
+        assert!(c.listing.show_hidden());
+        assert_eq!(c.listing.query(), "kotlin");
+        assert_eq!(c.listing.view().len(), 1);
+        c.state_action("clear");
+        assert_eq!(c.listing.query(), "");
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn the_status_bar_says_reading_while_rows_stream_in() {
+        let mut c = setup("reading");
+        assert_eq!(c.status_line(false), "3 items");
+        assert_eq!(c.status_line(true), "Reading… 3 items");
+        c.loaded = false;
+        assert_eq!(c.status_line(false), "Reading…");
+        c.loaded = true;
+        let many: Vec<crate::model::Entry> = (0..18_240)
+            .map(|i| crate::model::Entry {
+                name: format!("f{i}").into(),
+                is_dir: false,
+                is_symlink: false,
+                len: 1,
+                mtime: std::time::UNIX_EPOCH,
+                mode: 0o100644,
+            })
+            .collect();
+        c.listing.set_entries(many);
+        assert_eq!(c.status_line(true), "Reading… 18 240 items");
+        assert_eq!(c.status_line(false), "18 240 items");
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn a_denied_folder_names_its_owner_and_mode() {
+        assert_eq!(mode_text(0o040700), "drwx------");
+        assert_eq!(mode_text(0o041777), "drwxrwxrwt");
+        assert_eq!(mode_text(0o100644), "-rw-r--r--");
+        assert_eq!(mode_text(0o106755), "-rwsr-sr-x");
+        assert_eq!(mode_text(0o040000), "d---------");
+        let c = setup("denied-note");
+        let locked = c.dir.join("raw-exports");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        let note = denied_note(&locked);
+        assert!(note.starts_with("Owned by "), "{note}");
+        assert!(note.ends_with("(drwx------)"), "{note}");
+        assert_eq!(user_name(0), "root");
+        assert_eq!(denied_note(&c.dir.join("missing")), "");
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
     }
 
     #[test]
@@ -6133,7 +6468,7 @@ mod tests {
     }
 
     #[test]
-    fn modified_column_is_filled_like_thunar() {
+    fn modified_column_is_a_date_or_relative_within_a_day() {
         let mut c = setup("modified");
         let now = secs(std::time::SystemTime::now());
         let old = fs::File::options()
@@ -6152,10 +6487,8 @@ mod tests {
                 .modified
                 .to_string()
         };
-        assert_eq!(get("b.jpg"), "2023-11-14");
-        let today = get("a.jpg");
-        assert_eq!(today.len(), 5, "{today}");
-        assert_eq!(&today[2..3], ":");
+        assert_eq!(get("b.jpg"), "2023-11-14 22:13");
+        assert_eq!(get("a.jpg"), "just now");
     }
 
     #[test]

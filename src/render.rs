@@ -36,6 +36,8 @@ pub fn scripted(view: &str) -> bool {
             | "trash-noinfo"
             | "trash-restore-recreated"
             | "grid-view"
+            | "grid-view-s"
+            | "grid-view-l"
             | "grid-hidden"
             | "list-density"
             | "search-results"
@@ -238,6 +240,14 @@ fn paint_in(
                     "grid mode: {files} list rows, {lines} grid lines"
                 )));
             }
+        }
+        // Small and large tiles, stepped from medium with Ctrl+- and
+        // Ctrl+= as a person would.
+        "grid-view-s" | "grid-view-l" => {
+            ui.invoke_set_grid(true);
+            let step = if view == "grid-view-s" { "-" } else { "=" };
+            ui.invoke_key(step.into(), true, false, false);
+            select_row(&ui, "dune-sunset-0413.jpg");
         }
         // Grid with hidden files shown, from the status bar toggle.
         "grid-hidden" => {
