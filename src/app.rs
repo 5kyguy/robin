@@ -3605,6 +3605,7 @@ fn rows_key(ctl: &Controller, budget: usize) -> u64 {
     ctl.dir.hash(&mut h);
     ctl.grid.hash(&mut h);
     ctl.compact.hash(&mut h);
+    ctl.tile_step.hash(&mut h);
     budget.hash(&mut h);
     {
         let (key, dir) = ctl.listing.sort();
@@ -3679,11 +3680,29 @@ fn row_mark(name: &str, label: &SharedString, query: &str) -> Mark {
     }
 }
 
-fn write_chunk<T>(dest: &mut Vec<T>, start: usize, part: Vec<T>) {
+/// Merge a rebuilt prefix into an already-shown list. The tail past
+/// this chunk stays until `complete`, so a same-folder restart (counts
+/// landing, a selection change, a sort) doesn't shrink a list longer
+/// than one chunk or jump the scroll.
+fn merge_shown<T: Clone>(
+    dest: &mut Vec<T>,
+    start: usize,
+    part: Vec<T>,
+    total: usize,
+    complete: bool,
+) {
     if dest.len() > start {
-        dest.truncate(start);
+        let overwrite = (dest.len() - start).min(part.len());
+        dest[start..start + overwrite].clone_from_slice(&part[..overwrite]);
+        if overwrite < part.len() {
+            dest.extend_from_slice(&part[overwrite..]);
+        }
+    } else {
+        dest.extend(part);
     }
-    dest.extend(part);
+    if complete {
+        dest.truncate(total);
+    }
 }
 
 fn sync_model<T: Clone + 'static>(model: &VecModel<T>, data: &[T]) {
@@ -3785,21 +3804,17 @@ fn fill_rows(ui: &AppWindow, s: &State, budget: usize) {
         fill.labels.clear();
         fill.marks.clear();
     }
-    write_chunk(&mut fill.rows, start, chunk);
+    let complete = end == total;
+    // On a same-folder rebuild, keep already-shown rows past this
+    // chunk until the pass is complete, so the list doesn't shrink
+    // and jump whatever was scrolled below the first chunk.
+    merge_shown(&mut fill.rows, start, chunk, total, complete);
     if !ctl.grid {
-        write_chunk(&mut fill.labels, start, labels);
-        write_chunk(&mut fill.marks, start, marks);
+        merge_shown(&mut fill.labels, start, labels, total, complete);
+        merge_shown(&mut fill.marks, start, marks, total, complete);
     } else {
         fill.labels.clear();
         fill.marks.clear();
-    }
-    let complete = end == total;
-    if complete {
-        fill.rows.truncate(total);
-        if !ctl.grid {
-            fill.labels.truncate(total);
-            fill.marks.truncate(total);
-        }
     }
     fill.key = key;
     fill.dir = ctl.dir.clone();
@@ -6541,6 +6556,62 @@ mod tests {
             .map(|r| r.name.to_string())
             .collect();
         assert_eq!(selected, ["d.jpg", "f.jpg"]);
+    }
+
+    #[test]
+    fn a_same_folder_rebuild_keeps_rows_past_the_first_chunk() {
+        let n = ROW_CHUNK + 200;
+        let mut shown: Vec<u32> = (0..n as u32).collect();
+        let first: Vec<u32> = (1_000..1_000 + ROW_CHUNK as u32).collect();
+        merge_shown(&mut shown, 0, first, n, false);
+        assert_eq!(
+            shown.len(),
+            n,
+            "a same-folder restart must not drop the tail"
+        );
+        assert_eq!(shown[0], 1_000);
+        assert_eq!(shown[ROW_CHUNK - 1], 1_000 + ROW_CHUNK as u32 - 1);
+        assert_eq!(shown[ROW_CHUNK], ROW_CHUNK as u32, "old tail stays");
+        assert_eq!(shown[n - 1], n as u32 - 1);
+        let second: Vec<u32> = (2_000..2_000 + 200).collect();
+        merge_shown(&mut shown, ROW_CHUNK, second, n, true);
+        assert_eq!(shown.len(), n);
+        assert_eq!(shown[ROW_CHUNK], 2_000);
+        assert_eq!(shown[n - 1], 2_199);
+
+        // A shorter listing must not shrink until the rebuild completes.
+        let mut shown: Vec<u32> = (0..n as u32).collect();
+        let shorter = ROW_CHUNK + 50;
+        merge_shown(
+            &mut shown,
+            0,
+            (0..ROW_CHUNK as u32).collect(),
+            shorter,
+            false,
+        );
+        assert_eq!(shown.len(), n, "don't shrink mid-rebuild");
+        merge_shown(
+            &mut shown,
+            ROW_CHUNK,
+            (ROW_CHUNK as u32..shorter as u32).collect(),
+            shorter,
+            true,
+        );
+        assert_eq!(shown.len(), shorter);
+    }
+
+    #[test]
+    fn changing_tile_size_changes_the_rows_key() {
+        let mut c = setup("tile-key");
+        let before = rows_key(&c, 80);
+        assert_eq!(c.step_tile(1), Action::Redraw);
+        assert_ne!(
+            rows_key(&c, 80),
+            before,
+            "S/M/L must invalidate a finished grid"
+        );
+        assert_eq!(c.step_tile(-1), Action::Redraw);
+        assert_eq!(rows_key(&c, 80), before);
     }
 
     #[test]
