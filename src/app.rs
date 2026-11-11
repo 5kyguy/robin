@@ -5,8 +5,10 @@
 //! on a worker thread that reports back through the event loop.
 
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc};
@@ -124,15 +126,38 @@ pub struct Drag {
     pub refused: Option<usize>,
 }
 
-/// One read of a folder: its entries and each subfolder's item count.
+/// One read of a folder: its entries and, once the second pass finishes,
+/// each subfolder's item count.
 /// Built off the UI thread for live refresh.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub entries: Vec<crate::model::Entry>,
     pub counts: std::collections::HashMap<OsString, usize>,
+    /// False until the second pass has filled `counts`. A pending map
+    /// must not replace numbers already shown, so a reread doesn't flash
+    /// blank (or "0") before the new counts arrive. Once ready, a missing
+    /// key is a folder left uncounted (another device, or unreadable).
+    pub counts_ready: bool,
 }
 
 impl Snapshot {
+    /// Entries only, so a large folder can list before its counts arrive.
+    pub fn read_entries(dir: &Path) -> Result<Self> {
+        let fd = DirFd::open(dir)?;
+        let entries: Vec<crate::model::Entry> = fd
+            .list()?
+            .into_iter()
+            .map(crate::model::Entry::from_dirent)
+            .collect();
+        Ok(Self {
+            entries,
+            counts: std::collections::HashMap::new(),
+            counts_ready: false,
+        })
+    }
+
+    /// Entries and subfolder counts in one go, for tests and a synchronous
+    /// refresh that should look finished.
     pub fn read(dir: &Path) -> Result<Self> {
         let fd = DirFd::open(dir)?;
         let entries: Vec<crate::model::Entry> = fd
@@ -141,7 +166,11 @@ impl Snapshot {
             .map(crate::model::Entry::from_dirent)
             .collect();
         let counts = subfolder_counts(&fd, &entries, |a, b| device(a) == device(b));
-        Ok(Self { entries, counts })
+        Ok(Self {
+            entries,
+            counts,
+            counts_ready: true,
+        })
     }
 }
 
@@ -168,6 +197,18 @@ fn subfolder_counts(
             Some((e.name.clone(), child.list().ok()?.len()))
         })
         .collect()
+}
+
+/// Second pass over a listing already shown: reopen `dir` and count its
+/// subfolders. `None` if the folder went away before the pass ran.
+fn count_subfolders(
+    dir: &Path,
+    entries: &[crate::model::Entry],
+) -> Option<std::collections::HashMap<OsString, usize>> {
+    let fd = DirFd::open(dir).ok()?;
+    Some(subfolder_counts(&fd, entries, |a, b| {
+        device(a) == device(b)
+    }))
 }
 
 pub struct Controller {
@@ -383,15 +424,33 @@ impl ReadTicket {
         self.gen
     }
 
-    /// Do the blocking read. Only ENOENT/ENOTDIR on a refresh walk up.
+    /// Do the blocking read, including subfolder counts. Only
+    /// ENOENT/ENOTDIR on a refresh walk up. Tests and the scripted
+    /// harness use this so a finished read looks complete.
     pub fn perform(self) -> ReadResult {
-        let result = match Snapshot::read(&self.dir) {
+        let (mut read, follow) = self.perform_listing();
+        if let Some((_, dir, entries)) = follow {
+            if let Ok((_, snap)) = &mut read.result {
+                if let Some(counts) = count_subfolders(&dir, &entries) {
+                    snap.counts = counts;
+                    snap.counts_ready = true;
+                }
+            }
+        }
+        read
+    }
+
+    /// List the folder (walking up on a gone refresh) without counting
+    /// subfolders. The optional follow-up is the generation, the folder
+    /// actually listed, and its entries, so a second pass can fill counts.
+    pub fn perform_listing(self) -> (ReadResult, Option<(u64, PathBuf, Vec<crate::model::Entry>)>) {
+        let result = match Snapshot::read_entries(&self.dir) {
             Ok(snap) => Ok((self.dir, snap)),
             Err(e) if e.is_gone() && self.kind == ReadKind::Refresh => {
                 let mut dir = self.dir;
                 let mut found = None;
                 while dir.pop() {
-                    if let Ok(snap) = Snapshot::read(&dir) {
+                    if let Ok(snap) = Snapshot::read_entries(&dir) {
                         found = Some((dir, snap));
                         break;
                     }
@@ -400,16 +459,23 @@ impl ReadTicket {
             }
             Err(e) => Err(e),
         };
+        let follow = result
+            .as_ref()
+            .ok()
+            .map(|(dir, snap)| (self.gen, dir.clone(), snap.entries.clone()));
         let trash = self
             .trash
             .as_deref()
             .map(|t| crate::trash::read_all(t, None));
-        ReadResult {
-            gen: self.gen,
-            kind: self.kind,
-            result,
-            trash,
-        }
+        (
+            ReadResult {
+                gen: self.gen,
+                kind: self.kind,
+                result,
+                trash,
+            },
+            follow,
+        )
     }
 }
 
@@ -812,6 +878,9 @@ impl Controller {
                 self.listing = Listing::default();
                 self.listing.set_sort(key, order);
                 self.listing.set_show_hidden(hidden);
+                // Counts from the previous folder must not carry over,
+                // even when a child has the same name.
+                self.counts.clear();
                 self.apply_snapshot(snap);
                 // The viewer browses one folder; leaving it closes it.
                 self.viewer = None;
@@ -821,7 +890,7 @@ impl Controller {
                 if was_loaded
                     && !was_unreadable
                     && snap.entries == self.listing.entries()
-                    && snap.counts == self.counts
+                    && (!snap.counts_ready || snap.counts == self.counts)
                 {
                     return Landed::Unchanged;
                 }
@@ -857,8 +926,33 @@ impl Controller {
     }
 
     pub fn apply_snapshot(&mut self, snap: Snapshot) {
+        if !snap.counts_ready {
+            // Keep numbers already shown for folders that are still
+            // here, so a reread doesn't blank them before the second
+            // pass. New folders stay blank, never "0".
+            self.counts
+                .retain(|name, _| snap.entries.iter().any(|e| e.is_dir && e.name == *name));
+        }
         self.listing.set_entries(snap.entries);
-        self.counts = snap.counts;
+        if snap.counts_ready {
+            self.counts = snap.counts;
+        }
+    }
+
+    /// Apply a finished count pass when it still matches the open
+    /// folder and the request that listed it. True when the numbers
+    /// changed and the window should redraw, keeping scroll.
+    pub fn apply_counts(
+        &mut self,
+        gen: u64,
+        dir: &Path,
+        counts: std::collections::HashMap<OsString, usize>,
+    ) -> bool {
+        if gen != self.read_gen || dir != self.dir || self.counts == counts {
+            return false;
+        }
+        self.counts = counts;
+        true
     }
 
     pub fn reload(&mut self) -> Result<()> {
@@ -1457,6 +1551,15 @@ impl Controller {
     }
 
     pub fn rows(&self) -> Vec<Row> {
+        let view = self.listing.view();
+        self.rows_range(&view, 0, view.len())
+    }
+
+    /// Build `view[start..end]` as rows, so the window can fill a large
+    /// listing in chunks without stalling the UI thread.
+    pub fn rows_range(&self, view: &[&crate::model::Entry], start: usize, end: usize) -> Vec<Row> {
+        let end = end.min(view.len());
+        let start = start.min(end);
         let now = self
             .clock
             .map_or_else(|| secs(std::time::SystemTime::now()), |c| c.0);
@@ -1468,30 +1571,31 @@ impl Controller {
         let refused = self.drag.as_ref().and_then(|d| d.refused);
         let in_trash = self.in_trash();
         let home = self.env.home.as_deref();
-        let rows: Vec<Row> = self
-            .listing
-            .view()
+        let rows: Vec<Row> = view[start..end]
             .iter()
             .enumerate()
-            .map(|(i, e)| Row {
-                glyph: file_icon(e.is_dir, &e.extension()).0.into(),
-                name: e.name.to_string_lossy().as_ref().into(),
-                size: size_line(e.is_dir, e.len, self.counts.get(&e.name).copied()).into(),
-                kind: if e.is_dir {
-                    "Folder".into()
-                } else {
-                    kind_name(&e.extension())
+            .map(|(off, e)| {
+                let i = start + off;
+                Row {
+                    glyph: file_icon(e.is_dir, &e.extension()).0.into(),
+                    name: e.name.to_string_lossy().as_ref().into(),
+                    size: size_line(e.is_dir, e.len, self.counts.get(&e.name).copied()).into(),
+                    kind: if e.is_dir {
+                        "Folder".into()
+                    } else {
+                        kind_name(&e.extension())
+                    }
+                    .into(),
+                    modified: crate::model::format_modified(secs(e.mtime), now, offset).into(),
+                    selected: self.listing.selection().contains(&e.name),
+                    hovered: false,
+                    hidden: e.is_hidden(),
+                    role: file_icon(e.is_dir, &e.extension()).1,
+                    badge: SharedString::new(),
+                    cut: self.clip.is_cut(&self.dir, &e.name),
+                    drop: target == Some(i),
+                    drop_refused: refused == Some(i),
                 }
-                .into(),
-                modified: crate::model::format_modified(secs(e.mtime), now, offset).into(),
-                selected: self.listing.selection().contains(&e.name),
-                hovered: false,
-                hidden: e.is_hidden(),
-                role: file_icon(e.is_dir, &e.extension()).1,
-                badge: SharedString::new(),
-                cut: self.clip.is_cut(&self.dir, &e.name),
-                drop: target == Some(i),
-                drop_refused: refused == Some(i),
             })
             .collect();
         if !in_trash {
@@ -1499,7 +1603,7 @@ impl Controller {
         }
         // Trash columns: Name, Original location, Deleted.
         rows.into_iter()
-            .zip(self.listing.view().iter())
+            .zip(view[start..end].iter())
             .map(|(mut row, e)| {
                 let info = self.trash.get(&e.name);
                 row.size = SharedString::new();
@@ -1686,6 +1790,15 @@ struct State {
     prefs_saved: std::cell::Cell<crate::prefs::ViewPrefs>,
     /// Decoded viewer images and filmstrip thumbnails, by path.
     pics: RefCell<Pics>,
+    /// Rows already built for the current listing, filled in chunks so a
+    /// 100k-entry folder doesn't stall the UI thread, flash an empty pane,
+    /// or drop the scroll position and selection.
+    rows_fill: RefCell<RowsFill>,
+    files_model: RefCell<Option<Rc<VecModel<Row>>>>,
+    labels_model: RefCell<Option<Rc<VecModel<SharedString>>>>,
+    marks_model: RefCell<Option<Rc<VecModel<Mark>>>>,
+    grid_model: RefCell<Option<Rc<VecModel<GridLine>>>>,
+    row_fill_queued: std::cell::Cell<bool>,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -2326,6 +2439,12 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         prefs_saved: std::cell::Cell::new(saved.unwrap_or_else(crate::prefs::ViewPrefs::fresh)),
         prefs_path: launch.prefs,
         pics: RefCell::default(),
+        rows_fill: RefCell::default(),
+        files_model: RefCell::new(None),
+        labels_model: RefCell::new(None),
+        marks_model: RefCell::new(None),
+        grid_model: RefCell::new(None),
+        row_fill_queued: std::cell::Cell::new(false),
     }));
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
     redraw(&ui, &state.borrow());
@@ -2821,11 +2940,37 @@ fn start_read(ticket: Option<ReadTicket>) {
         return;
     }
     std::thread::spawn(move || {
-        let read = ticket.perform();
+        let (read, follow) = ticket.perform_listing();
         let _ = slint::invoke_from_event_loop(move || {
             with_state(|ui, st| landed(&ui, st, read));
         });
+        if let Some((gen, dir, entries)) = follow {
+            if let Some(counts) = count_subfolders(&dir, &entries) {
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_state(|ui, st| land_counts(&ui, st, gen, dir, counts));
+                });
+            }
+        }
     });
+}
+
+/// Apply a finished count pass: keep the listing and scroll, fill in
+/// folder sizes that were left blank (or kept from a previous reread).
+fn land_counts(
+    ui: &AppWindow,
+    st: &Shared,
+    gen: u64,
+    dir: PathBuf,
+    counts: std::collections::HashMap<OsString, usize>,
+) {
+    let mut s = st.borrow_mut();
+    if !s.ctl.apply_counts(gen, &dir, counts) {
+        return;
+    }
+    let (list_y, grid_y) = (ui.get_list_scroll(), ui.get_grid_scroll());
+    redraw(ui, &s);
+    ui.set_list_scroll(list_y);
+    ui.set_grid_scroll(grid_y);
 }
 
 /// Show a finished read: a navigation or fallback starts at the top, a
@@ -3472,13 +3617,283 @@ fn sync_viewer(ui: &AppWindow, s: &State) {
     ui.set_view_dir(tilde(ctl.crumb_dir(), ctl.env.home.as_deref()).into());
 }
 
+/// How many rows to build on the UI thread before yielding. Scripted
+/// renders and tests fill the whole list in one go so a screenshot is
+/// complete and scroll tests stay deterministic.
+const ROW_CHUNK: usize = 1024;
+
+#[derive(Default)]
+struct RowsFill {
+    key: u64,
+    dir: PathBuf,
+    filled: usize,
+    total: usize,
+    rows: Vec<Row>,
+    labels: Vec<SharedString>,
+    marks: Vec<Mark>,
+}
+
+fn row_chunk_limit() -> usize {
+    if SCRIPTED.with(|s| s.get()) {
+        usize::MAX
+    } else {
+        ROW_CHUNK
+    }
+}
+
+/// A fingerprint of everything [`Controller::rows`] and the name labels
+/// depend on, so a toast or sidebar land can reuse a finished list.
+fn rows_key(ctl: &Controller, budget: usize) -> u64 {
+    let mut h = DefaultHasher::new();
+    ctl.dir.hash(&mut h);
+    ctl.grid.hash(&mut h);
+    ctl.compact.hash(&mut h);
+    ctl.tile_step.hash(&mut h);
+    budget.hash(&mut h);
+    {
+        let (key, dir) = ctl.listing.sort();
+        std::mem::discriminant(&key).hash(&mut h);
+        std::mem::discriminant(&dir).hash(&mut h);
+    }
+    ctl.listing.show_hidden().hash(&mut h);
+    ctl.listing.query().hash(&mut h);
+    for e in ctl.listing.view() {
+        e.name.hash(&mut h);
+        e.is_dir.hash(&mut h);
+        e.is_symlink.hash(&mut h);
+        e.len.hash(&mut h);
+        e.mtime.hash(&mut h);
+        e.mode.hash(&mut h);
+    }
+    ctl.counts.len().hash(&mut h);
+    let mut counts: Vec<_> = ctl.counts.iter().collect();
+    counts.sort_by_key(|(name, _)| *name);
+    for (name, n) in counts {
+        name.hash(&mut h);
+        n.hash(&mut h);
+    }
+    for name in ctl.listing.selection() {
+        name.hash(&mut h);
+    }
+    ctl.clock.hash(&mut h);
+    if let Some(d) = &ctl.drag {
+        d.target.hash(&mut h);
+        d.refused.hash(&mut h);
+    }
+    if let Some(clip) = ctl.clip.clip() {
+        clip.dir.hash(&mut h);
+        clip.names.hash(&mut h);
+        std::mem::discriminant(&clip.mode).hash(&mut h);
+    }
+    ctl.in_trash().hash(&mut h);
+    let mut trash: Vec<_> = ctl.trash.iter().collect();
+    trash.sort_by_key(|(name, _)| *name);
+    for (name, info) in trash {
+        name.hash(&mut h);
+        info.original.hash(&mut h);
+        info.deleted.hash(&mut h);
+    }
+    h.finish()
+}
+
+fn row_label(name: &str, budget: usize) -> SharedString {
+    let cut = elide_middle(name, budget);
+    if cut == name {
+        SharedString::new()
+    } else {
+        cut.into()
+    }
+}
+
+fn row_mark(name: &str, label: &SharedString, query: &str) -> Mark {
+    match crate::model::match_runs(name, query) {
+        Some(runs) if label.is_empty() => {
+            let runs: Vec<MarkRun> = runs
+                .into_iter()
+                .map(|(text, hit)| MarkRun {
+                    text: text.into(),
+                    hit,
+                })
+                .collect();
+            Mark {
+                runs: ModelRc::new(Rc::new(VecModel::from(runs))),
+            }
+        }
+        _ => Mark::default(),
+    }
+}
+
+/// Merge a rebuilt prefix into an already-shown list. The tail past
+/// this chunk stays until `complete`, so a same-folder restart (counts
+/// landing, a selection change, a sort) doesn't shrink a list longer
+/// than one chunk or jump the scroll.
+fn merge_shown<T: Clone>(
+    dest: &mut Vec<T>,
+    start: usize,
+    part: Vec<T>,
+    total: usize,
+    complete: bool,
+) {
+    if dest.len() > start {
+        let overwrite = (dest.len() - start).min(part.len());
+        dest[start..start + overwrite].clone_from_slice(&part[..overwrite]);
+        if overwrite < part.len() {
+            dest.extend_from_slice(&part[overwrite..]);
+        }
+    } else {
+        dest.extend(part);
+    }
+    if complete {
+        dest.truncate(total);
+    }
+}
+
+fn sync_model<T: Clone + 'static>(model: &VecModel<T>, data: &[T]) {
+    let n = data.len();
+    let m = model.row_count();
+    let share = n.min(m);
+    for (i, item) in data.iter().take(share).enumerate() {
+        model.set_row_data(i, item.clone());
+    }
+    for item in data.iter().skip(share) {
+        model.push(item.clone());
+    }
+    for i in (n..m).rev() {
+        model.remove(i);
+    }
+}
+
+fn bind_model<T: Clone + 'static>(
+    slot: &RefCell<Option<Rc<VecModel<T>>>>,
+    data: &[T],
+    replace: bool,
+    set: impl FnOnce(ModelRc<T>),
+) {
+    let mut slot = slot.borrow_mut();
+    if let Some(model) = slot.as_ref() {
+        if replace {
+            model.set_vec(data.to_vec());
+        } else {
+            sync_model(model, data);
+        }
+    } else {
+        let model = Rc::new(VecModel::from(data.to_vec()));
+        set(ModelRc::from(model.clone()));
+        *slot = Some(model);
+    }
+}
+
+fn clear_model<T: Clone + 'static>(
+    slot: &RefCell<Option<Rc<VecModel<T>>>>,
+    set: impl FnOnce(ModelRc<T>),
+) {
+    if let Some(model) = slot.borrow().as_ref() {
+        if model.row_count() > 0 {
+            model.set_vec(Vec::new());
+        }
+    } else {
+        set(ModelRc::default());
+    }
+}
+
+/// Keep filling the list on a later event-loop turn, preserving scroll.
+fn schedule_row_fill(s: &State) {
+    if s.row_fill_queued.get() {
+        return;
+    }
+    s.row_fill_queued.set(true);
+    let _ = slint::invoke_from_event_loop(|| {
+        with_state(|ui, st| {
+            st.borrow().row_fill_queued.set(false);
+            let (list_y, grid_y) = (ui.get_list_scroll(), ui.get_grid_scroll());
+            redraw(&ui, &st.borrow());
+            ui.set_list_scroll(list_y);
+            ui.set_grid_scroll(grid_y);
+        });
+    });
+}
+
+/// Build the next chunk of rows into `s.rows_fill` and push them to the
+/// window's models without clearing a list that is already on screen.
+fn fill_rows(ui: &AppWindow, s: &State, budget: usize) {
+    let ctl = &s.ctl;
+    let key = rows_key(ctl, budget);
+    let view = ctl.listing.view();
+    let total = view.len();
+    let mut fill = s.rows_fill.borrow_mut();
+    let same = fill.key == key && fill.dir == ctl.dir;
+    if same && fill.filled == fill.total && fill.total == total {
+        return;
+    }
+    let replace = fill.dir != ctl.dir || s.files_model.borrow().is_none();
+    let start = if same { fill.filled } else { 0 };
+    let end = (start.saturating_add(row_chunk_limit())).min(total);
+    let chunk = ctl.rows_range(&view, start, end);
+    let query = ctl.listing.query();
+    let (labels, marks): (Vec<SharedString>, Vec<Mark>) = if ctl.grid {
+        (Vec::new(), Vec::new())
+    } else {
+        chunk
+            .iter()
+            .map(|r| {
+                let label = row_label(&r.name, budget);
+                let mark = row_mark(&r.name, &label, query);
+                (label, mark)
+            })
+            .unzip()
+    };
+    if replace && start == 0 {
+        fill.rows.clear();
+        fill.labels.clear();
+        fill.marks.clear();
+    }
+    let complete = end == total;
+    // On a same-folder rebuild, keep already-shown rows past this
+    // chunk until the pass is complete, so the list doesn't shrink
+    // and jump whatever was scrolled below the first chunk.
+    merge_shown(&mut fill.rows, start, chunk, total, complete);
+    if !ctl.grid {
+        merge_shown(&mut fill.labels, start, labels, total, complete);
+        merge_shown(&mut fill.marks, start, marks, total, complete);
+    } else {
+        fill.labels.clear();
+        fill.marks.clear();
+    }
+    fill.key = key;
+    fill.dir = ctl.dir.clone();
+    fill.filled = end;
+    fill.total = total;
+    if ctl.grid {
+        let lines = ctl.grid_lines(&fill.rows);
+        bind_model(&s.grid_model, &lines, replace && start == 0, |m| {
+            ui.set_grid_rows(m)
+        });
+        clear_model(&s.files_model, |m| ui.set_files(m));
+        clear_model(&s.labels_model, |m| ui.set_labels(m));
+        clear_model(&s.marks_model, |m| ui.set_marks(m));
+    } else {
+        bind_model(&s.files_model, &fill.rows, replace && start == 0, |m| {
+            ui.set_files(m)
+        });
+        bind_model(&s.labels_model, &fill.labels, replace && start == 0, |m| {
+            ui.set_labels(m)
+        });
+        bind_model(&s.marks_model, &fill.marks, replace && start == 0, |m| {
+            ui.set_marks(m)
+        });
+        clear_model(&s.grid_model, |m| ui.set_grid_rows(m));
+    }
+    drop(fill);
+    if end < total {
+        schedule_row_fill(s);
+    }
+}
+
 fn redraw(ui: &AppWindow, s: &State) {
     sync_viewer(ui, s);
     let ctl = &s.ctl;
     sync_drop_dest(s);
     remember_prefs(s);
-    // Built once per redraw: in a 100k-entry folder each pass is costly.
-    let rows = ctl.rows();
     ui.set_grid(ctl.grid);
     ui.set_compact(ctl.compact);
     ui.set_hidden_on(ctl.listing.show_hidden());
@@ -3494,54 +3909,10 @@ fn redraw(ui: &AppWindow, s: &State) {
     } else {
         usize::MAX
     };
-    let labels: Vec<SharedString> = rows
-        .iter()
-        .take(if ctl.grid { 0 } else { usize::MAX })
-        .map(|r| {
-            let cut = elide_middle(&r.name, budget);
-            if cut == r.name.as_str() {
-                SharedString::new()
-            } else {
-                cut.into()
-            }
-        })
-        .collect();
-    // The matched part of each name, painted in the accent colour.
-    // Elided names keep plain text: their chars no longer line up.
-    let query = ctl.listing.query();
-    let marks: Vec<Mark> = rows
-        .iter()
-        .zip(&labels)
-        .map(
-            |(r, label)| match crate::model::match_runs(&r.name, query) {
-                Some(runs) if label.is_empty() => {
-                    let runs: Vec<MarkRun> = runs
-                        .into_iter()
-                        .map(|(text, hit)| MarkRun {
-                            text: text.into(),
-                            hit,
-                        })
-                        .collect();
-                    Mark {
-                        runs: ModelRc::new(Rc::new(VecModel::from(runs))),
-                    }
-                }
-                _ => Mark::default(),
-            },
-        )
-        .collect();
-    // Only the visible mode gets a model; the other stays empty.
-    if ctl.grid {
-        ui.set_files(ModelRc::default());
-        ui.set_labels(ModelRc::default());
-        ui.set_marks(ModelRc::default());
-        ui.set_grid_rows(ModelRc::new(Rc::new(VecModel::from(ctl.grid_lines(&rows)))));
-    } else {
-        ui.set_labels(ModelRc::new(Rc::new(VecModel::from(labels))));
-        ui.set_marks(ModelRc::new(Rc::new(VecModel::from(marks))));
-        ui.set_files(ModelRc::new(Rc::new(VecModel::from(rows))));
-        ui.set_grid_rows(ModelRc::default());
-    }
+    // Fill the visible model in chunks, keeping whatever is already on
+    // screen so scroll and selection don't reset and the pane never
+    // flashes empty while a large folder streams in.
+    fill_rows(ui, s, budget);
     let (column, desc) = ctl.sort_header();
     ui.set_sort_column(column);
     ui.set_sort_desc(desc);
@@ -5968,6 +6339,7 @@ mod tests {
                 Snapshot {
                     entries: Vec::new(),
                     counts: Default::default(),
+                    counts_ready: false,
                 },
             )),
             trash: None,
@@ -5982,6 +6354,7 @@ mod tests {
                     Snapshot {
                         entries: Vec::new(),
                         counts: Default::default(),
+                        counts_ready: false,
                     },
                 )),
                 trash: None,
@@ -6205,6 +6578,147 @@ mod tests {
         fs::write(c.dir.join("raw-exports/3.raw"), b"x").unwrap();
         c.refresh().unwrap();
         assert_eq!(c.rows()[0].size, "4 items", "counts are retaken on refresh");
+    }
+
+    #[test]
+    fn a_listing_shows_entries_before_counts_without_flashing_zero() {
+        let mut c = setup("lazy-counts");
+        let inner = c.dir.join("raw-exports");
+        fs::create_dir_all(inner.join("shots")).unwrap();
+        let ticket = c.begin_navigate(inner);
+        let (read, follow) = ticket.perform_listing();
+        assert!(matches!(c.land(read), Landed::Shown { moved: true }));
+        let rows = c.rows();
+        let shots = rows.iter().find(|r| r.name == "shots").unwrap();
+        assert_eq!(shots.size, "", "blank until the count pass, not 0");
+        let (gen, dir, entries) = follow.expect("count pass");
+        let counts = count_subfolders(&dir, &entries).expect("still there");
+        assert!(c.apply_counts(gen, &dir, counts));
+        assert_eq!(
+            c.rows().iter().find(|r| r.name == "shots").unwrap().size,
+            "0 items",
+            "an empty folder is counted only once the pass lands"
+        );
+    }
+
+    #[test]
+    fn a_reread_keeps_folder_counts_until_the_second_pass() {
+        let mut c = setup("lazy-counts-keep");
+        for n in ["1.raw", "2.raw", "3.raw"] {
+            fs::write(c.dir.join("raw-exports").join(n), b"x").unwrap();
+        }
+        c.reload().unwrap();
+        assert_eq!(
+            c.rows()
+                .iter()
+                .find(|r| r.name == "raw-exports")
+                .unwrap()
+                .size,
+            "3 items"
+        );
+        let ticket = c.begin_refresh().unwrap();
+        let (read, follow) = ticket.perform_listing();
+        assert!(
+            matches!(
+                c.land(read),
+                Landed::Unchanged | Landed::Shown { moved: false }
+            ),
+            "entries are already on screen"
+        );
+        assert_eq!(
+            c.rows()
+                .iter()
+                .find(|r| r.name == "raw-exports")
+                .unwrap()
+                .size,
+            "3 items",
+            "pending counts must not blank a reread"
+        );
+        assert!(follow.is_some());
+    }
+
+    #[test]
+    fn rows_can_be_built_in_chunks_without_dropping_selection() {
+        let mut c = setup("row-chunks");
+        for n in ["c.jpg", "d.jpg", "e.jpg", "f.jpg"] {
+            fs::write(c.dir.join(n), b"x").unwrap();
+        }
+        c.reload().unwrap();
+        c.listing.select_only("d.jpg".into());
+        c.listing.toggle("f.jpg".into());
+        let view = c.listing.view();
+        let all = c.rows_range(&view, 0, view.len());
+        assert_eq!(all, c.rows());
+        let mut acc = Vec::new();
+        let mut start = 0;
+        while start < view.len() {
+            let end = (start + 2).min(view.len());
+            acc.extend(c.rows_range(&view, start, end));
+            start = end;
+        }
+        assert_eq!(acc, all);
+        let selected: Vec<_> = all
+            .iter()
+            .filter(|r| r.selected)
+            .map(|r| r.name.to_string())
+            .collect();
+        assert_eq!(selected, ["d.jpg", "f.jpg"]);
+    }
+
+    #[test]
+    fn a_same_folder_rebuild_keeps_rows_past_the_first_chunk() {
+        let n = ROW_CHUNK + 200;
+        let mut shown: Vec<u32> = (0..n as u32).collect();
+        let first: Vec<u32> = (1_000..1_000 + ROW_CHUNK as u32).collect();
+        merge_shown(&mut shown, 0, first, n, false);
+        assert_eq!(
+            shown.len(),
+            n,
+            "a same-folder restart must not drop the tail"
+        );
+        assert_eq!(shown[0], 1_000);
+        assert_eq!(shown[ROW_CHUNK - 1], 1_000 + ROW_CHUNK as u32 - 1);
+        assert_eq!(shown[ROW_CHUNK], ROW_CHUNK as u32, "old tail stays");
+        assert_eq!(shown[n - 1], n as u32 - 1);
+        let second: Vec<u32> = (2_000..2_000 + 200).collect();
+        merge_shown(&mut shown, ROW_CHUNK, second, n, true);
+        assert_eq!(shown.len(), n);
+        assert_eq!(shown[ROW_CHUNK], 2_000);
+        assert_eq!(shown[n - 1], 2_199);
+
+        // A shorter listing must not shrink until the rebuild completes.
+        let mut shown: Vec<u32> = (0..n as u32).collect();
+        let shorter = ROW_CHUNK + 50;
+        merge_shown(
+            &mut shown,
+            0,
+            (0..ROW_CHUNK as u32).collect(),
+            shorter,
+            false,
+        );
+        assert_eq!(shown.len(), n, "don't shrink mid-rebuild");
+        merge_shown(
+            &mut shown,
+            ROW_CHUNK,
+            (ROW_CHUNK as u32..shorter as u32).collect(),
+            shorter,
+            true,
+        );
+        assert_eq!(shown.len(), shorter);
+    }
+
+    #[test]
+    fn changing_tile_size_changes_the_rows_key() {
+        let mut c = setup("tile-key");
+        let before = rows_key(&c, 80);
+        assert_eq!(c.step_tile(1), Action::Redraw);
+        assert_ne!(
+            rows_key(&c, 80),
+            before,
+            "S/M/L must invalidate a finished grid"
+        );
+        assert_eq!(c.step_tile(-1), Action::Redraw);
+        assert_eq!(rows_key(&c, 80), before);
     }
 
     #[test]
