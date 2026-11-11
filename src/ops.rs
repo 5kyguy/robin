@@ -316,11 +316,12 @@ impl Job {
     }
 }
 
+/// "1 item", "42 items", "2 318 items": grouped like the sidebar counts.
 pub fn count(n: usize) -> String {
     if n == 1 {
         "1 item".into()
     } else {
-        format!("{n} items")
+        format!("{} items", crate::stats::group_digits(n as u64))
     }
 }
 

@@ -126,6 +126,29 @@ export struct StatType {
     alpha: float,
 }
 
+// One context-menu line (DESIGN §7): a separator, or an item with a
+// glyph, label, shortcut and optional submenu marker.
+export struct MenuItem {
+    glyph: string,
+    label: string,
+    shortcut: string,
+    danger: bool,
+    sub: bool,
+    sep: bool,
+}
+
+// One shortcut-overlay line: its key caps, then what it does.
+export struct KeyRow {
+    keys: [string],
+    label: string,
+}
+
+// A shortcut-overlay column under its `t-label` header.
+export struct KeySection {
+    title: string,
+    rows: [KeyRow],
+}
+
 export struct MapCell {
     x: length,
     y: length,
@@ -136,6 +159,53 @@ export struct MapCell {
     shade: float,
     // A lone tile: surface tint ringed in accent, not a solid block.
     outline: bool,
+}
+
+// A dialog or empty-state button (DESIGN §4): 32 tall, min 88 wide,
+// primary in accent, secondary outlined in `line`.
+component StateButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary;
+    in property <color> ink;
+    in property <color> line-ink;
+    in property <color> accent;
+    in property <color> on-accent;
+    in property <color> hover-bg;
+    callback clicked;
+    width: max(88px, button-label.preferred-width + 32px);
+    height: 32px;
+    border-radius: 6px;
+    border-width: primary ? 0px : 1px;
+    border-color: line-ink;
+    background: primary ? (button-touch.has-hover ? accent.with-alpha(0.85) : accent) : (button-touch.has-hover ? hover-bg : transparent);
+    button-label := Text { text: label; font-size: 12px; color: primary ? on-accent : ink; horizontal-alignment: center; vertical-alignment: center; }
+    button-touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// A 2px dashed stroke (dash 6, gap 4) around its box: the valid drop
+// target (DESIGN §0 `drop_target`). Slint has no dashed borders.
+component DashedFrame inherits Rectangle {
+    in property <color> ink;
+    property <int> across: ceil(self.width / 10px);
+    property <int> down: ceil(self.height / 10px);
+    for i in across: Rectangle { x: i * 10px; y: 0px; width: min(6px, root.width - i * 10px); height: 2px; background: ink; }
+    for i in across: Rectangle { x: i * 10px; y: root.height - 2px; width: min(6px, root.width - i * 10px); height: 2px; background: ink; }
+    for i in down: Rectangle { x: 0px; y: i * 10px; width: 2px; height: min(6px, root.height - i * 10px); background: ink; }
+    for i in down: Rectangle { x: root.width - 2px; y: i * 10px; width: 2px; height: min(6px, root.height - i * 10px); background: ink; }
+}
+
+// A key cap in the shortcut overlay: `t-small`, 1px `line`, radius r-xs,
+// padding 4/1, min width 20.
+component KeyCap inherits Rectangle {
+    in property <string> key;
+    in property <color> ink;
+    in property <color> line-ink;
+    width: max(20px, cap-label.preferred-width + 8px);
+    height: 18px;
+    border-radius: 2px;
+    border-width: 1px;
+    border-color: line-ink;
+    cap-label := Text { text: key; font-size: 11px; color: ink; horizontal-alignment: center; vertical-alignment: center; }
 }
 
 component SideRow inherits Rectangle {
@@ -683,6 +753,26 @@ export component AppWindow inherits Window {
     in property <string> state-title: "";
     /// A navigation read is slow: a thin progress bar under the toolbar.
     in property <bool> nav-busy: false;
+    // Rows are still streaming in (or the first read hasn't landed): the
+    // 2px bar runs under the toolbar without dimming the list.
+    in property <bool> reading: false;
+    // A button under an empty or error state: "new-folder", "admin",
+    // "back", "mount", "home", "search-hidden", "clear".
+    callback state-action(string);
+    // The no-results state offers [Search hidden files] only when hidden
+    // files were left out.
+    in property <bool> search-hidden-offer: false;
+    // The Move-to-trash confirm's "Don't ask again" box.
+    in property <bool> trash-dont-ask: false;
+    // Replace is amber when the file it overwrites is newer.
+    in property <bool> conflict-replace-warn: false;
+    // Path completion: matching folders, at most 8 shown.
+    in property <[string]> completions;
+    // The context menu's lines, for "menu-file" and "menu-bg".
+    in property <[MenuItem]> menu-items;
+    // The shortcut overlay's three columns and its filter text.
+    in property <[KeySection]> key-sections;
+    in property <string> key-filter: "";
     /// Renders pin the bar's position (0..1); negative animates it.
     in property <float> nav-phase: -1;
     in property <string> overlay: "";
@@ -765,7 +855,6 @@ export component AppWindow inherits Window {
     in-out property <length> list-scroll: 0px;
     in-out property <length> grid-scroll: 0px;
     in property <[GridLine]> grid-rows;
-    in property <[string]> menu-labels;
     in property <string> toast-text: "";
     in property <[string]> toast-details;
     /// Whether the toast has details or a pinned line under its headline;
@@ -1038,7 +1127,7 @@ export component AppWindow inherits Window {
                 property <length> right-w: icon-box * 4 + 18px;
                 property <length> crumb-x: 8px + nav-w + 12px;
                 property <length> right-x: self.width - 8px - right-w;
-                if nav-busy: Rectangle {
+                if nav-busy || reading: Rectangle {
                     y: parent.height - 2px;
                     height: 2px;
                     clip: true;
@@ -1302,12 +1391,17 @@ export component AppWindow inherits Window {
                         for row[i] in files: Rectangle {
                             width: parent.width;
                             height: row-h;
-                            background: row.drop ? selected : row.selected && !row.drop-refused ? selected-active : row.hovered ? hover : transparent;
+                            // drop_target: accent@12% under a dashed accent
+                            // stroke; drop_target_invalid: danger@10% and a
+                            // solid danger stroke (DESIGN §0).
+                            background: row.drop ? accent.with-alpha(0.12) : row.drop-refused ? danger.with-alpha(0.10) : row.selected ? selected-active : row.hovered ? hover : transparent;
                             border-radius: 6px;
-                            border-width: row.drop ? 2px : row.drop-refused ? 1px : 0px;
-                            border-color: row.drop-refused ? muted : accent;
+                            border-width: row.drop-refused ? 2px : 0px;
+                            border-color: danger;
                             opacity: row.cut ? 0.5 : 1;
+                            if row.drop: DashedFrame { width: parent.width; height: parent.height; ink: root.accent; }
                             TouchArea {
+                                mouse-cursor: row.drop-refused ? MouseCursor.not-allowed : MouseCursor.default;
                                 pointer-event(e) => {
                                     if e.button == PointerEventButton.left || e.kind == PointerEventKind.move {
                                         root.row-pointer(
@@ -1451,11 +1545,31 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                if state == "empty" || state == "trash-empty" || state == "denied" || state == "unmounted" || state == "ejected" || state == "nosearch" || state == "loading": VerticalLayout {
+                // The first read hasn't landed: file-icon rows stand in for
+                // the spec's skeleton rows (an accepted deviation) while the
+                // bar under the toolbar runs.
+                if state == "loading": VerticalLayout {
+                    alignment: start;
+                    Rectangle { height: 27px; }
+                    for i in 12: Rectangle {
+                        height: row-h;
+                        Text {
+                            text: "󰈔";
+                            x: Columns.pad;
+                            width: Columns.icon-w;
+                            height: parent.height;
+                            font-size: 14px;
+                            color: muted.with-alpha(0.5);
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                if state == "empty" || state == "trash-empty" || state == "denied" || state == "unmounted" || state == "ejected" || state == "nosearch": VerticalLayout {
                     alignment: center;
                     width: parent.width;
                     Text {
-                        text: state == "empty" ? "󰉖" : state == "trash-empty" ? "󰩺" : state == "denied" ? "󰌾" : state == "nosearch" ? "󰍉" : state == "loading" ? "" : "󰕓";
+                        text: state == "empty" ? "󰉖" : state == "trash-empty" ? "󰩺" : state == "denied" ? "󰌾" : state == "nosearch" ? "󰍉" : "󰕓";
                         font-size: 64px;
                         color: state == "denied" || state == "ejected" ? warning.with-alpha(0.6) : muted.with-alpha(0.6);
                         horizontal-alignment: center;
@@ -1463,7 +1577,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 12px; }
                     Text {
-                        text: state == "empty" ? "This folder is empty" : state == "trash-empty" ? "Trash is empty" : state == "denied" ? state-title : state == "unmounted" ? "SANDISK is not mounted" : state == "ejected" ? "SANDISK was removed" : state == "nosearch" ? state-title : "Reading…";
+                        text: state == "empty" ? "This folder is empty" : state == "trash-empty" ? "Trash is empty" : state == "denied" ? state-title : state == "unmounted" ? "SANDISK is not mounted" : state == "ejected" ? "SANDISK was removed" : state-title;
                         font-size: 18px;
                         font-weight: 700;
                         color: text;
@@ -1472,12 +1586,54 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 6px; }
                     Text {
-                        text: state == "empty" ? "Drop files here or press Ctrl+N" : state == "trash-empty" ? "Files you move to the trash wait here until you empty it." : state == "denied" ? state-note : state == "nosearch" ? state-note : state == "loading" ? state-note : "";
+                        text: state == "empty" ? "Drop files here or press Ctrl+N" : state == "trash-empty" ? "Files you move to the trash wait here until you empty it." : state == "denied" ? state-note : state == "nosearch" ? state-note : "";
                         font-size: 11px;
                         color: muted;
                         horizontal-alignment: center;
                         wrap: word-wrap;
                         width: parent.width;
+                    }
+                    // The state's actions, 16 below the body (DESIGN §3).
+                    if state != "trash-empty": Rectangle { height: 16px; }
+                    if state != "trash-empty": HorizontalLayout {
+                        alignment: center;
+                        spacing: 8px;
+                        if state == "empty": StateButton {
+                            label: "New folder";
+                            ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover;
+                            clicked => { root.state-action("new-folder"); }
+                        }
+                        if state == "denied": StateButton {
+                            label: "Open as admin…";
+                            ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover;
+                            clicked => { root.state-action("admin"); }
+                        }
+                        if state == "denied": StateButton {
+                            label: "Go back";
+                            ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover;
+                            clicked => { root.state-action("back"); }
+                        }
+                        if state == "unmounted": StateButton {
+                            label: "Mount";
+                            primary: true;
+                            ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover;
+                            clicked => { root.state-action("mount"); }
+                        }
+                        if state == "ejected": StateButton {
+                            label: "Go to Home";
+                            ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover;
+                            clicked => { root.state-action("home"); }
+                        }
+                        if state == "nosearch" && search-hidden-offer: StateButton {
+                            label: "Search hidden files";
+                            ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover;
+                            clicked => { root.state-action("search-hidden"); }
+                        }
+                        if state == "nosearch": StateButton {
+                            label: "Clear";
+                            ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover;
+                            clicked => { root.state-action("clear"); }
+                        }
                     }
                 }
             }
@@ -1729,28 +1885,37 @@ export component AppWindow inherits Window {
         }
     }
 
-    if !harness && (overlay == "trash" || overlay == "trash-no" || overlay == "delete" || overlay == "move-refused" || overlay == "menu-file" || overlay == "shortcuts"): Rectangle {
-        background: #000000.with-alpha(0.6);
+    if !harness && (overlay == "trash" || overlay == "trash-no" || overlay == "delete" || overlay == "move-refused" || overlay == "menu-file" || overlay == "menu-bg"): Rectangle {
+        // Menus open over the window as it is; dialogs get the scrim.
+        background: overlay == "menu-file" || overlay == "menu-bg" ? transparent : #000000.with-alpha(0.6);
         if overlay == "delete" || overlay == "trash" || overlay == "trash-no": Rectangle {
             width: 440px;
-            // Title, note, up to six name lines ("and N more"), buttons.
-            height: 150px + max(1, confirm-names-count) * 15px;
+            // Title, note, up to six name lines ("and N more"), the trash
+            // confirm's "Don't ask again" row, buttons.
+            height: 150px + max(1, confirm-names-count) * 15px + (overlay == "trash" ? 26px : 0px);
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: surface;
             border-radius: 10px;
             border-width: 1px;
             border-color: hairline;
+            // The danger top bar stays inside the radius.
+            clip: true;
             VerticalLayout {
                 padding: 20px;
                 spacing: 8px;
                 if overlay == "delete": HorizontalLayout {
                     spacing: 8px;
-                    Text { text: "󰀦"; width: 18px; height: 20px; font-size: 15px; color: danger; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "󰀦"; width: 20px; height: 20px; font-size: 20px; color: danger; horizontal-alignment: center; vertical-alignment: center; }
                     Text { text: "Permanently delete \{confirm-noun}?"; font-size: 13px; font-weight: 700; color: text; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
                 }
-                if overlay != "delete": Text {
-                    text: overlay == "trash-no" ? "This drive has no trash" : "Move \{confirm-noun} to trash?";
+                if overlay == "trash-no": HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "󰀦"; width: 20px; height: 20px; font-size: 20px; color: warning; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "This drive has no trash"; font-size: 13px; font-weight: 700; color: text; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
+                }
+                if overlay == "trash": Text {
+                    text: "Move \{confirm-noun} to trash?";
                     font-size: 13px;
                     font-weight: 700;
                     color: text;
@@ -1762,6 +1927,22 @@ export component AppWindow inherits Window {
                 }
                 Text { text: confirm-names; font-size: 11px; color: muted; }
                 Rectangle { vertical-stretch: 1; }
+                if overlay == "trash": HorizontalLayout {
+                    spacing: 8px;
+                    height: 18px;
+                    alignment: start;
+                    Rectangle {
+                        width: 14px;
+                        height: 14px;
+                        y: 2px;
+                        border-radius: 2px;
+                        border-color: dialog-focus == 2 ? accent : line;
+                        border-width: dialog-focus == 2 ? 2px : 1px;
+                        background: trash-dont-ask ? accent : transparent;
+                        if trash-dont-ask: Text { text: "󰄬"; font-size: 12px; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Text { text: "Don't ask again"; font-size: 12px; color: text; vertical-alignment: center; }
+                }
                 HorizontalLayout {
                     alignment: end;
                     spacing: 8px;
@@ -1794,6 +1975,14 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+            if overlay == "trash": TouchArea {
+                x: 20px;
+                y: parent.height - 20px - 32px - 8px - 18px;
+                width: 160px;
+                height: 18px;
+                clicked => { root.dialog-button(2); }
+            }
+            if overlay == "delete": Rectangle { x: 0px; y: 0px; width: parent.width; height: 3px; background: danger; }
         }
         if overlay == "move-refused": Rectangle {
             width: 460px;
@@ -1853,119 +2042,41 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        if overlay == "menu-file": Rectangle {
-            x: 280px;
-            y: 180px;
+        if overlay == "menu-file" || overlay == "menu-bg": Rectangle {
+            // From the pointer: a file row, or empty space in the list.
+            x: overlay == "menu-file" ? 280px : 620px;
+            y: overlay == "menu-file" ? 150px : 300px;
             width: 248px;
-            height: 161px;
+            height: menu-list.preferred-height;
             background: surface;
             border-radius: 10px;
             border-width: 1px;
             border-color: hairline;
-            VerticalLayout {
+            menu-list := VerticalLayout {
                 padding: 4px;
                 spacing: 0px;
-                HorizontalLayout {
-                    padding-left: 8px;
-                    padding-right: 8px;
-                    spacing: 8px;
-                    height: 28px;
-                    Text { text: "󰈔"; font-size: 14px; color: muted; vertical-alignment: center; }
-                    Text { text: "Open"; font-size: 12px; color: text; vertical-alignment: center; horizontal-stretch: 1; }
-                    Text { text: "Enter"; font-size: 11px; color: muted; vertical-alignment: center; }
-                }
-                HorizontalLayout {
-                    padding-left: 8px;
-                    padding-right: 8px;
-                    spacing: 8px;
-                    height: 28px;
-                    Text { text: "󰏫"; font-size: 14px; color: muted; vertical-alignment: center; }
-                    Text { text: "Rename"; font-size: 12px; color: text; vertical-alignment: center; horizontal-stretch: 1; }
-                    Text { text: "F2"; font-size: 11px; color: muted; vertical-alignment: center; }
-                }
-                HorizontalLayout {
-                    padding-left: 8px;
-                    padding-right: 8px;
-                    spacing: 8px;
-                    height: 28px;
-                    Text { text: "󰆏"; font-size: 14px; color: muted; vertical-alignment: center; }
-                    Text { text: "Copy path"; font-size: 12px; color: text; vertical-alignment: center; horizontal-stretch: 1; }
-                    Text { text: "Ctrl+C"; font-size: 11px; color: muted; vertical-alignment: center; }
-                }
-                HorizontalLayout {
-                    padding-left: 8px;
-                    padding-right: 8px;
-                    spacing: 8px;
-                    height: 28px;
-                    Text { text: "󰩺"; font-size: 14px; color: muted; vertical-alignment: center; }
-                    Text { text: "Move to trash"; font-size: 12px; color: text; vertical-alignment: center; horizontal-stretch: 1; }
-                    Text { text: "Del"; font-size: 11px; color: muted; vertical-alignment: center; }
-                }
-                Rectangle {
-                    height: 9px;
-                    Rectangle {
+                for item in menu-items: Rectangle {
+                    height: item.sep ? 9px : (compact ? 24px : 28px);
+                    if item.sep: Rectangle {
+                        x: 4px;
                         y: 4px;
+                        width: parent.width - 8px;
                         height: 1px;
                         background: divider;
                     }
-                }
-                HorizontalLayout {
-                    padding-left: 8px;
-                    padding-right: 8px;
-                    spacing: 8px;
-                    height: 28px;
-                    Text { text: "󰀦"; font-size: 14px; color: danger; vertical-alignment: center; }
-                    Text { text: "Delete permanently"; font-size: 12px; color: danger; vertical-alignment: center; horizontal-stretch: 1; }
-                    Text { text: "Shift+Del"; font-size: 11px; color: danger; vertical-alignment: center; }
-                }
-            }
-        }
-        if overlay == "shortcuts": Rectangle {
-            width: 720px;
-            height: 340px;
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: bg.with-alpha(0.86);
-            border-radius: 10px;
-            border-width: 1px;
-            border-color: hairline;
-            VerticalLayout {
-                padding: 16px;
-                spacing: 8px;
-                Text { text: "SHORTCUTS"; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; }
-                HorizontalLayout {
-                    spacing: 24px;
-                    VerticalLayout {
-                        spacing: 0px;
-                        Text { text: "↑ ↓ / j k     move"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "← → / h l     previous / next"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "Home / End     first / last"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "Enter     open"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "Ctrl+L     edit path"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "Ctrl+F     search"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "Ctrl+B     collapse sidebar"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "Ctrl+H     hidden files"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "Ctrl+= / -     tile size"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "F2     rename"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "Ctrl+Shift+N     new folder"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "Ctrl+Alt+N     new file"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                    }
-                    VerticalLayout {
-                        spacing: 0px;
-                        Text { text: "Del     move to trash"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "Shift+Del     delete permanently"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "+  −  0  1     zoom"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "r / R     rotate"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "f     filmstrip"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "i     info"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "s     slideshow"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "Space     play, or next image"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: ", / .     frame step"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "j / k     seek ∓5s"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "m     mute"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "Esc / q     back"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "?     this list"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
-                        Text { text: "F11     fullscreen"; height: 18px; font-size: 11px; color: text; vertical-alignment: center; }
+                    if !item.sep: Rectangle {
+                        border-radius: 6px;
+                        background: item-touch.has-hover ? selected : transparent;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 8px;
+                            Text { text: item.glyph; width: 16px; font-size: 14px; color: item.danger ? danger : muted; vertical-alignment: center; horizontal-alignment: center; }
+                            Text { text: item.label; font-size: 12px; color: item.danger ? danger : text; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                            if item.shortcut != "": Text { text: item.shortcut; font-size: 11px; color: item.danger ? danger : muted; vertical-alignment: center; }
+                            if item.sub: Text { text: "󰅂"; font-size: 12px; color: muted; vertical-alignment: center; }
+                        }
+                        item-touch := TouchArea { }
                     }
                 }
             }
@@ -2145,9 +2256,11 @@ export component AppWindow inherits Window {
                 width: 96px;
                 height: 32px;
                 border-radius: 6px;
-                border-width: f == 3 ? 2px : 1px;
-                border-color: f == 3 ? accent : line;
-                Text { text: conflict-replace-label; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+                // Primary: accent, or warning when the target is newer.
+                background: conflict-replace-warn ? warning : accent;
+                border-width: f == 3 ? 2px : 0px;
+                border-color: text;
+                Text { text: conflict-replace-label; font-size: 12px; color: conflict-replace-warn ? on-warning : on-accent; horizontal-alignment: center; vertical-alignment: center; }
                 TouchArea { clicked => { root.dialog-button(3); } }
             }
         }
@@ -2310,6 +2423,42 @@ export component AppWindow inherits Window {
             border-width: 1px;
             border-color: hairline;
             Text { text: view-zoom; font-size: 12px; color: text; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        // At 200% and up, a 120×80 minimap bottom-right: the whole picture
+        // with the part on screen outlined in accent (DESIGN §5).
+        if view-scale >= 2 && view-px-w > 0 && view-px-h > 0: Rectangle {
+            property <float> mm: min(120 / view-px-w, 80 / view-px-h);
+            property <length> mw: view-px-w * mm * 1px;
+            property <length> mh: view-px-h * mm * 1px;
+            property <length> iw: view-px-w * drawn * 1px;
+            property <length> ih: view-px-h * drawn * 1px;
+            property <length> ix: (open-w - iw) / 2 + view-pan-x * 1px;
+            property <length> vh: parent.height;
+            property <length> iy: (vh - ih) / 2 + view-pan-y * 1px;
+            x: open-w - 16px - 120px;
+            y: parent.height - 16px - 80px;
+            width: 120px;
+            height: 80px;
+            background: #000000;
+            border-width: 1px;
+            border-color: hairline;
+            clip: true;
+            Image {
+                source: view-image;
+                x: (120px - mw) / 2;
+                y: (80px - mh) / 2;
+                width: mw;
+                height: mh;
+                image-fit: fill;
+            }
+            Rectangle {
+                x: (120px - mw) / 2 + mw * max(0, -ix / iw);
+                y: (80px - mh) / 2 + mh * max(0, -iy / ih);
+                width: mw * min(1, open-w / iw, (open-w - max(0px, ix)) / iw);
+                height: mh * min(1, vh / ih, (vh - max(0px, iy)) / ih);
+                border-width: 1px;
+                border-color: accent;
+            }
         }
         if view-info: Rectangle {
             x: parent.width - 16px - 300px;
@@ -2883,7 +3032,7 @@ export component AppWindow inherits Window {
                             height: 32px;
                             border-radius: 6px;
                             background: danger;
-                            opacity: 0.42;
+                            opacity: danger-armed ? 1 : 0.42;
                             Text { text: "Delete permanently"; font-size: 12px; color: on-danger; horizontal-alignment: center; vertical-alignment: center; }
                         }
                     }
@@ -2907,18 +3056,94 @@ export component AppWindow inherits Window {
         drag-line := Text { text: drag-label; x: 40px; y: 0px; height: parent.height; font-size: 12px; color: text; vertical-alignment: center; }
     }
 
-    if !harness && overlay == "path-complete": Rectangle {
-        x: side-w + 120px;
-        y: toolbar-h;
+    // Only as tall as its rows: 28 each, at most 8, under the field.
+    if !harness && overlay == "path-complete" && completions.length > 0: Rectangle {
+        x: side-w + 1px + 8px + icon-box * 3 + 4px + 12px;
+        y: toolbar-h - (toolbar-h - 30px) / 2 + 2px;
         width: 360px;
+        height: min(8, completions.length) * 28px + 8px;
         background: surface;
         border-radius: 6px;
         border-width: 1px;
         border-color: hairline;
+        clip: true;
         VerticalLayout {
-            Text { text: "Pictures"; height: 28px; font-size: 12px; color: text; vertical-alignment: center; }
-            Text { text: "Projects"; height: 28px; font-size: 12px; color: text; vertical-alignment: center; }
-            Text { text: "Public"; height: 28px; font-size: 12px; color: text; vertical-alignment: center; }
+            padding: 4px;
+            for c[i] in completions: Rectangle {
+                height: 28px;
+                visible: i < 8;
+                border-radius: 6px;
+                background: i == 0 ? selected : transparent;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    spacing: 8px;
+                    Text { text: "󰉋"; font-size: 14px; color: accent; vertical-alignment: center; }
+                    Text { text: c; font-size: 12px; color: text; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                }
+            }
+        }
+    }
+    // Above the browser and the viewer, so `?` works from either.
+    if !harness && overlay == "shortcuts": Rectangle {
+        background: #000000.with-alpha(0.6);
+        Rectangle {
+            width: 760px;
+            height: 520px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: bg.with-alpha(0.86);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            // The filter field across the top.
+            Rectangle {
+                x: 16px;
+                y: 16px;
+                width: parent.width - 32px;
+                height: 30px;
+                border-radius: 6px;
+                background: surface;
+                border-width: 1px;
+                border-color: hairline;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 6px;
+                    Text { text: "󰍉"; font-size: 13px; color: muted; vertical-alignment: center; }
+                    Text {
+                        text: key-filter != "" ? key-filter : "Filter shortcuts";
+                        font-size: 12px;
+                        color: key-filter != "" ? text : muted;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Text { text: "Esc"; font-size: 11px; color: muted; vertical-alignment: center; }
+                }
+            }
+            HorizontalLayout {
+                x: 16px;
+                y: 62px;
+                width: parent.width - 32px;
+                height: parent.height - 62px - 16px;
+                spacing: 16px;
+                for section in key-sections: VerticalLayout {
+                    alignment: start;
+                    spacing: 4px;
+                    width: (760px - 32px - 32px) / 3;
+                    Text { text: section.title; height: 20px; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: muted; }
+                    for row in section.rows: HorizontalLayout {
+                        height: 22px;
+                        spacing: 8px;
+                        HorizontalLayout {
+                            min-width: 92px;
+                            spacing: 3px;
+                            alignment: start;
+                            for k in row.keys: KeyCap { key: k; ink: root.text; line-ink: root.line; y: 2px; }
+                        }
+                        Text { text: row.label; font-size: 11px; color: text; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                    }
+                }
+            }
         }
     }
 }
