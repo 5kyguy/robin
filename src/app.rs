@@ -4256,6 +4256,25 @@ fn fill_rows(ui: &AppWindow, s: &State, budget: usize) -> bool {
     end < total
 }
 
+/// What the file pane draws. Until the first read lands it is `loading`,
+/// which draws placeholder rows: never a listing or a selection.
+fn pane_state(ctl: &Controller) -> &'static str {
+    let n = ctl.listing.view().len();
+    if !ctl.loaded {
+        "loading"
+    } else if ctl.unreadable.is_some() {
+        "denied"
+    } else if n == 0 && !ctl.listing.query().is_empty() {
+        "nosearch"
+    } else if n == 0 && ctl.in_trash() {
+        "trash-empty"
+    } else if n == 0 {
+        "empty"
+    } else {
+        "files"
+    }
+}
+
 fn redraw(ui: &AppWindow, s: &State) {
     sync_viewer(ui, s);
     let ctl = &s.ctl;
@@ -4327,22 +4346,7 @@ fn redraw(ui: &AppWindow, s: &State) {
             ui.set_state_note(note.into());
         }
     }
-    ui.set_state(
-        if !ctl.loaded {
-            "loading"
-        } else if ctl.unreadable.is_some() {
-            "denied"
-        } else if n == 0 && !ctl.listing.query().is_empty() {
-            "nosearch"
-        } else if n == 0 && ctl.in_trash() {
-            "trash-empty"
-        } else if n == 0 {
-            "empty"
-        } else {
-            "files"
-        }
-        .into(),
-    );
+    ui.set_state(pane_state(ctl).into());
     match ctl.drag_label() {
         Some((label, glyph)) => {
             ui.set_drag_label(label.into());
@@ -5858,6 +5862,17 @@ mod tests {
         assert_eq!(c.listing.view().len(), 1);
         c.state_action("clear");
         assert_eq!(c.listing.query(), "");
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn an_unread_folder_draws_placeholders_even_with_rows_and_a_selection() {
+        let mut c = setup("placeholders");
+        let first = c.listing.view()[0].name.clone();
+        c.listing.select_only(first);
+        assert_eq!(super::pane_state(&c), "files");
+        c.loaded = false;
+        assert_eq!(super::pane_state(&c), "loading");
         let _ = fs::remove_dir_all(c.env.home.unwrap());
     }
 

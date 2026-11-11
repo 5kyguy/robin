@@ -108,6 +108,20 @@ pub fn paint(view: &str, theme: &Theme, size: (u32, u32), out: &Path) -> Result<
     crate::render::snapshot(&ui, size, out)
 }
 
+/// Which pane state a frame shows. The loading frame must be `loading`:
+/// only that state draws the placeholder rows instead of the listing.
+fn scene_state(view: &str) -> &'static str {
+    match view {
+        "loading-large-dir" => "loading",
+        "empty-folder" => "empty",
+        "permission-denied" => "denied",
+        "device-unmounted" => "unmounted",
+        "device-ejected" => "ejected",
+        "search-no-results" => "nosearch",
+        _ => "files",
+    }
+}
+
 fn apply_scene(ui: &AppWindow, view: &str) {
     let compact = view == "browser-list-compact";
     let grid = matches!(
@@ -179,17 +193,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
     } else {
         "0".into()
     });
-    ui.set_state(
-        match view {
-            "empty-folder" => "empty",
-            "permission-denied" => "denied",
-            "device-unmounted" => "unmounted",
-            "device-ejected" => "ejected",
-            "search-no-results" => "nosearch",
-            _ => "files",
-        }
-        .into(),
-    );
+    ui.set_state(scene_state(view).into());
     if view == "search-no-results" {
         ui.set_state_title("Nothing matches \"kotlin\"".into());
         ui.set_state_note("Searched 4 812 items in ~/Projects".into());
@@ -202,8 +206,9 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         ui.set_search_hidden_offer(true);
     }
     if view == "loading-large-dir" {
-        // The first batch is on screen while the rest streams in: the bar
-        // under the toolbar runs and the status bar counts what's read.
+        // Placeholder rows stand in for the listing (no rows, no
+        // selection) while the bar under the toolbar runs and the status
+        // bar counts what's read.
         ui.set_reading(true);
         ui.set_nav_phase(0.45);
         ui.set_status_left("Reading… 18 240 items".into());
@@ -1286,6 +1291,12 @@ fn list_scene(ui: &AppWindow, view: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_loading_frame_shows_placeholders_not_the_listing() {
+        assert_eq!(super::scene_state("loading-large-dir"), "loading");
+        assert_eq!(super::scene_state("browser-list"), "files");
+    }
+
     #[test]
     fn the_sidebar_highlights_only_the_open_entry() {
         let pinned = ["Home", "Pictures"];
