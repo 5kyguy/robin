@@ -2726,6 +2726,12 @@ impl Launch {
 }
 
 pub fn run(dir: PathBuf) -> Result<i32> {
+    // set_xdg_app_id answers NoPlatform until a backend exists, and the
+    // winit backend bakes the id into the window at creation: taskbars,
+    // window rules, and the desktop entry's StartupWMClass match on it.
+    // The render harnesses select their backend first and set it there.
+    let _ = slint::BackendSelector::new().select();
+    slint::set_xdg_app_id("dev.skyguy.robin").map_err(|e| Error::Message(e.to_string()))?;
     let ui = build(Launch::system(dir))?;
     ui.show().map_err(|e| Error::Message(e.to_string()))?;
     slint::run_event_loop().map_err(|e| Error::Message(e.to_string()))?;
