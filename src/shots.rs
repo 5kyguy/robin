@@ -52,6 +52,8 @@ pub fn known(view: &str) -> bool {
             | "device-busy-copy"
             | "device-busy-other"
             | "device-safe-unplug"
+            | "device-partition-unplug"
+            | "device-partitions-removed-elsewhere"
             | "device-unlock"
             | "device-unlock-wrong"
             | "phone-waiting"
@@ -698,7 +700,11 @@ fn places(view: &str) -> Vec<Place> {
     // Pulled out, or ejected: the row is gone.
     if matches!(
         view,
-        "device-ejected" | "device-safe-unplug" | "device-removed-elsewhere"
+        "device-ejected"
+            | "device-safe-unplug"
+            | "device-removed-elsewhere"
+            | "device-partition-unplug"
+            | "device-partitions-removed-elsewhere"
     ) {
         rows.retain(|row| row.name != "SANDISK");
     }
@@ -1306,6 +1312,17 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
         "device-safe-unplug" => {
             device_toast(ui, "", "SANDISK can be unplugged", "", "");
         }
+        // A stick with two partitions: ejecting either row takes both
+        // rows away together, and the toast names them both.
+        // Both partitions pulled while Pictures is open: one toast.
+        "device-partitions-removed-elsewhere" => {
+            let names = ["SANDISK".to_string(), "BACKUP".to_string()];
+            device_toast(ui, "warning", &crate::app::removed_text(&names), "", "");
+        }
+        "device-partition-unplug" => {
+            let names = ["SANDISK".to_string(), "BACKUP".to_string()];
+            device_toast(ui, "", &crate::app::unplug_text(&names), "", "");
+        }
         "device-menu" => {
             let item = |glyph: &str, label: &str, sep: bool| crate::MenuItem {
                 glyph: glyph.into(),
@@ -1336,7 +1353,7 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
             ui.set_toast_on(true);
             ui.set_toast_tone("warning".into());
             ui.set_toast_glyph(crate::app::toast_glyph("warning").into());
-            ui.set_toast_text(crate::app::removed_text("SANDISK").into());
+            ui.set_toast_text(crate::app::removed_text(&["SANDISK".to_string()]).into());
             ui.set_toast_action("".into());
             crate::app::set_toast_rows(ui, &crate::app::detail_rows(&[], false, false));
         }

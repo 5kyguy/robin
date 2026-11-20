@@ -3040,8 +3040,22 @@ fn drives_landed(
         start_side(&mut s);
         (arrived, lost)
     };
-    for l in lost {
-        mount_lost(ui, st, l);
+    // Every partition pulled while another folder is open shares one
+    // toast: "SANDISK and BACKUP were removed without being ejected".
+    let unseen: Vec<String> = lost
+        .into_iter()
+        .filter_map(|l| mount_lost(ui, st, l))
+        .collect();
+    if !unseen.is_empty() {
+        show_toast(
+            ui,
+            st,
+            "warning",
+            removed_text(&unseen),
+            Vec::new(),
+            false,
+            "",
+        );
     }
     if let Some(d) = arrived.last() {
         device_toast(
@@ -3056,13 +3070,23 @@ fn drives_landed(
     }
 }
 
-/// "SANDISK connected · 29.8 GB".
-/// The toast for a drive pulled out without eject while another folder
-/// is open.
-pub fn removed_text(name: &str) -> String {
-    format!("{name} was removed without being ejected")
+/// The toast for drives pulled out without eject while another folder
+/// is open: "SANDISK was removed…", "SANDISK and BACKUP were removed…".
+pub fn removed_text(names: &[String]) -> String {
+    let verb = if names.len() > 1 { "were" } else { "was" };
+    format!("{} {verb} removed without being ejected", name_list(names))
 }
 
+/// "SANDISK", "SANDISK and BACKUP", "A, B and C".
+fn name_list(names: &[String]) -> String {
+    match names {
+        [] => "The drive".to_string(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// "SANDISK connected · 29.8 GB".
 pub fn connected_text(d: &crate::devices::Drive) -> String {
     format!(
         "{} connected · {}",
@@ -3071,8 +3095,9 @@ pub fn connected_text(d: &crate::devices::Drive) -> String {
     )
 }
 
-/// A mount went away without Robin ejecting it.
-fn mount_lost(ui: &AppWindow, st: &Shared, l: crate::devices::Lost) {
+/// A mount went away without Robin ejecting it. Returns its name when it
+/// was pulled out while another folder was open, for the shared toast.
+fn mount_lost(ui: &AppWindow, st: &Shared, l: crate::devices::Lost) -> Option<String> {
     let name = l
         .mount
         .file_name()
@@ -3081,7 +3106,7 @@ fn mount_lost(ui: &AppWindow, st: &Shared, l: crate::devices::Lost) {
     let (open_on, job_on) = {
         let s = st.borrow();
         if s.dev.ejecting.contains(&l.drive.id) {
-            return;
+            return None;
         }
         (
             s.ctl.dir.starts_with(&l.mount),
@@ -3100,19 +3125,6 @@ fn mount_lost(ui: &AppWindow, st: &Shared, l: crate::devices::Lost) {
         drop(s);
         ui.set_job_detail(format!("{name} was removed · stopping…").into());
     }
-    if !open_on && !job_on && !l.still_plugged {
-        // Pulled out while another folder is open: the row just goes, so
-        // say why.
-        show_toast(
-            ui,
-            st,
-            "warning",
-            removed_text(&name),
-            Vec::new(),
-            false,
-            "",
-        );
-    }
     if open_on {
         show_gone(
             ui,
@@ -3124,7 +3136,11 @@ fn mount_lost(ui: &AppWindow, st: &Shared, l: crate::devices::Lost) {
                 drive: l.still_plugged.then(|| l.drive.id.clone()),
             },
         );
+        return None;
     }
+    // Pulled out while another folder is open: the row just goes, so the
+    // caller's toast says why.
+    (!job_on && !l.still_plugged).then_some(name)
 }
 
 /// Put the pane in the drive's gone state.
@@ -3327,6 +3343,12 @@ fn eject_drive(ui: &AppWindow, st: &Shared, id: &str, force: bool) {
     );
 }
 
+/// "SANDISK can be unplugged", naming every partition on the drive:
+/// "SANDISK and BACKUP", "A, B and C".
+pub fn unplug_text(names: &[String]) -> String {
+    format!("{} can be unplugged", name_list(names))
+}
+
 /// "SANDISK is in use by vlc", or by "another program" when the holder
 /// can't be seen.
 pub fn in_use_text(name: &str, holder: Option<&str>) -> String {
@@ -3398,7 +3420,7 @@ fn eject_landed(
                 ui,
                 st,
                 "",
-                format!("{name} can be unplugged"),
+                unplug_text(&parts.iter().map(drive_name).collect::<Vec<_>>()),
                 Vec::new(),
                 false,
                 "",
@@ -9618,5 +9640,36 @@ mod tests {
             "A alone knows nothing of B's copy"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_unplug_toast_names_every_partition() {
+        let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(unplug_text(&n(&["SANDISK"])), "SANDISK can be unplugged");
+        assert_eq!(
+            unplug_text(&n(&["SANDISK", "BACKUP"])),
+            "SANDISK and BACKUP can be unplugged"
+        );
+        assert_eq!(
+            unplug_text(&n(&["A", "B", "C"])),
+            "A, B and C can be unplugged"
+        );
+    }
+
+    #[test]
+    fn one_removed_toast_names_every_partition() {
+        let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            removed_text(&n(&["SANDISK"])),
+            "SANDISK was removed without being ejected"
+        );
+        assert_eq!(
+            removed_text(&n(&["SANDISK", "BACKUP"])),
+            "SANDISK and BACKUP were removed without being ejected"
+        );
+        assert_eq!(
+            removed_text(&n(&["A", "B", "C"])),
+            "A, B and C were removed without being ejected"
+        );
     }
 }

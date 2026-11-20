@@ -64,6 +64,8 @@ fn scripted_views_render_through_the_real_app() {
         ("devices-removed-elsewhere", 800),
         ("devices-power-off", 800),
         ("devices-partition-busy", 800),
+        ("devices-partition-unplug", 800),
+        ("devices-partitions-removed-elsewhere", 800),
         ("devices-unmounted", 800),
         ("devices-no-space", 800),
         ("devices-fat-too-big", 800),

@@ -69,6 +69,8 @@ pub fn scripted(view: &str) -> bool {
             | "devices-removed-elsewhere"
             | "devices-power-off"
             | "devices-partition-busy"
+            | "devices-partition-unplug"
+            | "devices-partitions-removed-elsewhere"
             | "devices-unmounted"
             | "devices-no-space"
             | "devices-fat-too-big"
@@ -107,6 +109,32 @@ fn device_row(ui: &AppWindow, name: &str) -> Result<i32> {
         .find(|&i| rows.row_data(i).is_some_and(|p| p.name == name))
         .map(|i| i as i32)
         .ok_or_else(|| Error::Message(format!("no DEVICES row named {name}")))
+}
+
+/// The DEVICES rows' names, top to bottom.
+fn device_names(ui: &AppWindow) -> Vec<String> {
+    use slint::Model;
+    ui.get_device_places()
+        .iter()
+        .map(|p| p.name.to_string())
+        .collect()
+}
+
+/// Plug a second partition, BACKUP, onto the SANDISK stick and open it.
+fn plug_backup(ui: &AppWindow, root: &Path, fake: &crate::devices::FakeDevices) -> Result<()> {
+    let mut b = crate::devices::FakeDrive::stick(
+        "sda2",
+        "BACKUP",
+        32_000_000_000,
+        &root.join("media/sky/BACKUP"),
+    );
+    b.drive.drive = "sda1-drive".into();
+    fake.plug(b);
+    app::devices_poll();
+    app::land_reads();
+    ui.invoke_place_open(1, device_row(ui, "BACKUP")?);
+    app::land_reads();
+    Ok(())
 }
 
 /// Play a `devices-*` scene against the fake backend.
@@ -167,18 +195,7 @@ fn device_scene(
         // A second partition on the same stick: a copy onto it blocks
         // ejecting SANDISK, and the toast names BACKUP.
         "devices-partition-busy" => {
-            let mut b = crate::devices::FakeDrive::stick(
-                "sda2",
-                "BACKUP",
-                32_000_000_000,
-                &root.join("media/sky/BACKUP"),
-            );
-            b.drive.drive = "sda1-drive".into();
-            fake.plug(b);
-            app::devices_poll();
-            app::land_reads();
-            ui.invoke_place_open(1, device_row(ui, "BACKUP")?);
-            app::land_reads();
+            plug_backup(ui, root, fake)?;
             back_home(ui);
             app::hold_job(Job::new(
                 JobKind::Copy,
@@ -191,6 +208,58 @@ fn device_scene(
                 &root.join("media/sky/BACKUP"),
             ));
             ui.invoke_place_eject(device_row(ui, "SANDISK")?);
+        }
+        // Ejecting SANDISK's row takes the whole stick: both partitions
+        // unmount, it powers off, and both rows go in the same redraw.
+        // The scene checks that itself, so the render test fails if not.
+        // The stick pulled out while Pictures is open: both partitions go
+        // and one toast names them. Checked here, so the render test fails
+        // on two toasts (the second would replace the first's text).
+        "devices-partitions-removed-elsewhere" => {
+            plug_backup(ui, root, fake)?;
+            back_home(ui);
+            fake.unplug("sda1");
+            fake.unplug("sda2");
+            app::devices_poll();
+            app::land_reads();
+            let toast = ui.get_toast_text().to_string();
+            if toast != "SANDISK and BACKUP were removed without being ejected" {
+                return Err(Error::Message(format!("removed toast: {toast:?}")));
+            }
+            let left = device_names(ui);
+            if left.iter().any(|n| n == "SANDISK" || n == "BACKUP") {
+                return Err(Error::Message(format!("rows left behind: {left:?}")));
+            }
+        }
+        "devices-partition-unplug" => {
+            plug_backup(ui, root, fake)?;
+            back_home(ui);
+            ui.invoke_place_eject(device_row(ui, "SANDISK")?);
+            // Before the side job lands both rows still show; never one.
+            let ours = |ui: &AppWindow| {
+                device_names(ui)
+                    .iter()
+                    .filter(|n| *n == "SANDISK" || *n == "BACKUP")
+                    .count()
+            };
+            if ours(ui) == 1 {
+                return Err(Error::Message("one partition's row went alone".into()));
+            }
+            app::land_reads();
+            let toast = ui.get_toast_text().to_string();
+            if toast != "SANDISK and BACKUP can be unplugged" {
+                return Err(Error::Message(format!("unplug toast: {toast:?}")));
+            }
+            let left = device_names(ui);
+            if left.iter().any(|n| n == "SANDISK" || n == "BACKUP") {
+                return Err(Error::Message(format!("rows left behind: {left:?}")));
+            }
+            if !crate::devices::DeviceBackend::drives(fake)
+                .unwrap_or_default()
+                .is_empty()
+            {
+                return Err(Error::Message("the stick is still powered".into()));
+            }
         }
         "devices-busy-other" => {
             back_home(ui);
