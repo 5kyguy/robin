@@ -439,22 +439,25 @@ fn copy_plain(
     opts: &mut CopyOpts<'_>,
 ) -> Result<CopyOutcome> {
     let to_c = component(dest_name)?;
-    if replace {
-        match rustix::fs::unlinkat(dest_parent.as_fd(), to_c.as_c_str(), AtFlags::empty()) {
-            Ok(()) | Err(Errno::NOENT) => {}
-            Err(e) => return Err(Error::from_errno(dest_name, e)),
-        }
-    }
+    // A Replace writes beside the original under a hidden name, so a
+    // cancel, a failure or an unplug partway leaves the original whole.
+    // A new file goes straight to its name: there is nothing to lose.
+    let tmp = std::ffi::OsString::from(partial_name());
+    let (write_name, write_c) = if replace {
+        (tmp.as_os_str(), component(&tmp)?)
+    } else {
+        (dest_name, to_c.clone())
+    };
     let dest = rustix::fs::openat(
         dest_parent.as_fd(),
-        to_c.as_c_str(),
+        write_c.as_c_str(),
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o644),
     )
     .map_err(|e| Error::from_errno(dest_name, e))?;
     let mut guard = UnlinkOnDrop {
         dir: dest_parent.as_fd(),
-        name: to_c,
+        name: write_c,
         live: true,
     };
     let mut input = File::from(src);
@@ -469,6 +472,10 @@ fn copy_plain(
         if n == 0 {
             break;
         }
+        #[cfg(test)]
+        if WRITE_FAULT_AFTER.with(|f| f.get()) <= opts.cancel.written.load(Ordering::Relaxed) {
+            return Err(Error::io(dest_name, std::io::Error::from_raw_os_error(5)));
+        }
         output
             .write_all(&buf[..n])
             .map_err(|e| Error::io(dest_name, e))?;
@@ -479,8 +486,113 @@ fn copy_plain(
     let _ = output.sync_all();
     let fd: rustix::fd::OwnedFd = output.into();
     drop(fd);
+    if replace {
+        // The temp file is cleaned up by the guard if this fails.
+        finish_replace(dest_parent, write_name, dest_name, &mut guard)?;
+    }
     guard.live = false;
     Ok(CopyOutcome::Copied)
+}
+
+/// Put a fully written temp file in place of `name` on a phone, never
+/// losing the original to a rename the phone refuses.
+///
+/// First a rename over the original (atomic where the folder allows it).
+/// If that is refused, the temp file is renamed once more to learn
+/// whether this folder renames at all: if not, the temp file goes and
+/// the original stays, with an error saying so. Only once a rename has
+/// just worked is the original removed and the new file renamed in; if
+/// that last rename fails, the new copy is kept under its hidden name
+/// and the error names it.
+fn finish_replace(
+    dir: &DirFd,
+    tmp: &std::ffi::OsStr,
+    name: &std::ffi::OsStr,
+    guard: &mut UnlinkOnDrop<'_>,
+) -> Result<()> {
+    let tmp_c = component(tmp)?;
+    let name_c = component(name)?;
+    if rename_in(dir, &tmp_c, &name_c).is_ok() {
+        guard.live = false;
+        return Ok(());
+    }
+    let probe = std::ffi::OsString::from(partial_name());
+    let probe_c = component(&probe)?;
+    if rename_in(dir, &tmp_c, &probe_c).is_err() {
+        // The guard removes the temp file; the original was never touched.
+        return Err(Error::Message(format!(
+            "this folder doesn't allow renaming, so {} wasn't replaced. The original is unchanged",
+            name.to_string_lossy()
+        )));
+    }
+    // The guard now points at the probe name.
+    guard.name = probe_c.clone();
+    if let Err(e) = rustix::fs::unlinkat(dir.as_fd(), name_c.as_c_str(), AtFlags::empty()) {
+        if e != Errno::NOENT {
+            return Err(Error::Message(format!(
+                "couldn't remove the old {} ({e}), so it wasn't replaced. The original is unchanged",
+                name.to_string_lossy()
+            )));
+        }
+    }
+    if let Err(e) = rename_in(dir, &probe_c, &name_c) {
+        // The original is gone, so the new copy must stay.
+        guard.live = false;
+        return Err(Error::Message(format!(
+            "the old {} was removed but the new copy couldn't take its name ({e}). It is saved as {}",
+            name.to_string_lossy(),
+            probe.to_string_lossy()
+        )));
+    }
+    guard.live = false;
+    Ok(())
+}
+
+/// A rename inside one folder. Tests can make it refuse, as some MTP
+/// folders do.
+fn rename_in(
+    dir: &DirFd,
+    from: &std::ffi::CStr,
+    to: &std::ffi::CStr,
+) -> std::result::Result<(), Errno> {
+    #[cfg(test)]
+    {
+        let fault = RENAME_FAULT.with(|f| f.get());
+        let taken = rustix::fs::statat(dir.as_fd(), to, AtFlags::SYMLINK_NOFOLLOW).is_ok();
+        match fault {
+            RenameFault::All => return Err(Errno::NOTSUP),
+            RenameFault::Overwrite | RenameFault::LastStep if taken => return Err(Errno::EXIST),
+            RenameFault::LastStep if RENAMES.with(|n| n.replace(n.get() + 1)) >= 1 => {
+                return Err(Errno::IO)
+            }
+            _ => {}
+        }
+    }
+    rustix::fs::renameat(dir.as_fd(), from, dir.as_fd(), to)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenameFault {
+    None,
+    /// Every rename is refused (ENOTSUP), as in some MTP folders.
+    All,
+    /// A rename over an existing name is refused (EEXIST).
+    Overwrite,
+    /// A rename over an existing name is refused, the probe rename works
+    /// and the rename into place then fails (EIO): a phone pulled between
+    /// the steps.
+    LastStep,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RENAME_FAULT: std::cell::Cell<RenameFault> =
+        const { std::cell::Cell::new(RenameFault::None) };
+    pub(crate) static RENAMES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// A plain write fails with EIO once this many bytes are written: a
+    /// phone pulled mid-copy.
+    pub(crate) static WRITE_FAULT_AFTER: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
 }
 
 /// fsync a folder, except on a phone, where gvfs may not implement it.
@@ -2857,6 +2969,112 @@ mod tests {
         std::fs::write(root.join("photo.jpg"), b"new").unwrap();
         plain_copy(&root, &Cancel::new(), true).unwrap();
         assert_eq!(std::fs::read(root.join("phone/photo.jpg")).unwrap(), b"new");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Names in `dir`, sorted, and whether any is a temp file.
+    fn names_in(dir: &Path) -> (Vec<String>, bool) {
+        let mut n = walk(dir);
+        n.sort();
+        let tmp = n.iter().any(|n| n.starts_with(".robin-partial"));
+        (n, tmp)
+    }
+
+    fn with_fault<T>(fault: RenameFault, f: impl FnOnce() -> T) -> T {
+        RENAME_FAULT.with(|c| c.set(fault));
+        RENAMES.with(|c| c.set(0));
+        let out = f();
+        RENAME_FAULT.with(|c| c.set(RenameFault::None));
+        out
+    }
+
+    /// A phone folder holding the old photo, and a 3 MiB new one at home.
+    fn replace_scene(label: &str) -> std::path::PathBuf {
+        let root = scratch(label);
+        std::fs::create_dir_all(root.join("phone")).unwrap();
+        std::fs::write(root.join("phone/photo.jpg"), b"old original").unwrap();
+        std::fs::write(root.join("photo.jpg"), vec![7u8; 3 << 20]).unwrap();
+        root
+    }
+
+    #[test]
+    fn cancelling_a_plain_replace_keeps_the_original_and_no_temp_file() {
+        let root = replace_scene("plain-replace-cancel");
+        let cancel = Cancel::new();
+        cancel.stop_after_bytes(1 << 20);
+        let out = plain_copy(&root, &cancel, true);
+        assert!(matches!(out, Err(Error::Cancelled)), "{out:?}");
+        assert_eq!(
+            std::fs::read(root.join("phone/photo.jpg")).unwrap(),
+            b"old original"
+        );
+        assert_eq!(
+            names_in(&root.join("phone")),
+            (vec!["photo.jpg".to_string()], false)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_plain_replace_where_overwrite_is_refused_still_lands() {
+        let root = replace_scene("plain-replace-overwrite");
+        let out = with_fault(RenameFault::Overwrite, || {
+            plain_copy(&root, &Cancel::new(), true)
+        });
+        assert_eq!(out.unwrap(), CopyOutcome::Copied);
+        assert_eq!(
+            std::fs::read(root.join("phone/photo.jpg")).unwrap().len(),
+            3 << 20
+        );
+        assert_eq!(
+            names_in(&root.join("phone")),
+            (vec!["photo.jpg".to_string()], false)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_folder_that_refuses_rename_keeps_the_original_and_says_so() {
+        let root = replace_scene("plain-replace-norename");
+        let out = with_fault(RenameFault::All, || plain_copy(&root, &Cancel::new(), true));
+        let Err(Error::Message(m)) = out else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            m,
+            "this folder doesn't allow renaming, so photo.jpg wasn't replaced. The original is unchanged"
+        );
+        assert_eq!(
+            std::fs::read(root.join("phone/photo.jpg")).unwrap(),
+            b"old original"
+        );
+        assert_eq!(
+            names_in(&root.join("phone")),
+            (vec!["photo.jpg".to_string()], false)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_rename_that_fails_after_the_original_went_keeps_the_new_copy_and_names_it() {
+        let root = replace_scene("plain-replace-last");
+        let out = with_fault(RenameFault::LastStep, || {
+            plain_copy(&root, &Cancel::new(), true)
+        });
+        let Err(Error::Message(m)) = out else {
+            panic!("{out:?}");
+        };
+        let (names, _) = names_in(&root.join("phone"));
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].starts_with(".robin-partial-"), "{names:?}");
+        assert!(m.contains(&format!("It is saved as {}", names[0])), "{m}");
+        assert_eq!(
+            std::fs::read(root.join("phone").join(&names[0]))
+                .unwrap()
+                .len(),
+            3 << 20,
+            "the new bytes are all there"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

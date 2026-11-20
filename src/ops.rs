@@ -1735,6 +1735,86 @@ mod tests {
         (root, dest)
     }
 
+    /// The fake Pixel 8 mounted and allowed, with an old photo in DCIM,
+    /// and a 3 MiB new photo of the same name at home.
+    fn phone_replace(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        use crate::devices::DeviceBackend;
+        let root = scratch(label);
+        let fake = crate::devices::FakeDevices::new();
+        fake.plug(crate::devices::FakeDrive::phone(
+            "pixel",
+            "Pixel 8",
+            &root.join("run/user/1000/gvfs/mtp:host=Google_Pixel_8_X"),
+        ));
+        let at = fake.mount("pixel").unwrap();
+        let dcim = at.join("Internal shared storage/DCIM");
+        let pics = root.join("Pictures");
+        fs::create_dir_all(&dcim).unwrap();
+        fs::create_dir_all(&pics).unwrap();
+        fs::write(dcim.join("photo.jpg"), b"old original").unwrap();
+        fs::write(pics.join("photo.jpg"), vec![7u8; 3 << 20]).unwrap();
+        (root, pics, dcim)
+    }
+
+    fn replace_onto(pics: &Path, dcim: &Path) -> Job {
+        let mut job = Job::new(JobKind::Copy, pics, names(&["photo.jpg"]), dcim);
+        job.dest_media = true;
+        job
+    }
+
+    fn phone_names(dcim: &Path) -> Vec<String> {
+        let mut n: Vec<String> = fs::read_dir(dcim)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        n.sort();
+        n
+    }
+
+    fn replace(_: &fsops::ConflictPrompt) -> Result<ConflictChoice> {
+        Ok(ConflictChoice {
+            action: fsops::Conflict::Replace,
+            apply_all: false,
+        })
+    }
+
+    #[test]
+    fn a_replace_onto_a_phone_that_fails_partway_keeps_the_original() {
+        let (root, pics, dcim) = phone_replace("phone-replace-pulled");
+        let job = replace_onto(&pics, &dcim);
+        // The phone goes away after 1 MiB of the 3 MiB file.
+        fsops::WRITE_FAULT_AFTER.with(|f| f.set(1 << 20));
+        let out = run_asking(&job, &env(&root), &Cancel::new(), &mut |_| {}, &mut replace);
+        fsops::WRITE_FAULT_AFTER.with(|f| f.set(u64::MAX));
+        assert_eq!((out.done, out.failed.len()), (0, 1), "{out:?}");
+        assert_eq!(fs::read(dcim.join("photo.jpg")).unwrap(), b"old original");
+        assert_eq!(phone_names(&dcim), ["photo.jpg"], "no temp file left");
+        // The same Replace, with the phone back, lands whole.
+        let out = run_asking(&job, &env(&root), &Cancel::new(), &mut |_| {}, &mut replace);
+        assert_eq!(out.done, 1, "{out:?}");
+        assert_eq!(fs::read(dcim.join("photo.jpg")).unwrap().len(), 3 << 20);
+        assert_eq!(phone_names(&dcim), ["photo.jpg"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_replace_onto_a_phone_folder_that_refuses_rename_keeps_the_original() {
+        let (root, pics, dcim) = phone_replace("phone-replace-norename");
+        let job = replace_onto(&pics, &dcim);
+        fsops::RENAME_FAULT.with(|f| f.set(fsops::RenameFault::All));
+        let out = run_asking(&job, &env(&root), &Cancel::new(), &mut |_| {}, &mut replace);
+        fsops::RENAME_FAULT.with(|f| f.set(fsops::RenameFault::None));
+        assert_eq!(out.done, 0, "{out:?}");
+        assert_eq!(out.failed.len(), 1, "{out:?}");
+        assert!(
+            out.failed[0].contains("doesn't allow renaming, so photo.jpg wasn't replaced"),
+            "{out:?}"
+        );
+        assert_eq!(fs::read(dcim.join("photo.jpg")).unwrap(), b"old original");
+        assert_eq!(phone_names(&dcim), ["photo.jpg"], "no temp file left");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn conflict_answers_and_apply_to_all() {
         let (root, dest) = clash("conflict-all", &["a", "b", "c"]);
