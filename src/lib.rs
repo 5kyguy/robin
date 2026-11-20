@@ -10,6 +10,7 @@ pub mod devices;
 pub mod error;
 pub mod fixture;
 pub mod fsops;
+pub mod gvfs;
 pub mod instance;
 pub mod menus;
 pub mod model;

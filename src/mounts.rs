@@ -218,9 +218,16 @@ impl MountSource for SystemMounts {
     fn space(&self, mount_point: &Path) -> Result<Space> {
         let st = rustix::fs::statvfs(mount_point)
             .map_err(|e| Error::io(mount_point, std::io::Error::from(e)))?;
+        // FUSE (gvfs) may leave the fragment size unset; its unit is then
+        // the block size.
+        let unit = if st.f_frsize > 0 {
+            st.f_frsize
+        } else {
+            st.f_bsize
+        };
         Ok(Space {
-            total: st.f_blocks * st.f_frsize,
-            free: st.f_bavail * st.f_frsize,
+            total: st.f_blocks * unit,
+            free: st.f_bavail * unit,
         })
     }
 
@@ -269,6 +276,12 @@ impl FixtureMounts {
 }
 
 impl FixtureMounts {
+    /// Seed what statvfs says for `path`: a phone storage's own numbers.
+    pub fn with_space(mut self, path: &Path, total: u64, free: u64) -> Self {
+        self.space.push((path.to_path_buf(), Space { total, free }));
+        self
+    }
+
     /// The same table less the mounts of `source`: a stick the device
     /// renders plug in unmounted.
     pub fn without(mut self, source: &str) -> Self {

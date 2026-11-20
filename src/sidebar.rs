@@ -35,6 +35,12 @@ pub struct SideEntry {
     pub drive: Option<String>,
     /// The mount's filesystem, for the FAT32 file-size check.
     pub fs_type: String,
+    /// A drive, phone or camera. Phones and cameras are slow: no trash,
+    /// no counts, no thumbnails.
+    pub kind: crate::devices::Kind,
+    /// A phone mounted but not giving access yet: muted like an unmounted
+    /// drive, and a click opens its waiting state.
+    pub waiting: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -360,6 +366,8 @@ impl SideJob {
                     read_only: v.read_only || drive.is_some_and(|d| d.read_only),
                     drive: drive.map(|d| d.id.clone()),
                     fs_type: v.fs_type.clone(),
+                    kind: crate::devices::Kind::Drive,
+                    waiting: false,
                 }
             })
             .collect();
@@ -373,10 +381,27 @@ impl SideJob {
                 continue;
             }
             let row = match d.mounted() {
+                // A phone or camera: named by the device, not its gvfs
+                // folder ("mtp:host=…"), and never probed for space, since
+                // every call crosses USB.
+                Some(m) if d.media() => SideEntry {
+                    glyph: d.kind.glyph(),
+                    name: d.name(),
+                    path: m.to_path_buf(),
+                    count: String::new(),
+                    usage: None,
+                    removable: true,
+                    mounted: true,
+                    read_only: d.read_only,
+                    drive: Some(d.id.clone()),
+                    fs_type: d.fs_type.clone(),
+                    kind: d.kind,
+                    waiting: d.waiting,
+                },
                 Some(m) => {
                     let usage = self.probe.space(&self.mounts, m).and_then(used);
                     SideEntry {
-                        glyph: "󰕓",
+                        glyph: d.kind.glyph(),
                         name: m
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
@@ -389,10 +414,12 @@ impl SideJob {
                         read_only: d.read_only,
                         drive: Some(d.id.clone()),
                         fs_type: d.fs_type.clone(),
+                        kind: crate::devices::Kind::Drive,
+                        waiting: false,
                     }
                 }
                 None => SideEntry {
-                    glyph: "󰕓",
+                    glyph: d.kind.glyph(),
                     name: d.name(),
                     path: PathBuf::new(),
                     count: String::new(),
@@ -402,6 +429,8 @@ impl SideJob {
                     read_only: false,
                     drive: Some(d.id.clone()),
                     fs_type: d.fs_type.clone(),
+                    kind: d.kind,
+                    waiting: false,
                 },
             };
             out.push(row);
@@ -427,15 +456,40 @@ impl SideJob {
             read_only: false,
             drive: None,
             fs_type: String::new(),
+            kind: crate::devices::Kind::Drive,
+            waiting: false,
         }
     }
 
     fn space(&self, volumes: &[Volume]) -> String {
+        // On a phone or camera: only inside a storage, and that storage's
+        // own numbers. gvfsd-fuse answers statfs per path from gvfs's
+        // filesystem::free and ::size, which gvfs-mtp reads per storage
+        // (the top folder would sum every storage). This runs on the side
+        // job, behind the probe's timeout, so a slow phone can't stall it.
+        let media_root = crate::devices::device_of(&self.drives, &self.dir)
+            .filter(|d| d.media())
+            .and_then(|d| d.mounted().map(Path::to_path_buf))
+            .or_else(|| crate::devices::gvfs_media_root(&self.dir));
+        if let Some(root) = media_root {
+            return storage_of(&root, &self.dir)
+                .and_then(|storage| self.probe.space(&self.mounts, &storage))
+                .filter(|s| s.total > 0)
+                .map(space_text)
+                .unwrap_or_default();
+        }
         mount_of(&self.dir, volumes)
             .and_then(|m| self.probe.space(&self.mounts, Path::new(m)))
             .map(space_text)
             .unwrap_or_default()
     }
+}
+
+/// The storage `dir` is in on a phone mounted at `root`: the first
+/// folder under it. `None` at the top folder itself.
+pub fn storage_of(root: &Path, dir: &Path) -> Option<PathBuf> {
+    let first = dir.strip_prefix(root).ok()?.components().next()?;
+    Some(root.join(first))
 }
 
 fn folder(glyph: &'static str, name: String, path: PathBuf, count: String) -> SideEntry {
@@ -450,6 +504,8 @@ fn folder(glyph: &'static str, name: String, path: PathBuf, count: String) -> Si
         read_only: false,
         drive: None,
         fs_type: String::new(),
+        kind: crate::devices::Kind::Drive,
+        waiting: false,
     }
 }
 
@@ -754,6 +810,52 @@ mod tests {
         assert_eq!(on(&Env::for_home(&home).home_trash.join("files")), want);
         assert_eq!(on(&crate::fixture::empty_trash(&top).join("files")), want);
         crate::fixture::remove(&top).unwrap();
+    }
+
+    #[test]
+    fn a_phone_shows_its_storage_free_space_only_inside_a_storage() {
+        let top = std::env::temp_dir().join(format!("robin-side-phone-{}", std::process::id()));
+        let _ = crate::fixture::remove(&top);
+        crate::fixture::materialize(&top).unwrap();
+        let home = crate::fixture::home(&top);
+        let at = top.join("run/user/1000/gvfs/mtp:host=Pixel");
+        let storage = at.join("Internal shared storage");
+        std::fs::create_dir_all(storage.join("DCIM")).unwrap();
+        let mut phone = crate::devices::FakeDrive::phone("pixel", "Pixel 8", &at).drive;
+        phone.mount_points = vec![at.clone()];
+        let mounts = FixtureMounts::load(&crate::fixture::mounts_dir(&top))
+            .unwrap()
+            .with_space(&storage, 128_000_000_000, 12_000_000_000)
+            .with_space(&at, 256_000_000_000, 40_000_000_000);
+        let mounts: Arc<dyn MountSource> = Arc::new(mounts);
+        let job = |dir: &Path, drives: Vec<crate::devices::Drive>| SideJob {
+            env: Env::for_home(&home),
+            mounts: mounts.clone(),
+            dir: dir.to_path_buf(),
+            probe: SpaceProbe::new(Duration::from_secs(5)),
+            drives,
+        };
+        let space = |dir: &Path| job(dir, vec![phone.clone()]).perform().space;
+        assert_eq!(space(&storage.join("DCIM")), "12 GB free of 128 GB");
+        assert_eq!(space(&storage), "12 GB free of 128 GB");
+        assert_eq!(
+            space(&at),
+            "",
+            "not at the top folder, which sums every storage"
+        );
+        // A gvfs path with no backend row reads the same way.
+        assert_eq!(
+            job(&storage, Vec::new()).perform().space,
+            "12 GB free of 128 GB"
+        );
+        let d = job(&storage, vec![phone.clone()]).perform();
+        let row = d.devices.iter().find(|e| e.name == "Pixel 8").unwrap();
+        assert_eq!(
+            (row.usage, row.count.as_str()),
+            (None, ""),
+            "no usage bar on the row"
+        );
+        let _ = crate::fixture::remove(&top);
     }
 
     #[test]

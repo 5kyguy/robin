@@ -1,4 +1,5 @@
-//! Removable drives: USB sticks, SD cards and external disks.
+//! Removable drives (USB sticks, SD cards, external disks) and, since
+//! phase 2, phones and cameras over USB.
 //!
 //! The sidebar's mounted rows still come from `/proc/self/mountinfo`
 //! ([`crate::mounts`]); this module adds what the mount table can't say:
@@ -9,6 +10,12 @@
 //! and a busy drive are all covered without hardware. With no UDisks2
 //! (no system bus, or `ROBIN_DEVICES=none`) Robin keeps the mountinfo-only
 //! sidebar: no unmounted rows, no hotplug, no eject.
+//!
+//! Phones (MTP) and cameras (PTP) come from gvfs's volume monitors on the
+//! session bus ([`crate::gvfs::Gvfs`]); a mounted one is an ordinary folder
+//! under `/run/user/<uid>/gvfs/`. [`Combined`] puts both sources behind
+//! one backend. Without gvfs (no session bus, or no monitor answering)
+//! DEVICES is exactly phase 1's.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,6 +41,45 @@ pub struct Drive {
     pub mount_points: Vec<PathBuf>,
     pub read_only: bool,
     pub can_power_off: bool,
+    /// A drive, or a phone or camera reached through gvfs.
+    pub kind: Kind,
+    /// A phone that is mounted but hasn't given Robin its files yet: it is
+    /// locked, or "Allow" hasn't been tapped. Its top folder lists nothing.
+    pub waiting: bool,
+    /// Folders on it that take no new files, each with the reason the UI
+    /// gives (a fake's scripted refusals; real phones use [`limits`]'s
+    /// rules).
+    pub no_write: Vec<(PathBuf, String)>,
+}
+
+/// What a device row stands for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Kind {
+    /// A USB stick, SD card or disk, from UDisks2.
+    #[default]
+    Drive,
+    /// An Android phone over MTP.
+    Phone,
+    /// A camera (or a phone in photo mode) over PTP.
+    Camera,
+}
+
+impl Kind {
+    /// The row's glyph from the bundled Nerd Font: nf-md-usb U+F0553,
+    /// nf-md-cellphone U+F011C, nf-md-camera U+F0100.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Kind::Drive => "\u{f0553}",
+            Kind::Phone => "\u{f011c}",
+            Kind::Camera => "\u{f0100}",
+        }
+    }
+
+    /// Phones and cameras: every call crosses USB one object at a time,
+    /// so counts, thumbnails and recursive sizes are skipped.
+    pub fn slow(self) -> bool {
+        self != Kind::Drive
+    }
 }
 
 impl Drive {
@@ -53,6 +99,11 @@ impl Drive {
     /// Whether `path` is on this drive's mounted filesystem.
     pub fn holds(&self, path: &Path) -> bool {
         self.mount_points.iter().any(|m| path.starts_with(m))
+    }
+
+    /// A phone or camera rather than a drive.
+    pub fn media(&self) -> bool {
+        self.kind.slow()
     }
 
     /// FAT32 can't hold a file of 4 GiB or more.
@@ -94,6 +145,8 @@ pub enum DeviceError {
     Unsupported,
     /// Polkit said no.
     NotAuthorized(String),
+    /// A phone that won't open: locked, or file access not allowed yet.
+    Locked,
     /// Anything else, as UDisks2 put it.
     Failed(String),
 }
@@ -103,6 +156,7 @@ impl std::fmt::Display for DeviceError {
         match self {
             DeviceError::Busy => write!(f, "it is in use"),
             DeviceError::Unsupported => write!(f, "the drive doesn't support it"),
+            DeviceError::Locked => write!(f, "unlock it and allow file access"),
             DeviceError::NotAuthorized(m) if m.is_empty() => write!(f, "not allowed"),
             DeviceError::NotAuthorized(m) | DeviceError::Failed(m) => write!(f, "{m}"),
         }
@@ -126,6 +180,107 @@ pub trait DeviceBackend: Send + Sync {
     fn holder(&self, mount: &Path) -> Option<String> {
         holder(mount)
     }
+    /// Whether `id` is one of this backend's, for [`Combined`] to route.
+    fn owns(&self, _id: &str) -> bool {
+        true
+    }
+    /// [Retry] on a phone waiting for access: look again, remounting if
+    /// it still shows nothing; returns where it is mounted.
+    fn retry(&self, id: &str) -> Result<PathBuf, DeviceError> {
+        self.mount(id)
+    }
+    /// Called on the reading thread before a folder on a slow device is
+    /// listed. Real devices are slow by themselves; the fake sleeps here
+    /// to script a slow phone.
+    fn pace(&self, _dir: &Path) {}
+}
+
+/// What can't be done in a folder on a phone or camera, and why: the UI
+/// greys these out (or refuses up front) instead of failing part-way.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Limits {
+    /// Nothing can be created, pasted or dropped here.
+    pub write: Option<String>,
+    /// What is here can't be deleted (a phone's storages).
+    pub remove: Option<String>,
+    /// There is no trash: Del offers Delete permanently.
+    pub no_trash: bool,
+    /// Every read crosses USB: skip folder counts, recursive sizes and
+    /// thumbnails, and copy moves instead of renaming them (MTP may have
+    /// no move).
+    pub slow: bool,
+}
+
+/// The device `dir` is on (the deepest mount that holds it), if any.
+pub fn device_of<'a>(drives: &'a [Drive], dir: &Path) -> Option<&'a Drive> {
+    drives
+        .iter()
+        .filter(|d| d.holds(dir))
+        .max_by_key(|d| d.mounted().map_or(0, |m| m.components().count()))
+}
+
+/// The limits on `dir`: a phone's or camera's (from the device list, or
+/// its gvfs path when the list doesn't know it), or none for a drive.
+/// A phone's top folder only lists its storages ("Internal shared
+/// storage", an SD card): files can't go there and the storages can't
+/// be deleted. Nothing on a phone has a trash.
+pub fn limits(drives: &[Drive], dir: &Path) -> Limits {
+    let (name, root) = match device_of(drives, dir) {
+        Some(d) => {
+            let scripted = d
+                .no_write
+                .iter()
+                .find(|(p, _)| p == dir)
+                .map(|(_, why)| why.clone());
+            if !d.media() {
+                return Limits {
+                    write: scripted,
+                    ..Limits::default()
+                };
+            }
+            let root = d.mounted().is_some_and(|m| m == dir);
+            let mut l = media_limits(&d.name(), root);
+            if l.write.is_none() {
+                l.write = scripted;
+            }
+            return l;
+        }
+        None => match gvfs_media_root(dir) {
+            Some(root) => (
+                root.file_name()
+                    .map(|n| crate::gvfs::fuse_name_host(&n.to_string_lossy()))
+                    .unwrap_or_default(),
+                root == dir,
+            ),
+            None => return Limits::default(),
+        },
+    };
+    media_limits(if name.is_empty() { "the phone" } else { &name }, root)
+}
+
+fn media_limits(name: &str, root: bool) -> Limits {
+    Limits {
+        write: root.then(|| format!("Files can only go inside a storage on {name}")),
+        remove: root.then(|| format!("{name}'s storages can't be deleted")),
+        no_trash: true,
+        slow: true,
+    }
+}
+
+/// The gvfs folder of the phone or camera `path` is on:
+/// `/run/user/1000/gvfs/mtp:host=Google_Pixel_8_…` for anything under it.
+pub fn gvfs_media_root(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    let mut prev_gvfs = false;
+    for c in path.components() {
+        out.push(c);
+        let name = c.as_os_str().to_string_lossy();
+        if prev_gvfs && (name.starts_with("mtp:host=") || name.starts_with("gphoto2:host=")) {
+            return Some(out);
+        }
+        prev_gvfs = name == "gvfs" || name == ".gvfs";
+    }
+    None
 }
 
 /// How an eject ended.
@@ -311,14 +466,16 @@ pub fn preflight(
     (need > free).then_some(Preflight::NoSpace { need, free })
 }
 
-/// The backend the app uses: UDisks2 on the system bus, unless
-/// `ROBIN_DEVICES` says `none` (mountinfo only) or `fake` (a scripted
+/// The backend the app uses: UDisks2 on the system bus and gvfs's phone
+/// and camera monitors on the session bus, whichever answer, unless
+/// `ROBIN_DEVICES` says `none` (mountinfo only), `fake` (a scripted
 /// SANDISK stick that plugs in two seconds after launch, for trying the
-/// device states without hardware).
+/// device states without hardware) or `fake-phone` (that stick plus a
+/// locked PIXEL 8 phone that allows access six seconds after it mounts).
 pub fn from_env() -> Option<Arc<dyn DeviceBackend>> {
     match std::env::var("ROBIN_DEVICES").as_deref() {
         Ok("none") => None,
-        Ok("fake") => {
+        Ok(v @ ("fake" | "fake-phone")) => {
             let fake = FakeDevices::new();
             let base = std::env::var_os("XDG_RUNTIME_DIR")
                 .map(PathBuf::from)
@@ -326,6 +483,7 @@ pub fn from_env() -> Option<Arc<dyn DeviceBackend>> {
                 .unwrap_or_else(std::env::temp_dir)
                 .join("robin-fake-devices");
             let plug = fake.clone();
+            let phone = v == "fake-phone";
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 plug.plug(FakeDrive::stick(
@@ -334,12 +492,115 @@ pub fn from_env() -> Option<Arc<dyn DeviceBackend>> {
                     29_800_000_000,
                     &base.join("SANDISK"),
                 ));
+                if phone {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let mut p = FakeDrive::phone("fake-pixel", "PIXEL 8", &base.join("PIXEL 8"));
+                    p.locked = true;
+                    p.allow_after = Some(std::time::Duration::from_secs(6));
+                    p.list_delay = Some(std::time::Duration::from_millis(700));
+                    plug.plug(p);
+                }
             });
             Some(fake)
         }
-        _ => UDisks::connect()
-            .ok()
-            .map(|u| Arc::new(u) as Arc<dyn DeviceBackend>),
+        _ => {
+            let mut all: Vec<Arc<dyn DeviceBackend>> = Vec::new();
+            if let Ok(u) = UDisks::connect() {
+                all.push(Arc::new(u));
+            }
+            if let Some(g) = crate::gvfs::Gvfs::session() {
+                all.push(Arc::new(g));
+            }
+            match all.len() {
+                0 => None,
+                1 => all.pop(),
+                _ => Some(Arc::new(Combined::new(all))),
+            }
+        }
+    }
+}
+
+// ---- Several backends -----------------------------------------------------
+
+/// UDisks2's drives and gvfs's phones as one list. Calls on a device go
+/// to the backend that [owns](DeviceBackend::owns) its id.
+pub struct Combined {
+    parts: Vec<Arc<dyn DeviceBackend>>,
+}
+
+impl Combined {
+    pub fn new(parts: Vec<Arc<dyn DeviceBackend>>) -> Self {
+        Self { parts }
+    }
+
+    fn of(&self, id: &str) -> Result<&Arc<dyn DeviceBackend>, DeviceError> {
+        self.parts
+            .iter()
+            .find(|b| b.owns(id))
+            .ok_or_else(|| DeviceError::Failed("No such device".into()))
+    }
+}
+
+impl DeviceBackend for Combined {
+    /// Every backend's devices. One that fails fails the whole listing, so
+    /// the window keeps what it shows instead of reading its devices as
+    /// pulled out.
+    fn drives(&self) -> Result<Vec<Drive>, DeviceError> {
+        let mut out = Vec::new();
+        for b in &self.parts {
+            out.extend(b.drives()?);
+        }
+        Ok(out)
+    }
+
+    fn mount(&self, id: &str) -> Result<PathBuf, DeviceError> {
+        self.of(id)?.mount(id)
+    }
+
+    fn unmount(&self, id: &str, force: bool) -> Result<(), DeviceError> {
+        self.of(id)?.unmount(id, force)
+    }
+
+    fn power_off(&self, id: &str) -> Result<(), DeviceError> {
+        self.of(id)?.power_off(id)
+    }
+
+    fn retry(&self, id: &str) -> Result<PathBuf, DeviceError> {
+        self.of(id)?.retry(id)
+    }
+
+    fn owns(&self, id: &str) -> bool {
+        self.parts.iter().any(|b| b.owns(id))
+    }
+
+    fn pace(&self, dir: &Path) {
+        for b in &self.parts {
+            b.pace(dir);
+        }
+    }
+
+    /// One channel that pings when any backend's does.
+    fn watch(&self) -> Option<mpsc::Receiver<()>> {
+        let rxs: Vec<_> = self.parts.iter().filter_map(|b| b.watch()).collect();
+        if rxs.is_empty() {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel();
+        for r in rxs {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                while r.recv().is_ok() {
+                    if tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        Some(rx)
+    }
+
+    fn holder(&self, mount: &Path) -> Option<String> {
+        self.parts.first().and_then(|b| b.holder(mount))
     }
 }
 
@@ -440,6 +701,9 @@ pub fn drives_from_managed(objects: &Managed) -> Vec<Drive> {
             read_only: prop::<bool>(block, "ReadOnly").unwrap_or(false),
             can_power_off: drive.is_some_and(|d| prop::<bool>(d, "CanPowerOff").unwrap_or(false)),
             drive: drive_path,
+            kind: Kind::Drive,
+            waiting: false,
+            no_write: Vec::new(),
         });
     }
     out.sort_by(|a, b| a.device.cmp(&b.device));
@@ -500,6 +764,11 @@ impl UDisks {
 impl DeviceBackend for UDisks {
     fn drives(&self) -> Result<Vec<Drive>, DeviceError> {
         Ok(drives_from_managed(&self.managed()?))
+    }
+
+    /// UDisks2 ids are its object paths.
+    fn owns(&self, id: &str) -> bool {
+        id.starts_with('/')
     }
 
     fn mount(&self, id: &str) -> Result<PathBuf, DeviceError> {
@@ -563,6 +832,16 @@ pub struct FakeDrive {
     pub read_only: bool,
     /// Unmount refuses with Busy unless forced.
     pub busy: bool,
+    /// A phone that mounts but lists nothing until [`FakeDevices::allow`]:
+    /// locked, or "Allow access" not tapped yet.
+    pub locked: bool,
+    /// A locked phone allows access this long after it first mounts, as
+    /// someone tapping Allow would (the `fake-phone` demo).
+    pub allow_after: Option<std::time::Duration>,
+    /// Listing any folder on it takes this long (a slow phone).
+    pub list_delay: Option<std::time::Duration>,
+    /// A phone's storages, made in its top folder once it allows access.
+    pub storages: Vec<String>,
 }
 
 impl FakeDrive {
@@ -579,11 +858,48 @@ impl FakeDrive {
                 mount_points: Vec::new(),
                 read_only: false,
                 can_power_off: true,
+                kind: Kind::Drive,
+                waiting: false,
+                no_write: Vec::new(),
             },
             mount_at: mount_at.to_path_buf(),
             mount_error: None,
             read_only: false,
             busy: false,
+            locked: false,
+            allow_after: None,
+            list_delay: None,
+            storages: Vec::new(),
+        }
+    }
+
+    /// An Android phone over MTP, unmounted, with one storage. Like a real
+    /// one it can't power off: eject only unmounts it.
+    pub fn phone(id: &str, name: &str, mount_at: &Path) -> Self {
+        let mut p = Self::stick(id, name, 0, mount_at);
+        p.drive.drive = String::new();
+        p.drive.device = format!("mtp://fake-{id}/");
+        p.drive.fs_type = "mtp".into();
+        p.drive.can_power_off = false;
+        p.drive.kind = Kind::Phone;
+        p.storages = vec!["Internal shared storage".into()];
+        p
+    }
+
+    /// A camera over PTP (gvfs's gPhoto2 monitor), unmounted, with one
+    /// card. Like a phone it waits while `locked` (off, or not in PTP mode).
+    pub fn camera(id: &str, name: &str, mount_at: &Path) -> Self {
+        let mut c = Self::phone(id, name, mount_at);
+        c.drive.device = format!("gphoto2://fake-{id}/");
+        c.drive.fs_type = "gphoto2".into();
+        c.drive.kind = Kind::Camera;
+        c.storages = vec!["store_00010001".into()];
+        c
+    }
+
+    fn make_storages(&self) {
+        for s in &self.storages {
+            let _ = std::fs::create_dir_all(self.mount_at.join(s));
         }
     }
 }
@@ -598,11 +914,15 @@ pub struct FakeDevices {
     pub log: Mutex<Vec<String>>,
     /// Who the busy toast names; the `/proc` scan when unset.
     pub holder: Mutex<Option<String>>,
+    /// Itself, for a scripted Allow that lands later on its own thread.
+    me: Mutex<Option<std::sync::Weak<FakeDevices>>>,
 }
 
 impl FakeDevices {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        let me = Arc::new(Self::default());
+        *me.me.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&me));
+        me
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<FakeDrive>> {
@@ -652,6 +972,18 @@ impl FakeDevices {
     pub fn get(&self, id: &str) -> Option<FakeDrive> {
         self.lock().iter().find(|d| d.drive.id == id).cloned()
     }
+
+    /// Someone unlocked the phone and tapped Allow: its storages show.
+    pub fn allow(&self, id: &str) {
+        if let Some(d) = self.lock().iter_mut().find(|d| d.drive.id == id) {
+            d.locked = false;
+            if d.drive.mounted().is_some() {
+                d.make_storages();
+            }
+            d.drive.waiting = false;
+        }
+        self.notify();
+    }
 }
 
 impl DeviceBackend for FakeDevices {
@@ -676,10 +1008,43 @@ impl DeviceBackend for FakeDevices {
             std::fs::create_dir_all(&d.mount_at).map_err(|e| DeviceError::Failed(e.to_string()))?;
             d.drive.mount_points = vec![d.mount_at.clone()];
             d.drive.read_only = d.read_only;
+            if d.drive.media() {
+                if d.locked {
+                    d.drive.waiting = true;
+                } else {
+                    d.make_storages();
+                }
+            }
+            if let (true, Some(after)) = (d.locked, d.allow_after.take()) {
+                let me = self.me.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let id = id.to_string();
+                std::thread::spawn(move || {
+                    std::thread::sleep(after);
+                    if let Some(me) = me.and_then(|w| w.upgrade()) {
+                        me.allow(&id);
+                    }
+                });
+            }
             d.mount_at.clone()
         };
         self.notify();
         Ok(at)
+    }
+
+    fn retry(&self, id: &str) -> Result<PathBuf, DeviceError> {
+        self.note(format!("retry {id}"));
+        self.mount(id)
+    }
+
+    fn pace(&self, dir: &Path) {
+        let delay = self
+            .lock()
+            .iter()
+            .find(|d| d.drive.holds(dir))
+            .and_then(|d| d.list_delay);
+        if let Some(t) = delay {
+            std::thread::sleep(t);
+        }
     }
 
     fn unmount(&self, id: &str, force: bool) -> Result<(), DeviceError> {
@@ -694,6 +1059,7 @@ impl DeviceBackend for FakeDevices {
                 return Err(DeviceError::Busy);
             }
             d.drive.mount_points.clear();
+            d.drive.waiting = false;
             d.busy = false;
         }
         self.notify();
@@ -1057,5 +1423,221 @@ mod tests {
             err("org.freedesktop.UDisks2.Error.Failed", "wrong fs"),
             DeviceError::Failed("wrong fs".into())
         );
+    }
+
+    fn pixel(root: &Path) -> FakeDrive {
+        FakeDrive::phone(
+            "pixel",
+            "Pixel 8",
+            &root.join("gvfs/mtp:host=Google_Pixel_8_X"),
+        )
+    }
+
+    #[test]
+    fn a_phone_plugs_mounts_and_lists_its_storages() {
+        let root = tmp("phone");
+        let fake = FakeDevices::new();
+        let rx = fake.watch().unwrap();
+        fake.plug(pixel(&root));
+        rx.try_recv().unwrap();
+        let d = fake.drives().unwrap()[0].clone();
+        assert_eq!(d.kind, Kind::Phone);
+        assert!(d.media() && d.kind.slow());
+        assert_eq!(d.kind.glyph(), "\u{f011c}", "md-cellphone");
+        let at = fake.mount("pixel").unwrap();
+        assert!(at.join("Internal shared storage").is_dir());
+        assert!(!fake.drives().unwrap()[0].waiting);
+        fake.unplug("pixel");
+        rx.try_recv().unwrap();
+        assert!(fake.drives().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_locked_phone_waits_until_allowed() {
+        let root = tmp("phone-locked");
+        let fake = FakeDevices::new();
+        let mut p = pixel(&root);
+        p.locked = true;
+        fake.plug(p);
+        let at = fake.mount("pixel").unwrap();
+        let d = fake.drives().unwrap()[0].clone();
+        assert!(d.waiting, "mounted but nothing to list yet");
+        assert_eq!(std::fs::read_dir(&at).unwrap().count(), 0);
+        // [Retry] while still locked: still empty, still waiting.
+        fake.retry("pixel").unwrap();
+        assert!(fake.drives().unwrap()[0].waiting);
+        fake.allow("pixel");
+        assert!(!fake.drives().unwrap()[0].waiting);
+        assert!(at.join("Internal shared storage").is_dir());
+        let log = fake.log.lock().unwrap().clone();
+        assert_eq!(log, ["mount pixel", "retry pixel", "mount pixel"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_scripted_allow_lands_on_its_own() {
+        let root = tmp("phone-allow-after");
+        let fake = FakeDevices::new();
+        let rx = fake.watch().unwrap();
+        let mut p = pixel(&root);
+        p.locked = true;
+        p.allow_after = Some(std::time::Duration::from_millis(20));
+        fake.plug(p);
+        rx.recv().unwrap();
+        let at = fake.mount("pixel").unwrap();
+        rx.recv().unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the scripted allow pings the watchers");
+        assert!(!fake.drives().unwrap()[0].waiting);
+        assert!(at.join("Internal shared storage").is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ejecting_a_phone_only_unmounts_it() {
+        let root = tmp("phone-eject");
+        let fake = FakeDevices::new();
+        fake.plug(pixel(&root));
+        fake.plug(stick(&root));
+        fake.mount("pixel").unwrap();
+        let all = fake.drives().unwrap();
+        let phone = all.iter().find(|d| d.id == "pixel").unwrap();
+        let parts: Vec<Drive> = partitions(&all, phone).into_iter().cloned().collect();
+        assert_eq!(parts.len(), 1, "a phone shares no drive with the stick");
+        assert_eq!(eject(fake.as_ref(), &parts, false), Ok(Ejected::Unmounted));
+        let log = fake.log.lock().unwrap().clone();
+        assert_eq!(log, ["mount pixel", "unmount pixel"], "never powered off");
+        assert_eq!(fake.drives().unwrap().len(), 2, "still plugged in");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_slow_phone_paces_its_listings() {
+        let root = tmp("phone-pace");
+        let fake = FakeDevices::new();
+        let mut p = pixel(&root);
+        p.list_delay = Some(std::time::Duration::from_millis(60));
+        fake.plug(p);
+        let at = fake.mount("pixel").unwrap();
+        let t = std::time::Instant::now();
+        fake.pace(&at.join("Internal shared storage"));
+        assert!(t.elapsed() >= std::time::Duration::from_millis(60));
+        let t = std::time::Instant::now();
+        fake.pace(&root);
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(60),
+            "not on the phone"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_phone_top_folder_refuses_writes_and_nothing_has_a_trash() {
+        let root = tmp("phone-limits");
+        let fake = FakeDevices::new();
+        let mut p = pixel(&root);
+        let data = p.mount_at.join("Internal shared storage/Android/data");
+        p.drive.no_write = vec![(data.clone(), "no changes here".into())];
+        fake.plug(p);
+        fake.plug(stick(&root));
+        let at = fake.mount("pixel").unwrap();
+        fake.mount("sdb1").unwrap();
+        let all = fake.drives().unwrap();
+        let top = limits(&all, &at);
+        assert_eq!(
+            top.write.as_deref(),
+            Some("Files can only go inside a storage on Pixel 8")
+        );
+        assert_eq!(
+            top.remove.as_deref(),
+            Some("Pixel 8's storages can't be deleted")
+        );
+        assert!(top.no_trash && top.slow);
+        let inside = limits(&all, &at.join("Internal shared storage"));
+        assert_eq!(inside.write, None);
+        assert_eq!(inside.remove, None);
+        assert!(inside.no_trash && inside.slow);
+        assert_eq!(
+            limits(&all, &data).write.as_deref(),
+            Some("no changes here")
+        );
+        let stick = limits(&all, &root.join("SANDISK"));
+        assert_eq!(stick, Limits::default(), "a USB stick has no limits");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gvfs_paths_are_media_even_without_a_backend_row() {
+        let p =
+            Path::new("/run/user/1000/gvfs/mtp:host=Google_Pixel_8_X/Internal shared storage/DCIM");
+        assert_eq!(
+            gvfs_media_root(p),
+            Some(PathBuf::from(
+                "/run/user/1000/gvfs/mtp:host=Google_Pixel_8_X"
+            ))
+        );
+        let cam = Path::new("/home/sky/.gvfs/gphoto2:host=Canon/DCIM");
+        assert_eq!(
+            gvfs_media_root(cam),
+            Some(PathBuf::from("/home/sky/.gvfs/gphoto2:host=Canon"))
+        );
+        assert_eq!(
+            gvfs_media_root(Path::new("/home/sky/mtp:host=x")),
+            None,
+            "not under gvfs"
+        );
+        assert_eq!(
+            gvfs_media_root(Path::new("/run/user/1000/gvfs/smb-share:server=nas")),
+            None
+        );
+        let l = limits(&[], p);
+        assert!(l.no_trash && l.slow);
+        assert_eq!(l.write, None);
+    }
+
+    /// A backend that owns ids with its own prefix and logs its calls.
+    struct Tagged(&'static str, Mutex<Vec<String>>);
+
+    impl DeviceBackend for Tagged {
+        fn drives(&self) -> Result<Vec<Drive>, DeviceError> {
+            let mut d = FakeDrive::stick(&format!("{}1", self.0), self.0, 1, Path::new("/x")).drive;
+            d.drive = String::new();
+            Ok(vec![d])
+        }
+        fn owns(&self, id: &str) -> bool {
+            id.starts_with(self.0)
+        }
+        fn mount(&self, id: &str) -> Result<PathBuf, DeviceError> {
+            self.1.lock().unwrap().push(format!("mount {id}"));
+            Ok(PathBuf::from("/x"))
+        }
+        fn unmount(&self, id: &str, _force: bool) -> Result<(), DeviceError> {
+            self.1.lock().unwrap().push(format!("unmount {id}"));
+            Ok(())
+        }
+        fn power_off(&self, _id: &str) -> Result<(), DeviceError> {
+            Err(DeviceError::Unsupported)
+        }
+        fn watch(&self) -> Option<mpsc::Receiver<()>> {
+            None
+        }
+        fn holder(&self, _mount: &Path) -> Option<String> {
+            None
+        }
+    }
+
+    #[test]
+    fn combined_routes_each_call_to_the_backend_that_owns_the_id() {
+        let a = Arc::new(Tagged("/dev", Mutex::default()));
+        let b = Arc::new(Tagged("gvfs:", Mutex::default()));
+        let both = Combined::new(vec![a.clone(), b.clone()]);
+        let ids: Vec<String> = both.drives().unwrap().into_iter().map(|d| d.id).collect();
+        assert_eq!(ids, ["/dev1", "gvfs:1"]);
+        both.mount("gvfs:1").unwrap();
+        both.unmount("/dev1", false).unwrap();
+        assert_eq!(*a.1.lock().unwrap(), ["unmount /dev1"]);
+        assert_eq!(*b.1.lock().unwrap(), ["mount gvfs:1"]);
+        assert!(both.mount("nobody").is_err(), "no owner, no call");
     }
 }
