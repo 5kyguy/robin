@@ -6,6 +6,7 @@
 pub mod app;
 pub mod cli;
 pub mod delegate;
+pub mod devices;
 pub mod error;
 pub mod fixture;
 pub mod fsops;

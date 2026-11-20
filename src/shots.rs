@@ -13,6 +13,19 @@ use crate::error::{Error, Result};
 use crate::theme::Theme;
 use crate::{AppWindow, GridLine, Place, RefusalLine, Row};
 
+/// A device toast as the live app binds it: tone, text, and up to two
+/// buttons (DESIGN §2 DEVICES).
+fn device_toast(ui: &AppWindow, tone: &str, text: &str, first: &str, second: &str) {
+    ui.set_toast_on(true);
+    ui.set_toast_tone(tone.into());
+    ui.set_toast_glyph(crate::app::toast_glyph(tone).into());
+    ui.set_toast_text(text.into());
+    ui.set_toast_action(first.into());
+    ui.set_toast_action2(second.into());
+    ui.set_toast_action2_danger(second == "Force");
+    crate::app::set_toast_rows(ui, &crate::app::detail_rows(&[], false, false));
+}
+
 pub fn known(view: &str) -> bool {
     matches!(
         view,
@@ -33,6 +46,20 @@ pub fn known(view: &str) -> bool {
             | "permission-denied"
             | "device-unmounted"
             | "device-ejected"
+            | "device-plugged"
+            | "device-read-only"
+            | "device-menu"
+            | "device-busy-copy"
+            | "device-busy-other"
+            | "device-safe-unplug"
+            | "device-partition-unplug"
+            | "device-partitions-removed-elsewhere"
+            | "device-unlock"
+            | "device-unlock-wrong"
+            | "phone-waiting"
+            | "device-read-only-empty"
+            | "device-removed-elsewhere"
+            | "device-power-off"
             | "loading-large-dir"
             | "hidden-files-shown"
             | "confirm-trash"
@@ -109,6 +136,11 @@ pub fn paint(view: &str, theme: &Theme, size: (u32, u32), out: &Path) -> Result<
         ui.window()
             .set_size(slint::PhysicalSize::new(size.0, size.1));
         ui.global::<crate::Columns>().set_row_w(ui.get_content_w());
+        // The pointer on the unmounted row's eject button, once the
+        // window has its size.
+        if view == "device-power-off" {
+            crate::render::hover_at(&ui, 209.0, 336.0);
+        }
     }
     crate::render::snapshot(&ui, size, out)
 }
@@ -122,6 +154,8 @@ fn scene_state(view: &str) -> &'static str {
         "permission-denied" => "denied",
         "device-unmounted" => "unmounted",
         "device-ejected" => "ejected",
+        "phone-waiting" => "phone-waiting",
+        "device-read-only-empty" => "read-only",
         "search-no-results" => "nosearch",
         _ => "files",
     }
@@ -188,6 +222,14 @@ fn apply_scene(ui: &AppWindow, view: &str) {
     } else {
         "~  ›  Pictures".into()
     });
+    if view == "phone-waiting" {
+        ui.set_crumbs("Pixel 8".into());
+    }
+    if view == "device-read-only-empty" {
+        ui.set_crumbs("SANDISK".into());
+        ui.set_status_left("0 items".into());
+        ui.set_status_right("42 GB free of 64 GB".into());
+    }
     ui.set_path_text("/home/sky/Pictures".into());
     ui.set_search_query(if view == "search-no-results" {
         "kotlin".into()
@@ -203,6 +245,21 @@ fn apply_scene(ui: &AppWindow, view: &str) {
     if view == "search-no-results" {
         ui.set_state_title("Nothing matches \"kotlin\"".into());
         ui.set_state_note("Searched 4 812 items in ~/Projects".into());
+    }
+    match view {
+        "device-unmounted" => ui.set_state_title("SANDISK is not mounted".into()),
+        "device-ejected" => ui.set_state_title("SANDISK was removed".into()),
+        "device-read-only-empty" => {
+            ui.set_state_title("SANDISK is read-only".into());
+            ui.set_state_note("Files can be opened but not changed".into());
+        }
+        "phone-waiting" => {
+            ui.set_state_title("Pixel 8".into());
+            ui.set_state_note("Unlock your phone and allow file access".into());
+            ui.set_status_left("".into());
+            ui.set_status_right("".into());
+        }
+        _ => {}
     }
     if view == "permission-denied" {
         ui.set_state_title("No permission to open ~/secret".into());
@@ -321,6 +378,8 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             | "move-refused-many" => "move-refused",
             "menu-file" => "menu-file",
             "menu-bg" => "menu-bg",
+            "device-menu" => "menu-device",
+            "device-unlock" | "device-unlock-wrong" => "unlock",
             "shortcuts-browser" | "shortcuts-viewer" => "shortcuts",
             _ => "",
         }
@@ -348,7 +407,13 @@ fn apply_scene(ui: &AppWindow, view: &str) {
     };
     ui.set_stats_mode(stats_mode.into());
     if !stats_mode.is_empty() {
-        crate::app::show_stats(ui, &mock_report(), "Scanned 16:10  ·  Rescan", false);
+        crate::app::show_stats(
+            ui,
+            &mock_report(),
+            "Scanned 16:10  ·  Rescan",
+            false,
+            &[std::path::PathBuf::from("/run/media/sky/SANDISK")],
+        );
         if stats_mode == "drilled" {
             let weights: Vec<(String, u64)> = vec![
                 ("raw-exports".into(), 180_000_000_000),
@@ -390,6 +455,7 @@ fn mock_report() -> crate::stats::Report {
         disks: vec![
             disk("r2-root", "/", 1_800 * GB, 812 * GB),
             disk("archive", "/mnt/archive", 4_000 * GB, 362 * GB),
+            disk("SANDISK", "/run/media/sky/SANDISK", 64 * GB, 42 * GB),
         ],
         home: crate::stats::Scan {
             total_bytes: 1_042 * GB,
@@ -498,6 +564,8 @@ fn open_folder(view: &str) -> &'static str {
     match view {
         "empty-folder" => "~/Pictures/empty",
         "start-denied" => "~/secret",
+        "phone-waiting" => "Pixel 8",
+        "device-read-only-empty" => "SANDISK",
         _ => "~/Pictures",
     }
 }
@@ -608,11 +676,58 @@ fn places(view: &str) -> Vec<Place> {
             level: 0,
         }),
     ];
-    if view == "device-unmounted" || view == "device-ejected" {
+    // Plugged in but not mounted (DESIGN §2): muted name, no bar.
+    if matches!(
+        view,
+        "device-unmounted"
+            | "device-plugged"
+            | "device-unlock"
+            | "device-unlock-wrong"
+            | "device-power-off"
+    ) {
         if let Some(disk) = rows.iter_mut().find(|row| row.name == "SANDISK") {
-            disk.count = "—".into();
-            disk.usage = 0.0;
+            disk.count = "".into();
+            disk.usage = -1.0;
+            disk.dim = true;
         }
+    }
+    if matches!(view, "device-read-only" | "device-read-only-empty") {
+        if let Some(disk) = rows.iter_mut().find(|row| row.name == "SANDISK") {
+            disk.pill = "Read-only".into();
+            disk.selected = view == "device-read-only-empty";
+        }
+    }
+    // Pulled out, or ejected: the row is gone.
+    if matches!(
+        view,
+        "device-ejected"
+            | "device-safe-unplug"
+            | "device-removed-elsewhere"
+            | "device-partition-unplug"
+            | "device-partitions-removed-elsewhere"
+    ) {
+        rows.retain(|row| row.name != "SANDISK");
+    }
+    if view == "phone-waiting" {
+        let at = rows
+            .iter()
+            .position(|r| r.section == 2)
+            .unwrap_or(rows.len());
+        rows.insert(
+            at,
+            Place {
+                glyph: "󰄜".into(),
+                name: "Pixel 8".into(),
+                count: "".into(),
+                selected: true,
+                usage: -1.0,
+                level: 0,
+                section: 1,
+                dim: true,
+                eject: false,
+                pill: "".into(),
+            },
+        );
     }
     let pinned: Vec<&'static str> = [
         "Home",
@@ -649,6 +764,10 @@ fn place(spec: PlaceSpec<'_>) -> Place {
         usage: spec.usage,
         level: spec.level,
         section: spec.section,
+        dim: false,
+        // Removable drives (the USB glyph) can be ejected.
+        eject: spec.glyph == "󰕓",
+        pill: "".into(),
     }
 }
 
@@ -1170,12 +1289,71 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
             ui.set_dialog_focus(0);
             ui.set_danger_armed(true);
         }
-        "device-ejected" => {
-            // The ejected state comes with a warning toast (DESIGN §3).
+        "device-plugged" => {
+            device_toast(ui, "info", "SANDISK connected · 29.8 GB", "Open", "");
+        }
+        "device-busy-copy" => {
+            ui.set_job_on(true);
+            ui.set_job_glyph("󰆏".into());
+            ui.set_job_label("Copying 3 items to SANDISK".into());
+            ui.set_job_detail("2 of 3 items · speeder-run.mp4".into());
+            ui.set_job_amount(0.66);
+            device_toast(
+                ui,
+                "warning",
+                "Copying 3 items to SANDISK",
+                "Wait",
+                "Cancel copy",
+            );
+        }
+        "device-busy-other" => {
+            device_toast(ui, "warning", "SANDISK is in use by vlc", "Retry", "Force");
+        }
+        "device-safe-unplug" => {
+            device_toast(ui, "", "SANDISK can be unplugged", "", "");
+        }
+        // A stick with two partitions: ejecting either row takes both
+        // rows away together, and the toast names them both.
+        // Both partitions pulled while Pictures is open: one toast.
+        "device-partitions-removed-elsewhere" => {
+            let names = ["SANDISK".to_string(), "BACKUP".to_string()];
+            device_toast(ui, "warning", &crate::app::removed_text(&names), "", "");
+        }
+        "device-partition-unplug" => {
+            let names = ["SANDISK".to_string(), "BACKUP".to_string()];
+            device_toast(ui, "", &crate::app::unplug_text(&names), "", "");
+        }
+        "device-menu" => {
+            let item = |glyph: &str, label: &str, sep: bool| crate::MenuItem {
+                glyph: glyph.into(),
+                label: label.into(),
+                shortcut: "".into(),
+                danger: false,
+                sub: false,
+                sep,
+            };
+            ui.set_device_menu_items(ModelRc::new(Rc::new(VecModel::from(vec![
+                item("󰉋", "Open", false),
+                item("", "", true),
+                item("󰇪", "Eject", false),
+            ]))));
+            ui.set_menu_at_x(150.0);
+            ui.set_menu_at_y(312.0);
+        }
+        "device-unlock" | "device-unlock-wrong" => {
+            ui.set_unlock_name("SANDISK".into());
+            ui.set_unlock_text("••••••••••".into());
+            if view == "device-unlock-wrong" {
+                ui.set_unlock_error("Wrong passphrase. Try again.".into());
+            }
+        }
+        // The removed screen says it all; the toast is for a drive pulled
+        // while another folder is open (DESIGN §2).
+        "device-removed-elsewhere" => {
             ui.set_toast_on(true);
             ui.set_toast_tone("warning".into());
             ui.set_toast_glyph(crate::app::toast_glyph("warning").into());
-            ui.set_toast_text("SANDISK was removed while it was open".into());
+            ui.set_toast_text(crate::app::removed_text(&["SANDISK".to_string()]).into());
             ui.set_toast_action("".into());
             crate::app::set_toast_rows(ui, &crate::app::detail_rows(&[], false, false));
         }
