@@ -138,23 +138,56 @@ pub enum Ejected {
     Unmounted,
 }
 
-/// Unmount every mount of `id`, then power the drive off. A drive that
-/// can't power off is still safe to unplug once unmounted.
+/// Why an eject stopped: the step and the filesystem it stopped on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EjectError {
+    /// Unmounting `part` failed. A `Busy` here is a program holding that
+    /// filesystem, which a forced unmount can get past.
+    Unmount {
+        part: Box<Drive>,
+        error: DeviceError,
+    },
+    /// Every filesystem came off, but the drive wouldn't power off; a
+    /// forced unmount can't help with that.
+    PowerOff(DeviceError),
+}
+
+/// The filesystems on the same physical drive as `d` (itself included),
+/// in listing order. A filesystem with no drive behind it stands alone.
+pub fn partitions<'a>(all: &'a [Drive], d: &Drive) -> Vec<&'a Drive> {
+    if d.drive.is_empty() {
+        return all.iter().filter(|p| p.id == d.id).collect();
+    }
+    all.iter().filter(|p| p.drive == d.drive).collect()
+}
+
+/// Eject a whole drive: unmount every mounted filesystem on it in turn
+/// (stopping at the first that fails), then power the drive off. A drive
+/// that can't power off is still safe to unplug once unmounted. `parts`
+/// is [`partitions`] of the row that asked.
 pub fn eject(
     backend: &dyn DeviceBackend,
-    drive: &Drive,
+    parts: &[Drive],
     force: bool,
-) -> Result<Ejected, DeviceError> {
-    if drive.mounted().is_some() {
-        backend.unmount(&drive.id, force)?;
+) -> Result<Ejected, EjectError> {
+    for part in parts.iter().filter(|p| p.mounted().is_some()) {
+        backend
+            .unmount(&part.id, force)
+            .map_err(|error| EjectError::Unmount {
+                part: Box::new(part.clone()),
+                error,
+            })?;
     }
-    if !drive.can_power_off {
+    let Some(first) = parts.first() else {
+        return Ok(Ejected::Unmounted);
+    };
+    if !parts.iter().any(|p| p.can_power_off) {
         return Ok(Ejected::Unmounted);
     }
-    match backend.power_off(&drive.id) {
+    match backend.power_off(&first.id) {
         Ok(()) => Ok(Ejected::PoweredOff),
         Err(DeviceError::Unsupported) => Ok(Ejected::Unmounted),
-        Err(e) => Err(e),
+        Err(e) => Err(EjectError::PowerOff(e)),
     }
 }
 
@@ -669,11 +702,26 @@ impl DeviceBackend for FakeDevices {
 
     fn power_off(&self, id: &str) -> Result<(), DeviceError> {
         self.note(format!("power-off {id}"));
-        let can = self.get(id).is_some_and(|d| d.drive.can_power_off);
-        if !can {
+        let Some(me) = self.get(id) else {
+            return Err(DeviceError::Failed("No such device".into()));
+        };
+        if !me.drive.can_power_off {
             return Err(DeviceError::Unsupported);
         }
-        self.unplug(id);
+        // As UDisks2 does: the whole drive goes, so every filesystem on it
+        // must be unmounted first.
+        let on_drive: Vec<FakeDrive> = self
+            .lock()
+            .iter()
+            .filter(|d| d.drive.drive == me.drive.drive)
+            .cloned()
+            .collect();
+        if on_drive.iter().any(|d| d.drive.mounted().is_some()) {
+            return Err(DeviceError::Busy);
+        }
+        for d in on_drive {
+            self.unplug(&d.drive.id);
+        }
         Ok(())
     }
 
@@ -781,12 +829,19 @@ mod tests {
         fake.mount("sdb1").unwrap();
         fake.edit("sdb1", |d| d.busy = true);
         let drive = fake.drives().unwrap()[0].clone();
-        assert_eq!(eject(fake.as_ref(), &drive, false), Err(DeviceError::Busy));
+        let parts = std::slice::from_ref(&drive);
+        assert_eq!(
+            eject(fake.as_ref(), parts, false),
+            Err(EjectError::Unmount {
+                part: Box::new(drive.clone()),
+                error: DeviceError::Busy
+            })
+        );
         assert!(
             fake.drives().unwrap()[0].mounted().is_some(),
             "still mounted"
         );
-        assert_eq!(eject(fake.as_ref(), &drive, true), Ok(Ejected::PoweredOff));
+        assert_eq!(eject(fake.as_ref(), parts, true), Ok(Ejected::PoweredOff));
         assert!(fake.drives().unwrap().is_empty(), "powered off and gone");
         let log = fake.log.lock().unwrap().clone();
         assert_eq!(
@@ -801,6 +856,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// One stick, two partitions: A and B share the drive.
+    fn two_partitions(fake: &FakeDevices, root: &Path) {
+        let mut a = FakeDrive::stick("sdc1", "PART-A", 16 << 30, &root.join("PART-A"));
+        let mut b = FakeDrive::stick("sdc2", "PART-B", 16 << 30, &root.join("PART-B"));
+        a.drive.drive = "stick-drive".into();
+        b.drive.drive = "stick-drive".into();
+        fake.plug(a);
+        fake.plug(b);
+        fake.mount("sdc1").unwrap();
+        fake.mount("sdc2").unwrap();
+    }
+
+    #[test]
+    fn ejecting_one_partition_unmounts_both_then_powers_the_drive_off() {
+        let root = tmp("two-parts");
+        let fake = FakeDevices::new();
+        two_partitions(&fake, &root);
+        let all = fake.drives().unwrap();
+        let parts: Vec<Drive> = partitions(&all, &all[0]).into_iter().cloned().collect();
+        assert_eq!(parts.len(), 2, "A's row finds B on the same drive");
+        assert_eq!(eject(fake.as_ref(), &parts, false), Ok(Ejected::PoweredOff));
+        assert!(
+            fake.drives().unwrap().is_empty(),
+            "both gone with the drive"
+        );
+        let log = fake.log.lock().unwrap().clone();
+        assert_eq!(
+            log[2..],
+            ["unmount sdc1", "unmount sdc2", "power-off sdc1"],
+            "every filesystem comes off before the power-off"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_busy_sibling_stops_the_eject_and_names_itself() {
+        let root = tmp("two-parts-busy");
+        let fake = FakeDevices::new();
+        two_partitions(&fake, &root);
+        fake.edit("sdc2", |d| d.busy = true);
+        let all = fake.drives().unwrap();
+        let parts: Vec<Drive> = partitions(&all, &all[0]).into_iter().cloned().collect();
+        match eject(fake.as_ref(), &parts, false) {
+            Err(EjectError::Unmount { part, error }) => {
+                assert_eq!((part.id.as_str(), error), ("sdc2", DeviceError::Busy));
+            }
+            other => panic!("expected B's unmount to refuse, got {other:?}"),
+        }
+        assert_eq!(fake.drives().unwrap().len(), 2, "no power-off");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_power_off_refused_after_unmounting_is_not_a_holder() {
+        let root = tmp("two-parts-poweroff");
+        let fake = FakeDevices::new();
+        two_partitions(&fake, &root);
+        let all = fake.drives().unwrap();
+        // Only A asked: B stays mounted, so the drive can't go.
+        let only_a = vec![all[0].clone()];
+        assert_eq!(
+            eject(fake.as_ref(), &only_a, false),
+            Err(EjectError::PowerOff(DeviceError::Busy))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn a_drive_that_cannot_power_off_is_still_safe_once_unmounted() {
         let root = tmp("nopower");
@@ -810,7 +932,10 @@ mod tests {
         fake.plug(card);
         fake.mount("sdb1").unwrap();
         let drive = fake.drives().unwrap()[0].clone();
-        assert_eq!(eject(fake.as_ref(), &drive, false), Ok(Ejected::Unmounted));
+        assert_eq!(
+            eject(fake.as_ref(), std::slice::from_ref(&drive), false),
+            Ok(Ejected::Unmounted)
+        );
         let after = fake.drives().unwrap();
         assert_eq!(after.len(), 1, "the reader stays");
         assert!(after[0].mounted().is_none());

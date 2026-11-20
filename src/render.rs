@@ -66,6 +66,9 @@ pub fn scripted(view: &str) -> bool {
             | "devices-busy-other"
             | "devices-safe-unplug"
             | "devices-removed"
+            | "devices-removed-elsewhere"
+            | "devices-power-off"
+            | "devices-partition-busy"
             | "devices-unmounted"
             | "devices-no-space"
             | "devices-fat-too-big"
@@ -125,6 +128,11 @@ fn device_scene(
         app::land_reads();
         return Ok(());
     }
+    // The pointer on the unmounted row's eject button: "Power off".
+    if view == "devices-power-off" {
+        hover_at(ui, 209.0, 366.0);
+        return Ok(());
+    }
     let mount = |ui: &AppWindow| -> Result<()> {
         ui.invoke_place_open(1, device_row(ui, "SANDISK")?);
         app::land_reads();
@@ -156,6 +164,34 @@ fn device_scene(
             ));
             ui.invoke_place_eject(device_row(ui, "SANDISK")?);
         }
+        // A second partition on the same stick: a copy onto it blocks
+        // ejecting SANDISK, and the toast names BACKUP.
+        "devices-partition-busy" => {
+            let mut b = crate::devices::FakeDrive::stick(
+                "sda2",
+                "BACKUP",
+                32_000_000_000,
+                &root.join("media/sky/BACKUP"),
+            );
+            b.drive.drive = "sda1-drive".into();
+            fake.plug(b);
+            app::devices_poll();
+            app::land_reads();
+            ui.invoke_place_open(1, device_row(ui, "BACKUP")?);
+            app::land_reads();
+            back_home(ui);
+            app::hold_job(Job::new(
+                JobKind::Copy,
+                &home.join("Pictures"),
+                names(&[
+                    "dune-sunset-0412.jpg",
+                    "dune-sunset-0413.jpg",
+                    "speeder-run.mp4",
+                ]),
+                &root.join("media/sky/BACKUP"),
+            ));
+            ui.invoke_place_eject(device_row(ui, "SANDISK")?);
+        }
         "devices-busy-other" => {
             back_home(ui);
             *fake.holder.lock().unwrap_or_else(|e| e.into_inner()) = Some("vlc".into());
@@ -163,6 +199,12 @@ fn device_scene(
         }
         "devices-safe-unplug" => {
             ui.invoke_place_eject(device_row(ui, "SANDISK")?);
+            app::land_reads();
+        }
+        "devices-removed-elsewhere" => {
+            back_home(ui);
+            fake.unplug("sda1");
+            app::devices_poll();
             app::land_reads();
         }
         "devices-removed" => {
@@ -186,20 +228,32 @@ fn device_scene(
         }
         "devices-no-space" | "devices-fat-too-big" => {
             back_home(ui);
-            // Sparse: 7 GB on paper, nothing on disk. The fixture leaves
-            // SANDISK 6 GB free; FAT32 refuses it for size alone.
+            // Sparse: GBs on paper, nothing on disk. The fixture leaves
+            // SANDISK 6 GB free. FAT32 refuses two of these for size, so
+            // its details name both and say why.
             let src = home.join("Downloads");
-            let img = src.join("holo-archive.img");
-            let f = std::fs::File::create(&img).map_err(|e| Error::io(&img, e))?;
-            f.set_len(7_000_000_000).map_err(|e| Error::io(&img, e))?;
-            app::run_job(Job::new(
-                JobKind::Copy,
-                &src,
-                names(&["holo-archive.img"]),
-                &stick,
-            ));
+            let files: &[(&str, u64)] = if view == "devices-fat-too-big" {
+                &[
+                    ("holo-archive.img", 7_000_000_000),
+                    ("speeder-run-4k.mkv", 4_600_000_000),
+                    ("notes.txt", 2_000),
+                ]
+            } else {
+                &[("holo-archive.img", 7_000_000_000)]
+            };
+            for (n, len) in files {
+                let p = src.join(n);
+                let f = std::fs::File::create(&p).map_err(|e| Error::io(&p, e))?;
+                f.set_len(*len).map_err(|e| Error::io(&p, e))?;
+            }
+            let picked: Vec<&str> = files.iter().map(|(n, _)| *n).collect();
+            app::run_job(Job::new(JobKind::Copy, &src, names(&picked), &stick));
             app::land_reads();
-            let _ = std::fs::remove_file(&img);
+            // Open the details, as a click on the link would.
+            ui.invoke_toast_link();
+            for (n, _) in files {
+                let _ = std::fs::remove_file(src.join(n));
+            }
         }
         _ => {}
     }
@@ -602,6 +656,14 @@ fn seed_media(view: &str, home: &Path) -> Result<()> {
         saved.set(&clip, 134.0, CLIP_SECS);
     }
     Ok(())
+}
+
+/// Move the pointer to `(x, y)` in the window, for hover states.
+pub fn hover_at(ui: &AppWindow, x: f32, y: f32) {
+    ui.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(x, y),
+        });
 }
 
 /// Move the pointer over the transport's scrub track at `at` (0..1), so
