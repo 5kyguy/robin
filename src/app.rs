@@ -129,6 +129,9 @@ pub enum Action {
     Refuse(String),
     /// Reread the open folder off the UI thread.
     Reread,
+    /// Make a "New folder" in this folder on a worker: on a phone even
+    /// the name probe is a round trip over USB.
+    MakeFolder(PathBuf),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -311,6 +314,9 @@ pub struct Controller {
     ///
     /// [`DeviceBackend::pace`]: crate::devices::DeviceBackend::pace
     pub pacer: Option<Arc<dyn crate::devices::DeviceBackend>>,
+    /// A folder just made off the UI thread: selected when the reread
+    /// that lists it lands.
+    pub select_on_land: Option<std::ffi::OsString>,
 }
 
 /// The open folder's drive, gone from under it (DESIGN §3).
@@ -856,6 +862,7 @@ impl Controller {
             device_menu: None,
             devices: Vec::new(),
             pacer: None,
+            select_on_land: None,
         }
     }
 
@@ -1212,6 +1219,11 @@ impl Controller {
                 }
                 self.apply_snapshot(snap);
                 self.prune_viewer();
+                if let Some(name) = self.select_on_land.take() {
+                    if self.listing.entries().iter().any(|e| e.name == name) {
+                        self.listing.select_only(name);
+                    }
+                }
                 Landed::Shown { moved: false }
             }
             Err(e) => Landed::Failed(e),
@@ -1370,29 +1382,14 @@ impl Controller {
         if let Some(why) = limits.write {
             return Action::Refuse(why);
         }
-        let name = (1..1000)
-            .map(|n| {
-                if n == 1 {
-                    "New folder".to_string()
-                } else {
-                    format!("New folder {n}")
-                }
-            })
-            .find(|n| self.dir.join(n).symlink_metadata().is_err());
-        let Some(name) = name else {
+        // On a phone, or any gvfs path, every probe and the mkdir are
+        // round trips over USB: all of it goes to a worker.
+        if limits.slow {
+            return Action::MakeFolder(self.dir.clone());
+        }
+        let Ok(name) = make_folder(&self.dir) else {
             return Action::None;
         };
-        let made = DirFd::open(&self.dir).and_then(|fd| {
-            rustix::fs::mkdirat(fd.as_fd(), name.as_str(), rustix::fs::Mode::from(0o777))
-                .map_err(|e| Error::io(self.dir.join(&name), std::io::Error::from(e)))
-        });
-        if made.is_err() {
-            return Action::None;
-        }
-        // On a phone the reread is a listing over USB: off the UI thread.
-        if limits.slow {
-            return Action::Reread;
-        }
         let _ = self.refresh();
         self.listing.select_only(name.into());
         Action::Redraw
@@ -3779,6 +3776,7 @@ fn retry_landed(
     empty: bool,
 ) {
     st.borrow_mut().dev.busy.remove(id);
+    let kind = drive_by_id(&st.borrow().dev, id).map_or(crate::devices::Kind::Phone, |d| d.kind);
     relist(ui, st);
     match got {
         Ok(at) => {
@@ -3797,7 +3795,7 @@ fn retry_landed(
                     ui,
                     st,
                     "info",
-                    still_waiting_text(name),
+                    still_waiting_text(name, kind),
                     Vec::new(),
                     false,
                     "",
@@ -3810,7 +3808,7 @@ fn retry_landed(
                 ui,
                 st,
                 "info",
-                still_waiting_text(name),
+                still_waiting_text(name, kind),
                 Vec::new(),
                 false,
                 "",
@@ -3828,9 +3826,13 @@ fn retry_landed(
     }
 }
 
-/// The toast after a [Retry] that found the phone still locked.
-pub fn still_waiting_text(name: &str) -> String {
-    format!("{name} still hasn't allowed file access")
+/// The toast after a [Retry] that found the phone still locked, or the
+/// camera still off or not in PTP mode.
+pub fn still_waiting_text(name: &str, kind: crate::devices::Kind) -> String {
+    match kind {
+        crate::devices::Kind::Camera => format!("{name} still isn't ready"),
+        _ => format!("{name} still hasn't allowed file access"),
+    }
 }
 
 /// What a copy onto a drive is checked against before it starts: the
@@ -6169,14 +6171,14 @@ fn draw_pane_state(ui: &AppWindow, s: &State) {
         .filter(|k| *k != crate::devices::Kind::Drive)
         .map_or("", |k| k.glyph());
     ui.set_state_glyph(glyph.into());
-    let waiting = |name: &str| {
+    let waiting = |name: &str, kind: crate::devices::Kind| {
         ui.set_state_title(name.into());
-        ui.set_state_note(PHONE_WAITING.into());
+        ui.set_state_note(waiting_note(kind, name).into());
         ui.set_state("phone-waiting".into());
     };
     if state == "phone-waiting" {
         if let Some(g) = &s.ctl.gone {
-            waiting(&g.name);
+            waiting(&g.name, g.kind);
         }
         return;
     }
@@ -6186,8 +6188,8 @@ fn draw_pane_state(ui: &AppWindow, s: &State) {
     }
     // A phone's top folder lists its storages; empty, it hasn't allowed
     // access yet.
-    if let Some(name) = waiting_phone(s) {
-        waiting(&name);
+    if let Some((name, kind)) = waiting_media(s) {
+        waiting(&name, kind);
         return;
     }
     if let Some(name) = read_only_drive(s) {
@@ -6206,6 +6208,83 @@ fn draw_pane_state(ui: &AppWindow, s: &State) {
     ui.set_state(state.into());
 }
 
+/// Make "New folder" (or "New folder 2", …) in `dir` and return its
+/// name. Blocking: on a phone it runs on a worker.
+pub fn make_folder(dir: &Path) -> Result<String> {
+    let name = (1..1000)
+        .map(|n| {
+            if n == 1 {
+                "New folder".to_string()
+            } else {
+                format!("New folder {n}")
+            }
+        })
+        .find(|n| dir.join(n).symlink_metadata().is_err())
+        .ok_or_else(|| Error::Message("too many folders named New folder".into()))?;
+    let fd = DirFd::open(dir)?;
+    rustix::fs::mkdirat(fd.as_fd(), name.as_str(), rustix::fs::Mode::from(0o777))
+        .map_err(|e| Error::io(dir.join(&name), std::io::Error::from(e)))?;
+    Ok(name)
+}
+
+/// The danger toast for a New folder that failed on a worker.
+pub fn make_folder_failed_text(dir: &Path, e: &Error) -> String {
+    let at = dir.file_name().map_or_else(
+        || dir.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    format!("Couldn't create a folder in {at}: {e}")
+}
+
+/// New folder off the UI thread: mkdir on a worker, then a reread that
+/// selects it, or a toast saying why not.
+fn make_folder_async(ui: &AppWindow, st: &Shared, dir: PathBuf) {
+    let at = dir.clone();
+    run_device(
+        ui,
+        st,
+        move || make_folder(&at),
+        move |ui, st, made| match made {
+            Ok(name) => {
+                let ticket = {
+                    let mut s = st.borrow_mut();
+                    if s.ctl.dir != dir {
+                        return;
+                    }
+                    s.ctl.select_on_land = Some(name.into());
+                    s.ctl.begin_refresh()
+                };
+                start_read(ticket);
+                let _ = ui;
+            }
+            Err(e) => show_toast(
+                ui,
+                st,
+                "danger",
+                make_folder_failed_text(&dir, &e),
+                Vec::new(),
+                false,
+                "",
+            ),
+        },
+    );
+}
+
+/// The no-trash confirm's note. On a phone or camera it names the device
+/// and says what deleting there means; a drive keeps #41's note.
+pub fn trash_no_note(ctl: &Controller) -> String {
+    match crate::devices::device_of(&ctl.devices, &ctl.dir) {
+        Some(d) if d.media() => format!("Files deleted on {} can't be recovered", d.name()),
+        _ if crate::devices::gvfs_media_root(&ctl.dir).is_some() => {
+            "Files deleted on this phone can't be recovered".into()
+        }
+        _ => TRASH_NO_NOTE.into(),
+    }
+}
+
+/// The no-trash confirm's note on a drive.
+pub const TRASH_NO_NOTE: &str = "Robin will not copy these files home.";
+
 /// The no-trash confirm's title: a phone's, a camera's, or a drive's.
 pub fn trash_no_title(ctl: &Controller) -> &'static str {
     match crate::devices::device_of(&ctl.devices, &ctl.dir).map(|d| d.kind) {
@@ -6219,13 +6298,22 @@ pub fn trash_no_title(ctl: &Controller) -> &'static str {
 /// The note under a phone that waits for access (DESIGN §3).
 pub const PHONE_WAITING: &str = "Unlock your phone and allow file access";
 
+/// The waiting state's note: a phone waits for Allow, a camera to be
+/// switched on in PTP mode.
+pub fn waiting_note(kind: crate::devices::Kind, name: &str) -> String {
+    match kind {
+        crate::devices::Kind::Camera => format!("Turn on {name} and set its USB mode to PTP"),
+        _ => PHONE_WAITING.into(),
+    }
+}
+
 /// The phone whose (empty) top folder is open.
-fn waiting_phone(s: &State) -> Option<String> {
+fn waiting_media(s: &State) -> Option<(String, crate::devices::Kind)> {
     s.side
         .devices
         .iter()
-        .find(|e| e.kind == crate::devices::Kind::Phone && e.mounted && e.path == s.ctl.dir)
-        .map(|e| e.name.clone())
+        .find(|e| e.kind.slow() && e.mounted && e.path == s.ctl.dir)
+        .map(|e| (e.name.clone(), e.kind))
 }
 
 /// The name of the read-only drive the open folder is on, if it is.
@@ -6373,6 +6461,7 @@ fn redraw(ui: &AppWindow, s: &State) {
                 }
                 Dialog::Trash(names) | Dialog::TrashNo(names) | Dialog::Delete(names) => {
                     ui.set_trash_no_title(trash_no_title(ctl).into());
+                    ui.set_trash_no_note(trash_no_note(ctl).into());
                     ui.set_confirm_noun(noun(names).into());
                     ui.set_confirm_names(names_text(names).into());
                     ui.set_confirm_names_count(names.len().min(6) as i32);
@@ -6475,6 +6564,7 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
             let ticket = st.borrow_mut().ctl.begin_refresh();
             start_read(ticket);
         }
+        Action::MakeFolder(dir) => make_folder_async(ui, st, dir),
         Action::Answer(choice) => {
             if let Some(tx) = st.borrow_mut().reply.take() {
                 let _ = tx.send(choice);
@@ -10099,13 +10189,14 @@ mod tests {
             "never a trash on the phone"
         );
         assert_eq!(trash_no_title(&c), "This phone has no trash");
-        assert!(
-            matches!(c.new_folder(), Action::Reread),
-            "made, then reread off the UI thread"
+        assert_eq!(
+            trash_no_note(&c),
+            "Files deleted on Pixel 8 can't be recovered"
         );
         let pics = c.env.home.clone().unwrap().join("Pictures");
         go(&mut c, pics);
         assert_eq!(trash_no_title(&c), "This drive has no trash");
+        assert_eq!(trash_no_note(&c), TRASH_NO_NOTE);
         let _ = fs::remove_dir_all(c.env.home.unwrap());
     }
 
@@ -10124,6 +10215,41 @@ mod tests {
         c.land(read);
         assert_eq!(c.dir, dcim);
         assert!(c.counts.is_empty(), "Camera stays blank, never 0");
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn new_folder_on_a_phone_is_made_off_the_ui_thread_then_selected() {
+        let delay = std::time::Duration::from_millis(80);
+        let (mut c, at) = on_phone("phone-mkdir", Some(delay));
+        let dcim = at.join("Internal shared storage/DCIM");
+        go(&mut c, dcim.clone());
+        let t = std::time::Instant::now();
+        let action = c.new_folder();
+        assert!(t.elapsed() < delay, "no round trip on the UI thread");
+        assert_eq!(action, Action::MakeFolder(dcim.clone()));
+        assert!(
+            !dcim.join("New folder").exists(),
+            "nothing made on the UI thread"
+        );
+        // What the worker does, then the reread it starts.
+        assert_eq!(make_folder(&dcim).unwrap(), "New folder");
+        assert_eq!(make_folder(&dcim).unwrap(), "New folder 2");
+        c.select_on_land = Some("New folder 2".into());
+        let ticket = c.begin_refresh().expect("a reread");
+        c.land(ticket.perform());
+        assert_eq!(c.names(), [std::ffi::OsString::from("New folder 2")]);
+        // A phone that went away: the toast says where and why.
+        let gone = dcim.join("missing");
+        let e = make_folder(&gone).unwrap_err();
+        assert!(
+            make_folder_failed_text(&gone, &e).starts_with("Couldn't create a folder in missing: "),
+            "{e}"
+        );
+        // Off a phone it stays synchronous and selects at once.
+        let pics = c.env.home.clone().unwrap().join("Pictures");
+        go(&mut c, pics);
+        assert_eq!(c.new_folder(), Action::Redraw);
         let _ = fs::remove_dir_all(c.env.home.unwrap());
     }
 }

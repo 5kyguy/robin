@@ -77,6 +77,9 @@ pub fn scripted(view: &str) -> bool {
             | "phones-removed"
             | "phones-removed-elsewhere"
             | "phones-menu"
+            | "phones-camera-waiting"
+            | "phones-camera-still-waiting"
+            | "phones-new-folder"
             | "devices-mounted"
             | "devices-read-only"
             | "devices-busy-copy"
@@ -201,6 +204,26 @@ fn phone_scene(
             ui.invoke_place_menu(device_row(ui, "Pixel 8")?, 150.0, 380.0);
             return Ok(());
         }
+        "phones-camera-waiting" | "phones-camera-still-waiting" => {
+            ui.invoke_place_open(1, device_row(ui, "Canon EOS R6")?);
+            app::land_reads();
+            check("camera state", ui.get_state().to_string(), "phone-waiting")?;
+            check(
+                "camera note",
+                ui.get_state_note().to_string(),
+                "Turn on Canon EOS R6 and set its USB mode to PTP",
+            )?;
+            if view == "phones-camera-still-waiting" {
+                app::press_state("retry");
+                app::land_reads();
+                check(
+                    "camera retry toast",
+                    ui.get_toast_text().to_string(),
+                    "Canon EOS R6 still isn't ready",
+                )?;
+            }
+            return Ok(());
+        }
         _ => {}
     }
     // Every other scene opens the phone with a click on its row.
@@ -224,7 +247,7 @@ fn phone_scene(
                 check(
                     "retry toast",
                     ui.get_toast_text().to_string(),
-                    &app::still_waiting_text("Pixel 8"),
+                    &app::still_waiting_text("Pixel 8", crate::devices::Kind::Phone),
                 )?;
             }
             // Allow tapped on the phone, then [Retry]: its storages list.
@@ -250,6 +273,30 @@ fn phone_scene(
         "phones-storage" => {
             app::go(dcim.clone());
             app::land_reads();
+            check(
+                "storage free space",
+                ui.get_status_right().to_string(),
+                "12 GB free of 128 GB",
+            )?;
+        }
+        // Made on a worker, then the reread lists it selected.
+        // From an empty folder's [New folder]: made on a worker, then the
+        // reread lists it selected.
+        "phones-new-folder" => {
+            let camera = dcim.join("Camera");
+            app::go(camera.clone());
+            app::land_reads();
+            check("empty first", ui.get_state().to_string(), "empty")?;
+            app::press_state("new-folder");
+            app::land_reads();
+            if !camera.join("New folder").is_dir() {
+                return Err(Error::Message("New folder wasn't made on the phone".into()));
+            }
+            check("listed", ui.get_state().to_string(), "files")?;
+            crate::fixture::freeze_times(&camera, FIXTURE_MTIME)?;
+            app::go(camera.clone());
+            app::land_reads();
+            select_row(ui, "New folder");
         }
         // A slow listing: the pane shows it is reading while the UI keeps
         // running (the read is on its own thread in the app).
@@ -287,6 +334,11 @@ fn phone_scene(
                 "trash title",
                 ui.get_trash_no_title().to_string(),
                 "This phone has no trash",
+            )?;
+            check(
+                "trash note",
+                ui.get_trash_no_note().to_string(),
+                "Files deleted on Pixel 8 can't be recovered",
             )?;
         }
         "phones-copying" => {
@@ -762,6 +814,14 @@ fn paint_in(
         crate::fixture::freeze_times(root, FIXTURE_MTIME)?;
     }
     let mut mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(root))?;
+    // What gvfs says of the Pixel's internal storage (statfs per storage).
+    if view.starts_with("phones-") {
+        mounts = mounts.with_space(
+            &pixel_mount(root).join("Internal shared storage"),
+            128_000_000_000,
+            12_000_000_000,
+        );
+    }
     // The device scenes plug SANDISK in through the fake backend instead.
     let fake = crate::devices::FakeDevices::new();
     let devices = view.starts_with("devices-").then(|| {
@@ -776,14 +836,17 @@ fn paint_in(
             if view != "phones-plugged" {
                 fake.plug(pixel(root, view));
             }
-            if view == "phones-row" {
-                let mut cam = crate::devices::FakeDrive::phone(
+            if matches!(
+                view,
+                "phones-row" | "phones-camera-waiting" | "phones-camera-still-waiting"
+            ) {
+                let mut cam = crate::devices::FakeDrive::camera(
                     "eos",
                     "Canon EOS R6",
                     &root.join("run/user/1000/gvfs/gphoto2:host=Canon_Inc._Canon_Digital_Camera"),
                 );
-                cam.drive.kind = crate::devices::Kind::Camera;
-                cam.drive.fs_type = "gphoto2".into();
+                // Off, or in mass-storage mode: it lists nothing yet.
+                cam.locked = view != "phones-row";
                 fake.plug(cam);
             }
             fake.clone() as Arc<dyn crate::devices::DeviceBackend>

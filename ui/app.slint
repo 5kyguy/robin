@@ -1014,6 +1014,7 @@ export component AppWindow inherits Window {
     in property <string> confirm-noun: "3 items";
     // The no-trash confirm's title: a drive's, or a phone's.
     in property <string> trash-no-title: "This drive has no trash";
+    in property <string> trash-no-note: "Robin will not copy these files home.";
     // A phone's or camera's glyph for its read-only and waiting states;
     // empty elsewhere, where the state's own glyph shows.
     in property <string> state-glyph: "";
@@ -2092,7 +2093,7 @@ export component AppWindow inherits Window {
                     overflow: elide;
                 }
                 Text {
-                    text: overlay == "delete" ? "This can't be undone." : overlay == "trash-no" ? "Robin will not copy these files home." : "You can restore them from Trash.";
+                    text: overlay == "delete" ? "This can't be undone." : overlay == "trash-no" ? trash-no-note : "You can restore them from Trash.";
                     font-size: 12px;
                     color: muted;
                     overflow: elide;

@@ -150,7 +150,12 @@ pub fn gio_error(stderr: &str) -> DeviceError {
     .trim()
     .to_string();
     let low = msg.to_lowercase();
-    if low.contains("unable to open mtp device") || low.contains("unable to connect to mtp device")
+    // A locked phone, or one where Allow wasn't tapped; a camera that is
+    // off, asleep or not in PTP mode fails gvfs-gphoto2's setup the same way.
+    if low.contains("unable to open mtp device")
+        || low.contains("unable to connect to mtp device")
+        || low.contains("error initializing camera")
+        || low.contains("error setting up camera communications port")
     {
         DeviceError::Locked
     } else if low.contains("busy") {
@@ -307,7 +312,7 @@ pub fn drives_from_volumes(
         .filter(|v| uri_host(&v.uri).is_some())
         .map(|v| {
             let at = fuse_dir_for(&v.uri, fuse_names).map(|n| fuse_root.join(n));
-            let waiting = kind == Kind::Phone && at.as_deref().is_some_and(&empty);
+            let waiting = kind.slow() && at.as_deref().is_some_and(&empty);
             Drive {
                 id: format!("{ID_PREFIX}{}", v.uri),
                 drive: String::new(),
@@ -559,7 +564,10 @@ mod tests {
         assert!(d[1].mounted().is_none() && !d[1].waiting);
         assert!(!d[0].can_power_off && d[0].drive.is_empty());
         let cams = drives_from_volumes(Kind::Camera, &vols, root, &names, |_| true);
-        assert!(!cams[0].waiting, "only phones wait for access");
+        assert!(
+            cams[0].waiting && cams[0].kind == Kind::Camera,
+            "a camera that opens empty waits too (off, or not in PTP mode)"
+        );
     }
 
     #[test]
@@ -567,6 +575,11 @@ mod tests {
         assert_eq!(
             gio_error("gio: mtp://Google_Pixel_8_X/: Unable to open MTP device “001,012”\n"),
             DeviceError::Locked
+        );
+        assert_eq!(
+            gio_error("gio: gphoto2://Canon/: Error initializing camera: -7: I/O problem"),
+            DeviceError::Locked,
+            "a camera that isn't on or in PTP mode waits too"
         );
         assert_eq!(
             gio_error("gio: mtp://X/: Device or resource busy"),

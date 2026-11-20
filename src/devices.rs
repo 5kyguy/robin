@@ -886,6 +886,17 @@ impl FakeDrive {
         p
     }
 
+    /// A camera over PTP (gvfs's gPhoto2 monitor), unmounted, with one
+    /// card. Like a phone it waits while `locked` (off, or not in PTP mode).
+    pub fn camera(id: &str, name: &str, mount_at: &Path) -> Self {
+        let mut c = Self::phone(id, name, mount_at);
+        c.drive.device = format!("gphoto2://fake-{id}/");
+        c.drive.fs_type = "gphoto2".into();
+        c.drive.kind = Kind::Camera;
+        c.storages = vec!["store_00010001".into()];
+        c
+    }
+
     fn make_storages(&self) {
         for s in &self.storages {
             let _ = std::fs::create_dir_all(self.mount_at.join(s));

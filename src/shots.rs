@@ -65,6 +65,7 @@ pub fn known(view: &str) -> bool {
             | "phone-no-trash"
             | "phone-busy-copy"
             | "phone-safe-unplug"
+            | "camera-waiting"
             | "device-read-only-empty"
             | "device-removed-elsewhere"
             | "device-power-off"
@@ -162,7 +163,7 @@ fn scene_state(view: &str) -> &'static str {
         "permission-denied" => "denied",
         "device-unmounted" => "unmounted",
         "device-ejected" => "ejected",
-        "phone-waiting" | "phone-still-waiting" => "phone-waiting",
+        "phone-waiting" | "phone-still-waiting" | "camera-waiting" => "phone-waiting",
         "device-read-only-empty" | "phone-no-write" => "read-only",
         "search-no-results" => "nosearch",
         _ => "files",
@@ -236,9 +237,12 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "phone-no-write" => "Pixel 8  ›  …  ›  Android  ›  data".into(),
             _ => "Pixel 8  ›  Internal shared storage  ›  DCIM".into(),
         });
-        // A phone's free space isn't read: every call crosses USB.
-        ui.set_status_right("".into());
-        ui.set_status_free_short("".into());
+        // Inside a storage: that storage's free space, from gvfs.
+        ui.set_status_right("12 GB free of 128 GB".into());
+        ui.set_status_free_short("12 GB free".into());
+    }
+    if view == "camera-waiting" {
+        ui.set_crumbs("Canon EOS R6".into());
     }
     if view == "device-read-only-empty" {
         ui.set_crumbs("SANDISK".into());
@@ -279,6 +283,17 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             ui.set_state_note("Unlock your phone and allow file access".into());
             ui.set_status_left("".into());
             ui.set_status_right("".into());
+            ui.set_status_free_short("".into());
+        }
+        "camera-waiting" => {
+            ui.set_state_title("Canon EOS R6".into());
+            ui.set_state_note(
+                crate::app::waiting_note(crate::devices::Kind::Camera, "Canon EOS R6").into(),
+            );
+            ui.set_state_glyph(crate::devices::Kind::Camera.glyph().into());
+            ui.set_status_left("".into());
+            ui.set_status_right("".into());
+            ui.set_status_free_short("".into());
         }
         _ => {}
     }
@@ -586,6 +601,7 @@ fn open_folder(view: &str) -> &'static str {
         "empty-folder" => "~/Pictures/empty",
         "start-denied" => "~/secret",
         v if v.starts_with("phone-") => "Pixel 8",
+        "camera-waiting" => "Canon EOS R6",
         "device-read-only-empty" => "SANDISK",
         _ => "~/Pictures",
     }
@@ -766,6 +782,28 @@ fn places(view: &str) -> Vec<Place> {
         for (i, p) in add.into_iter().enumerate() {
             rows.insert(at + i, p);
         }
+    }
+    // A camera that isn't on or in PTP mode: its row, muted and open.
+    if view == "camera-waiting" {
+        let at = rows
+            .iter()
+            .position(|r| r.section == 2)
+            .unwrap_or(rows.len());
+        rows.insert(
+            at,
+            Place {
+                glyph: crate::devices::Kind::Camera.glyph().into(),
+                name: "Canon EOS R6".into(),
+                count: "".into(),
+                selected: true,
+                usage: -1.0,
+                level: 0,
+                section: 1,
+                dim: true,
+                eject: true,
+                pill: "".into(),
+            },
+        );
     }
     let pinned: Vec<&'static str> = [
         "Home",
@@ -1338,7 +1376,7 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
             device_toast(
                 ui,
                 "info",
-                &crate::app::still_waiting_text("Pixel 8"),
+                &crate::app::still_waiting_text("Pixel 8", crate::devices::Kind::Phone),
                 "",
                 "",
             );
@@ -1371,6 +1409,7 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
         }
         "phone-no-trash" => {
             ui.set_trash_no_title("This phone has no trash".into());
+            ui.set_trash_no_note("Files deleted on Pixel 8 can't be recovered".into());
         }
         "device-busy-copy" => {
             ui.set_job_on(true);

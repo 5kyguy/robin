@@ -88,6 +88,9 @@ fn scripted_views_render_through_the_real_app() {
         ("phones-removed", 800),
         ("phones-removed-elsewhere", 800),
         ("phones-menu", 800),
+        ("phones-camera-waiting", 800),
+        ("phones-camera-still-waiting", 800),
+        ("phones-new-folder", 800),
         // The 480px floor: the info panel floats, the filmstrip is cut
         // to the window, and the statistics cards stack.
         ("view-info", 480),
