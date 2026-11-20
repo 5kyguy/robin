@@ -1012,6 +1012,11 @@ export component AppWindow inherits Window {
     // The danger button unlocks 600ms after the delete dialog opens.
     in property <bool> danger-armed: false;
     in property <string> confirm-noun: "3 items";
+    // The no-trash confirm's title: a drive's, or a phone's.
+    in property <string> trash-no-title: "This drive has no trash";
+    // A phone's or camera's glyph for its read-only and waiting states;
+    // empty elsewhere, where the state's own glyph shows.
+    in property <string> state-glyph: "";
     // Lines in confirm-names, at most six: five names and "and N more".
     in property <int> confirm-names-count: 3;
     in property <string> confirm-names: "dune-sunset-0412.jpg\ndune-sunset-0413.jpg\nspeeder-run.mp4";
@@ -1730,7 +1735,7 @@ export component AppWindow inherits Window {
                     alignment: center;
                     width: parent.width;
                     Text {
-                        text: state == "empty" ? "󰉖" : state == "trash-empty" ? "󰩺" : state == "denied" ? "󰌾" : state == "nosearch" ? "󰍉" : state == "phone-waiting" ? "󰄜" : "󰕓";
+                        text: state-glyph != "" && (state == "read-only" || state == "phone-waiting" || state == "ejected" || state == "unmounted") ? state-glyph : state == "empty" ? "󰉖" : state == "trash-empty" ? "󰩺" : state == "denied" ? "󰌾" : state == "nosearch" ? "󰍉" : state == "phone-waiting" ? "󰄜" : "󰕓";
                         font-size: 64px;
                         color: state == "denied" || state == "ejected" ? warning.with-alpha(0.6) : muted.with-alpha(0.6);
                         horizontal-alignment: center;
@@ -2077,7 +2082,7 @@ export component AppWindow inherits Window {
                 if overlay == "trash-no": HorizontalLayout {
                     spacing: 8px;
                     Text { text: "󰀦"; width: 20px; height: 20px; font-size: 20px; color: warning; horizontal-alignment: center; vertical-alignment: center; }
-                    Text { text: "This drive has no trash"; font-size: 13px; font-weight: 700; color: text; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
+                    Text { text: trash-no-title; font-size: 13px; font-weight: 700; color: text; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
                 }
                 if overlay == "trash": Text {
                     text: "Move \{confirm-noun} to trash?";

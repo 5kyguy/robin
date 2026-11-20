@@ -200,6 +200,12 @@ pub struct CopyOpts<'a> {
     pub cancel: &'a Cancel,
     pub policy: &'a mut ConflictPolicy,
     pub ask: &'a mut dyn FnMut(&ConflictPrompt) -> Result<ConflictChoice>,
+    /// The destination is a phone or camera (MTP/PTP through gvfs): it
+    /// keeps no modes, times or xattrs, and a rename there may be a whole
+    /// re-upload or unsupported, so files are written straight to their
+    /// final name (removed again on failure or Cancel) and metadata is
+    /// left alone.
+    pub plain: bool,
 }
 
 pub fn create_file(parent: &DirFd, name: &std::ffi::OsStr) -> Result<()> {
@@ -344,6 +350,9 @@ pub fn copy_file(
     else {
         return Ok(CopyOutcome::Skipped);
     };
+    if opts.plain {
+        return copy_plain(src, from, dest_parent, &dest_name, replace, opts);
+    }
     let to_c = component(dest_name.as_os_str())?;
     let tmp_name = partial_name();
     let tmp = std::ffi::OsString::from(&tmp_name);
@@ -415,6 +424,71 @@ pub fn copy_file(
     }
     guard.live = false;
     Ok(CopyOutcome::Copied)
+}
+
+/// [`copy_file`] onto a phone: stream into the final name, which is
+/// unlinked again if anything fails or Cancel lands, and set no metadata
+/// (gvfs-mtp refuses chmod and utimens). A Replace removes the old file
+/// first, since MTP can't overwrite in place.
+fn copy_plain(
+    src: rustix::fd::OwnedFd,
+    from: &std::ffi::OsStr,
+    dest_parent: &DirFd,
+    dest_name: &std::ffi::OsStr,
+    replace: bool,
+    opts: &mut CopyOpts<'_>,
+) -> Result<CopyOutcome> {
+    let to_c = component(dest_name)?;
+    if replace {
+        match rustix::fs::unlinkat(dest_parent.as_fd(), to_c.as_c_str(), AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => {}
+            Err(e) => return Err(Error::from_errno(dest_name, e)),
+        }
+    }
+    let dest = rustix::fs::openat(
+        dest_parent.as_fd(),
+        to_c.as_c_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    )
+    .map_err(|e| Error::from_errno(dest_name, e))?;
+    let mut guard = UnlinkOnDrop {
+        dir: dest_parent.as_fd(),
+        name: to_c,
+        live: true,
+    };
+    let mut input = File::from(src);
+    let mut output = File::from(dest);
+    // Big reads: every write is a round trip to the phone.
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        if opts.cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let n = input.read(&mut buf).map_err(|e| Error::io(from, e))?;
+        if n == 0 {
+            break;
+        }
+        output
+            .write_all(&buf[..n])
+            .map_err(|e| Error::io(dest_name, e))?;
+        opts.cancel.note_written(n as u64);
+    }
+    // gvfs uploads the file when it is closed: that is where a full or
+    // vanished phone shows up.
+    let _ = output.sync_all();
+    let fd: rustix::fd::OwnedFd = output.into();
+    drop(fd);
+    guard.live = false;
+    Ok(CopyOutcome::Copied)
+}
+
+/// fsync a folder, except on a phone, where gvfs may not implement it.
+fn sync_dir(dir: &DirFd, plain: bool, name: &std::ffi::OsStr) -> Result<()> {
+    match rustix::fs::fsync(dir.as_fd()) {
+        Err(_) if plain => Ok(()),
+        r => r.map_err(|e| Error::from_errno(name, e)),
+    }
 }
 
 pub struct MoveOpts<'a> {
@@ -1014,7 +1088,7 @@ fn move_entry(
             if copy_file(parent, from, dest_parent, to, &mut opts.copy)? == CopyOutcome::Skipped {
                 return Ok(CopyOutcome::Skipped);
             }
-            rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(to, e))?;
+            sync_dir(dest_parent, opts.copy.plain, to)?;
             if opts.fail_before_unlink {
                 return Err(Error::Message(
                     "injected failure before unlinking the source".into(),
@@ -1152,7 +1226,7 @@ fn move_directory(
             });
         }
         let gone = remove_copied(parent, rel, copied, root_dev, opts)?;
-        rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(to, e))?;
+        sync_dir(dest_parent, opts.copy.plain, to)?;
         if !gone {
             return Ok(CopyOutcome::Skipped);
         }
@@ -1405,13 +1479,14 @@ fn move_directory_inner(
             return children.map(|_| CopyOutcome::Skipped);
         }
     }
-    if created {
+    // A phone keeps no folder modes or times.
+    if created && !opts.copy.plain {
         rustix::fs::fchmod(dst.as_fd(), Mode::from_raw_mode(stat.st_mode & 0o777))
             .map_err(|e| Error::from_errno(&dest_name, e))?;
         set_times(dst.as_fd(), &stat).map_err(|e| Error::from_errno(&dest_name, e))?;
     }
     children?;
-    rustix::fs::fsync(dst.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
+    sync_dir(&dst, opts.copy.plain, &dest_name)?;
     if !all_copied {
         return Ok(CopyOutcome::Skipped);
     }
@@ -1423,7 +1498,7 @@ fn move_directory_inner(
             .report
             .keep(parent, from, rel, Error::from_errno(from, e));
     }
-    rustix::fs::fsync(dest_parent.as_fd()).map_err(|e| Error::from_errno(&dest_name, e))?;
+    sync_dir(dest_parent, opts.copy.plain, &dest_name)?;
     Ok(CopyOutcome::Copied)
 }
 
@@ -1680,6 +1755,7 @@ pub fn restore_across(
                 cancel: &cancel,
                 policy: &mut policy,
                 ask: &mut never,
+                plain: false,
             },
             report: TransferReport::default(),
             check_removable: false,
@@ -2739,7 +2815,65 @@ mod tests {
             cancel,
             policy,
             ask,
+            plain: false,
         }
+    }
+
+    fn plain_copy(root: &Path, cancel: &Cancel, replace: bool) -> Result<CopyOutcome> {
+        let dir = DirFd::open(root).unwrap();
+        let mut policy = ConflictPolicy::new();
+        let mut ask = |_: &ConflictPrompt| {
+            Ok(ConflictChoice {
+                action: if replace {
+                    Conflict::Replace
+                } else {
+                    Conflict::Skip
+                },
+                apply_all: false,
+            })
+        };
+        let mut o = opts(cancel, &mut policy, &mut ask);
+        o.plain = true;
+        copy_file(
+            &dir,
+            std::ffi::OsStr::new("photo.jpg"),
+            &DirFd::open(&root.join("phone")).unwrap(),
+            std::ffi::OsStr::new("photo.jpg"),
+            &mut o,
+        )
+    }
+
+    #[test]
+    fn a_plain_copy_writes_the_final_name_and_leaves_no_partial() {
+        let root = scratch("plain-copy");
+        std::fs::create_dir_all(root.join("phone")).unwrap();
+        let body = vec![7u8; 3 << 20];
+        std::fs::write(root.join("photo.jpg"), &body).unwrap();
+        let out = plain_copy(&root, &Cancel::new(), false).unwrap();
+        assert_eq!(out, CopyOutcome::Copied);
+        assert_eq!(std::fs::read(root.join("phone/photo.jpg")).unwrap(), body);
+        assert_eq!(walk(&root.join("phone")), ["photo.jpg"], "no partial file");
+        // Replace: the old file goes first, as a phone can't rename over it.
+        std::fs::write(root.join("photo.jpg"), b"new").unwrap();
+        plain_copy(&root, &Cancel::new(), true).unwrap();
+        assert_eq!(std::fs::read(root.join("phone/photo.jpg")).unwrap(), b"new");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cancelling_a_plain_copy_removes_the_half_written_file() {
+        let root = scratch("plain-cancel");
+        std::fs::create_dir_all(root.join("phone")).unwrap();
+        std::fs::write(root.join("photo.jpg"), vec![7u8; 3 << 20]).unwrap();
+        let cancel = Cancel::new();
+        cancel.stop_after_bytes(1 << 20);
+        let out = plain_copy(&root, &cancel, false);
+        assert!(matches!(out, Err(Error::Cancelled)), "{out:?}");
+        assert!(
+            walk(&root.join("phone")).is_empty(),
+            "nothing half-copied left"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -4170,6 +4304,7 @@ mod tests {
                 cancel: &cancel,
                 policy: &mut policy,
                 ask: &mut ask,
+                plain: false,
             },
             report: TransferReport::default(),
             check_removable: true,
@@ -4318,6 +4453,7 @@ mod tests {
                 cancel: &cancel,
                 policy: &mut policy,
                 ask: &mut ask,
+                plain: false,
             },
             report: TransferReport::default(),
             check_removable,
@@ -4497,6 +4633,7 @@ mod tests {
                 cancel: &cancel,
                 policy: &mut policy,
                 ask: &mut ask,
+                plain: false,
             },
         )
         .unwrap();
@@ -4532,6 +4669,7 @@ mod tests {
                 cancel: &cancel,
                 policy: &mut policy,
                 ask: &mut ask,
+                plain: false,
             },
         )
         .unwrap();
@@ -4661,6 +4799,7 @@ mod tests {
                 cancel: &cancel,
                 policy: &mut policy,
                 ask: &mut ask,
+                plain: false,
             },
         );
         std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o700))

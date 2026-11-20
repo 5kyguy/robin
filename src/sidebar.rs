@@ -35,6 +35,12 @@ pub struct SideEntry {
     pub drive: Option<String>,
     /// The mount's filesystem, for the FAT32 file-size check.
     pub fs_type: String,
+    /// A drive, phone or camera. Phones and cameras are slow: no trash,
+    /// no counts, no thumbnails.
+    pub kind: crate::devices::Kind,
+    /// A phone mounted but not giving access yet: muted like an unmounted
+    /// drive, and a click opens its waiting state.
+    pub waiting: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -360,6 +366,8 @@ impl SideJob {
                     read_only: v.read_only || drive.is_some_and(|d| d.read_only),
                     drive: drive.map(|d| d.id.clone()),
                     fs_type: v.fs_type.clone(),
+                    kind: crate::devices::Kind::Drive,
+                    waiting: false,
                 }
             })
             .collect();
@@ -373,10 +381,27 @@ impl SideJob {
                 continue;
             }
             let row = match d.mounted() {
+                // A phone or camera: named by the device, not its gvfs
+                // folder ("mtp:host=…"), and never probed for space, since
+                // every call crosses USB.
+                Some(m) if d.media() => SideEntry {
+                    glyph: d.kind.glyph(),
+                    name: d.name(),
+                    path: m.to_path_buf(),
+                    count: String::new(),
+                    usage: None,
+                    removable: true,
+                    mounted: true,
+                    read_only: d.read_only,
+                    drive: Some(d.id.clone()),
+                    fs_type: d.fs_type.clone(),
+                    kind: d.kind,
+                    waiting: d.waiting,
+                },
                 Some(m) => {
                     let usage = self.probe.space(&self.mounts, m).and_then(used);
                     SideEntry {
-                        glyph: "󰕓",
+                        glyph: d.kind.glyph(),
                         name: m
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
@@ -389,10 +414,12 @@ impl SideJob {
                         read_only: d.read_only,
                         drive: Some(d.id.clone()),
                         fs_type: d.fs_type.clone(),
+                        kind: crate::devices::Kind::Drive,
+                        waiting: false,
                     }
                 }
                 None => SideEntry {
-                    glyph: "󰕓",
+                    glyph: d.kind.glyph(),
                     name: d.name(),
                     path: PathBuf::new(),
                     count: String::new(),
@@ -402,6 +429,8 @@ impl SideJob {
                     read_only: false,
                     drive: Some(d.id.clone()),
                     fs_type: d.fs_type.clone(),
+                    kind: d.kind,
+                    waiting: false,
                 },
             };
             out.push(row);
@@ -427,10 +456,18 @@ impl SideJob {
             read_only: false,
             drive: None,
             fs_type: String::new(),
+            kind: crate::devices::Kind::Drive,
+            waiting: false,
         }
     }
 
     fn space(&self, volumes: &[Volume]) -> String {
+        // A phone's free space would cross USB on every side job.
+        if crate::devices::device_of(&self.drives, &self.dir).is_some_and(|d| d.media())
+            || crate::devices::gvfs_media_root(&self.dir).is_some()
+        {
+            return String::new();
+        }
         mount_of(&self.dir, volumes)
             .and_then(|m| self.probe.space(&self.mounts, Path::new(m)))
             .map(space_text)
@@ -450,6 +487,8 @@ fn folder(glyph: &'static str, name: String, path: PathBuf, count: String) -> Si
         read_only: false,
         drive: None,
         fs_type: String::new(),
+        kind: crate::devices::Kind::Drive,
+        waiting: false,
     }
 }
 

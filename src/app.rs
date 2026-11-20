@@ -124,6 +124,11 @@ pub enum Action {
     Fullscreen,
     /// Delete Robin's thumbnails under this cache root, then rescan stats.
     ClearThumbs(PathBuf),
+    /// Not done, and why: a `warning` toast (a phone's top folder takes no
+    /// files, its storages can't be deleted).
+    Refuse(String),
+    /// Reread the open folder off the UI thread.
+    Reread,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -299,6 +304,13 @@ pub struct Controller {
     pub gone: Option<Gone>,
     /// The DEVICES row whose right-click menu is open.
     pub device_menu: Option<usize>,
+    /// The device backend's last listing: which folders are on a phone,
+    /// and what can't be done there.
+    pub devices: Vec<crate::devices::Drive>,
+    /// The backend, for a scripted slow phone's [`DeviceBackend::pace`].
+    ///
+    /// [`DeviceBackend::pace`]: crate::devices::DeviceBackend::pace
+    pub pacer: Option<Arc<dyn crate::devices::DeviceBackend>>,
 }
 
 /// The open folder's drive, gone from under it (DESIGN §3).
@@ -314,6 +326,11 @@ pub struct Gone {
     /// The backend's id while it is still plugged in, so [Mount] can
     /// mount it again.
     pub drive: Option<String>,
+    /// A phone that wouldn't open (locked, or access not allowed): the
+    /// pane waits with [Retry] instead.
+    pub waiting: bool,
+    /// What it was, for the state's glyph: a phone isn't a USB stick.
+    pub kind: crate::devices::Kind,
 }
 
 /// Grid tile widths (S/M/L) per density, from the spec's density table.
@@ -466,6 +483,19 @@ pub struct ReadTicket {
     /// Set when `dir` is the home trash's files/: its trash folder, whose
     /// info/ is read alongside.
     trash: Option<PathBuf>,
+    /// On a phone or camera: list only, never count subfolders (each
+    /// count would be another listing over USB).
+    slow: bool,
+    pace: Option<Pace>,
+}
+
+/// The backend a slow read waits on first (only the fake waits).
+pub struct Pace(Arc<dyn crate::devices::DeviceBackend>);
+
+impl std::fmt::Debug for Pace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Pace")
+    }
 }
 
 /// A finished read: the folder actually read (an ancestor after a
@@ -507,7 +537,10 @@ impl ReadTicket {
     /// subfolders. The optional follow-up is the generation, the folder
     /// actually listed, and its entries, so a second pass can fill counts.
     pub fn perform_listing(self) -> (ReadResult, Option<(u64, PathBuf, Vec<crate::model::Entry>)>) {
-        let result = match Snapshot::read_entries(&self.dir) {
+        if let Some(p) = &self.pace {
+            p.0.pace(&self.dir);
+        }
+        let mut result = match Snapshot::read_entries(&self.dir) {
             Ok(snap) => Ok((self.dir, snap)),
             Err(e) if e.is_gone() && self.kind == ReadKind::Refresh => {
                 let mut dir = self.dir;
@@ -522,9 +555,16 @@ impl ReadTicket {
             }
             Err(e) => Err(e),
         };
+        // A phone's folders stay uncounted: blank, never "0".
+        if self.slow {
+            if let Ok((_, snap)) = &mut result {
+                snap.counts_ready = true;
+            }
+        }
         let follow = result
             .as_ref()
             .ok()
+            .filter(|_| !self.slow)
             .map(|(dir, snap)| (self.gen, dir.clone(), snap.entries.clone()));
         let trash = self
             .trash
@@ -814,6 +854,8 @@ impl Controller {
             forward: Vec::new(),
             gone: None,
             device_menu: None,
+            devices: Vec::new(),
+            pacer: None,
         }
     }
 
@@ -1017,12 +1059,25 @@ impl Controller {
         self.read_gen += 1;
         self.in_flight = Some(kind);
         let trash = (dir == self.trash_files()).then(|| self.env.home_trash.clone());
+        let slow = self.limits_at(&dir).slow;
         ReadTicket {
             gen: self.read_gen,
             kind,
             dir,
             trash,
+            slow,
+            pace: self.pacer.clone().filter(|_| slow).map(Pace),
         }
+    }
+
+    /// What can't be done in `dir`: a phone's or camera's limits, or none.
+    pub fn limits_at(&self, dir: &Path) -> crate::devices::Limits {
+        crate::devices::limits(&self.devices, dir)
+    }
+
+    /// The open folder's limits.
+    pub fn limits(&self) -> crate::devices::Limits {
+        self.limits_at(&self.dir)
     }
 
     /// The home trash's files/, the folder the Trash view shows.
@@ -1257,9 +1312,18 @@ impl Controller {
         if names.is_empty() {
             return Action::None;
         }
+        let limits = self.limits();
+        // A phone's storages: refused up front with the reason.
+        if let Some(why) = limits.remove {
+            return Action::Refuse(why);
+        }
         // The trash has no trash: Del there deletes for good, and says so.
         if permanent || self.in_trash() {
             return Action::Open(Dialog::Delete(names));
+        }
+        // Nor does a phone: the no-trash confirm offers Delete permanently.
+        if limits.no_trash {
+            return Action::Open(Dialog::TrashNo(names));
         }
         match ops::trash_choice(&self.dir, &self.env) {
             TrashChoice::Ask => Action::Open(Dialog::TrashNo(names)),
@@ -1302,6 +1366,10 @@ impl Controller {
         if self.nav_pending() || self.in_trash() {
             return Action::None;
         }
+        let limits = self.limits();
+        if let Some(why) = limits.write {
+            return Action::Refuse(why);
+        }
         let name = (1..1000)
             .map(|n| {
                 if n == 1 {
@@ -1320,6 +1388,10 @@ impl Controller {
         });
         if made.is_err() {
             return Action::None;
+        }
+        // On a phone the reread is a listing over USB: off the UI thread.
+        if limits.slow {
+            return Action::Reread;
         }
         let _ = self.refresh();
         self.listing.select_only(name.into());
@@ -2801,7 +2873,7 @@ fn draw_side(ui: &AppWindow, s: &State) {
                 usage: e.usage.unwrap_or(-1.0),
                 level: e.usage.map(crate::sidebar::level).unwrap_or(0),
                 section: section as i32,
-                dim: !e.mounted,
+                dim: !e.mounted || e.waiting,
                 eject: e.drive.is_some(),
                 pill: if e.read_only && e.mounted {
                     "Read-only".into()
@@ -2838,6 +2910,10 @@ fn drive_by_id<'a>(dev: &'a Devices, id: &str) -> Option<&'a crate::devices::Dri
 /// A drive's name as its row shows it: the folder it is mounted on (what
 /// the breadcrumb says too), or its label while unmounted.
 fn drive_name(d: &crate::devices::Drive) -> String {
+    // A phone's folder is gvfs's "mtp:host=…": name it as itself.
+    if d.media() {
+        return d.name();
+    }
     d.mounted()
         .and_then(Path::file_name)
         .map(|n| n.to_string_lossy().into_owned())
@@ -2978,6 +3054,16 @@ pub fn devices_poll() {
     with_state(|ui, st| relist(&ui, st));
 }
 
+/// Renders: open `dir` as a click on its row or crumb would.
+pub fn go(dir: PathBuf) {
+    with_state(|ui, st| apply(&ui, st, Action::Navigate(dir)));
+}
+
+/// Renders: a press of a state button, e.g. a waiting phone's [Retry].
+pub fn press_state(which: &str) {
+    with_state(|ui, _| ui.invoke_state_action(which.into()));
+}
+
 /// Renders: queue a job as a paste or drop would.
 pub fn run_job(job: Job) {
     with_state(|ui, st| apply(&ui, st, Action::Run(job)));
@@ -3036,6 +3122,7 @@ fn drives_landed(
             .as_deref()
             .map(|p| crate::devices::lost_mounts(p, &now))
             .unwrap_or_default();
+        s.ctl.devices = now.clone();
         s.dev.drives = Some(now);
         start_side(&mut s);
         (arrived, lost)
@@ -3088,6 +3175,10 @@ fn name_list(names: &[String]) -> String {
 
 /// "SANDISK connected · 29.8 GB".
 pub fn connected_text(d: &crate::devices::Drive) -> String {
+    // gvfs doesn't say how big a phone is.
+    if d.size == 0 {
+        return format!("{} connected", d.name());
+    }
     format!(
         "{} connected · {}",
         d.name(),
@@ -3098,11 +3189,14 @@ pub fn connected_text(d: &crate::devices::Drive) -> String {
 /// A mount went away without Robin ejecting it. Returns its name when it
 /// was pulled out while another folder was open, for the shared toast.
 fn mount_lost(ui: &AppWindow, st: &Shared, l: crate::devices::Lost) -> Option<String> {
-    let name = l
-        .mount
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| l.drive.name());
+    let name = if l.drive.media() {
+        l.drive.name()
+    } else {
+        l.mount
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| l.drive.name())
+    };
     let (open_on, job_on) = {
         let s = st.borrow();
         if s.dev.ejecting.contains(&l.drive.id) {
@@ -3134,6 +3228,8 @@ fn mount_lost(ui: &AppWindow, st: &Shared, l: crate::devices::Lost) -> Option<St
                 mount: l.mount.clone(),
                 removed: !l.still_plugged,
                 drive: l.still_plugged.then(|| l.drive.id.clone()),
+                waiting: false,
+                kind: l.drive.kind,
             },
         );
         return None;
@@ -3162,18 +3258,24 @@ fn gone_under(s: &State) -> Option<Gone> {
         .filter(|r| r.removable && r.mounted && !r.path.as_os_str().is_empty())
         .filter(|r| dir.starts_with(&r.path))
         .max_by_key(|r| r.path.components().count())?;
-    let in_table = s
-        .ctl
-        .mounts
-        .volumes()
-        .map(|v| v.iter().any(|v| Path::new(&v.mount_point) == row.path))
-        .unwrap_or(true);
-    let listed = s
-        .dev
-        .drives
-        .iter()
-        .flatten()
-        .any(|d| d.mount_points.contains(&row.path));
+    // A phone's folder isn't a mount of its own: gvfs drops it when the
+    // phone goes, before the device list says so.
+    let (in_table, listed) = if row.kind.slow() {
+        (row.path.exists(), false)
+    } else {
+        (
+            s.ctl
+                .mounts
+                .volumes()
+                .map(|v| v.iter().any(|v| Path::new(&v.mount_point) == row.path))
+                .unwrap_or(true),
+            s.dev
+                .drives
+                .iter()
+                .flatten()
+                .any(|d| d.mount_points.contains(&row.path)),
+        )
+    };
     if in_table || listed {
         return None;
     }
@@ -3183,6 +3285,8 @@ fn gone_under(s: &State) -> Option<Gone> {
         mount: row.path.clone(),
         removed: plugged.is_none(),
         drive: plugged.map(|d| d.id.clone()),
+        waiting: false,
+        kind: row.kind,
     })
 }
 
@@ -3258,12 +3362,18 @@ fn mount_landed(
                 if let Some(d) = s.dev.drives.iter_mut().flatten().find(|d| d.id == id) {
                     d.mount_points = vec![at.clone()];
                 }
+                s.ctl.devices = s.dev.drives.clone().unwrap_or_default();
                 s.dev.hidden.remove(id);
                 start_side(&mut s);
             }
             relist(ui, st);
             let target = open.filter(|o| o.starts_with(&at)).unwrap_or(at);
             apply(ui, st, Action::Navigate(target));
+        }
+        // A locked phone: the pane waits for it, with [Retry].
+        Err(crate::devices::DeviceError::Locked) => {
+            relist(ui, st);
+            phone_waits(ui, st, id, name);
         }
         Err(e) => {
             relist(ui, st);
@@ -3405,6 +3515,7 @@ fn eject_landed(
             }
             start_side(&mut s);
         }
+        s.ctl.devices = s.dev.drives.clone().unwrap_or_default();
         home.then(|| s.ctl.env.home.clone()).flatten()
     };
     relist(ui, st);
@@ -3566,6 +3677,160 @@ fn eject_device_row(ui: &AppWindow, st: &Shared, index: usize) {
     if let Some(id) = id {
         eject_drive(ui, st, &id, false);
     }
+}
+
+/// What a phone refuses of `job`, with why: anything written into its top
+/// folder, and its storages deleted or moved.
+pub fn job_refusal(ctl: &Controller, job: &Job) -> Option<String> {
+    use ops::JobKind;
+    let writes = matches!(job.kind, JobKind::Copy | JobKind::Move | JobKind::Restore);
+    let removes = matches!(job.kind, JobKind::Move | JobKind::Trash | JobKind::Delete);
+    if writes && job.src != job.dest {
+        if let Some(why) = ctl.limits_at(&job.dest).write {
+            return Some(why);
+        }
+    }
+    if removes {
+        if let Some(why) = ctl.limits_at(&job.src).remove {
+            return Some(why);
+        }
+    }
+    None
+}
+
+/// Put the pane in a phone's waiting state: "PIXEL 8" / "Unlock your
+/// phone and allow file access" [Retry].
+fn phone_waits(ui: &AppWindow, st: &Shared, id: &str, name: &str) {
+    let (mount, kind) = drive_by_id(&st.borrow().dev, id)
+        .map(|d| {
+            (
+                d.mounted().map(Path::to_path_buf).unwrap_or_default(),
+                d.kind,
+            )
+        })
+        .unwrap_or((PathBuf::new(), crate::devices::Kind::Phone));
+    show_gone(
+        ui,
+        st,
+        Gone {
+            name: name.to_string(),
+            mount,
+            removed: false,
+            drive: Some(id.to_string()),
+            waiting: true,
+            kind,
+        },
+    );
+}
+
+/// [Retry] on a waiting phone: ask the backend to look again (remounting
+/// if it still shows nothing) on a worker, then open its top folder. A
+/// phone that still lists nothing stays waiting and says so in a toast,
+/// since the pane alone wouldn't change.
+fn retry_phone(ui: &AppWindow, st: &Shared) {
+    let (backend, id) = {
+        let s = st.borrow();
+        let from_gone = s
+            .ctl
+            .gone
+            .as_ref()
+            .filter(|g| g.waiting)
+            .and_then(|g| g.drive.clone());
+        let from_dir = s
+            .side
+            .devices
+            .iter()
+            .find(|e| e.kind.slow() && e.mounted && e.path == s.ctl.dir)
+            .and_then(|e| e.drive.clone());
+        (s.dev.backend.clone(), from_gone.or(from_dir))
+    };
+    let (Some(backend), Some(id)) = (backend, id) else {
+        return;
+    };
+    if !st.borrow_mut().dev.busy.insert(id.clone()) {
+        return;
+    }
+    let name = drive_by_id(&st.borrow().dev, &id)
+        .map(drive_name)
+        .unwrap_or_default();
+    let call = id.clone();
+    run_device(
+        ui,
+        st,
+        move || {
+            let got = backend.retry(&call);
+            // Read its top folder here, off the UI thread: empty is
+            // still waiting.
+            let empty = got
+                .as_ref()
+                .is_ok_and(|at| std::fs::read_dir(at).map_or(true, |mut r| r.next().is_none()));
+            (got, empty)
+        },
+        move |ui, st, (got, empty)| retry_landed(ui, st, &id, &name, got, empty),
+    );
+}
+
+fn retry_landed(
+    ui: &AppWindow,
+    st: &Shared,
+    id: &str,
+    name: &str,
+    got: std::result::Result<PathBuf, crate::devices::DeviceError>,
+    empty: bool,
+) {
+    st.borrow_mut().dev.busy.remove(id);
+    relist(ui, st);
+    match got {
+        Ok(at) => {
+            {
+                let mut s = st.borrow_mut();
+                if let Some(d) = s.dev.drives.iter_mut().flatten().find(|d| d.id == id) {
+                    d.mount_points = vec![at.clone()];
+                    d.waiting = empty;
+                }
+                s.ctl.devices = s.dev.drives.clone().unwrap_or_default();
+                start_side(&mut s);
+            }
+            apply(ui, st, Action::Navigate(at));
+            if empty {
+                show_toast(
+                    ui,
+                    st,
+                    "info",
+                    still_waiting_text(name),
+                    Vec::new(),
+                    false,
+                    "",
+                );
+            }
+        }
+        Err(crate::devices::DeviceError::Locked) => {
+            phone_waits(ui, st, id, name);
+            show_toast(
+                ui,
+                st,
+                "info",
+                still_waiting_text(name),
+                Vec::new(),
+                false,
+                "",
+            );
+        }
+        Err(e) => show_toast(
+            ui,
+            st,
+            "danger",
+            format!("Couldn't open {name}: {e}"),
+            Vec::new(),
+            false,
+            "",
+        ),
+    }
+}
+
+/// The toast after a [Retry] that found the phone still locked.
+pub fn still_waiting_text(name: &str) -> String {
+    format!("{name} still hasn't allowed file access")
 }
 
 /// What a copy onto a drive is checked against before it starts: the
@@ -3799,6 +4064,10 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
             ..Default::default()
         },
     }));
+    {
+        let mut s = state.borrow_mut();
+        s.ctl.pacer = s.dev.backend.clone();
+    }
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
     redraw(&ui, &state.borrow());
     start_read(startup);
@@ -3856,6 +4125,12 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     let w = ui.as_weak();
     let st = state.clone();
     ui.on_state_action(move |which| {
+        if which == "retry" {
+            if let Some(ui) = w.upgrade() {
+                retry_phone(&ui, &st);
+            }
+            return;
+        }
         if which == "mount" {
             let gone = st.borrow().ctl.gone.clone();
             if let (Some(ui), Some(g)) = (w.upgrade(), gone) {
@@ -4628,6 +4903,15 @@ fn landed(ui: &AppWindow, st: &Shared, read: ReadResult) {
         Landed::Stale | Landed::Unchanged => {}
         Landed::Shown { moved } => {
             s.read_error = None;
+            // A waiting phone's top folder listed its storages: it has
+            // allowed access, so its row stops being muted.
+            let dir = s.ctl.dir.clone();
+            let listed = !s.ctl.listing.entries().is_empty();
+            for d in s.dev.drives.iter_mut().flatten() {
+                if d.waiting && listed && d.mounted() == Some(dir.as_path()) {
+                    d.waiting = false;
+                }
+            }
             start_side(&mut s);
             let (list_y, grid_y) = (ui.get_list_scroll(), ui.get_grid_scroll());
             redraw(ui, &s);
@@ -5560,8 +5844,9 @@ fn sync_viewer_tail(ui: &AppWindow, s: &State, name: &str, dims: Option<(u32, u3
             audio: crate::viewer::media(&p) == Some(crate::viewer::Media::Audio),
         });
     }
-    // One batch of tiles at a time, so scrubbing can't pile them up.
-    if pics.tiles_pending.is_empty() && !missing.is_empty() {
+    // One batch of tiles at a time, so scrubbing can't pile them up. On a
+    // phone every tile would pull a whole picture over USB: none are made.
+    if pics.tiles_pending.is_empty() && !missing.is_empty() && !ctl.limits().slow {
         pics.tiles_pending.extend(missing.iter().cloned());
         start_decode(DecodeJob::Tiles {
             gen: pics.gen,
@@ -5878,14 +6163,69 @@ fn fill_rows(ui: &AppWindow, s: &State, budget: usize) -> bool {
 /// so it redraws this too.
 fn draw_pane_state(ui: &AppWindow, s: &State) {
     let state = pane_state(&s.ctl);
-    match read_only_drive(s).filter(|_| state == "empty") {
-        Some(name) => {
-            ui.set_state_title(format!("{name} is read-only").into());
-            ui.set_state_note("Files can be opened but not changed".into());
-            ui.set_state("read-only".into());
+    let glyph = crate::devices::device_of(&s.ctl.devices, &s.ctl.dir)
+        .map(|d| d.kind)
+        .or_else(|| s.ctl.gone.as_ref().map(|g| g.kind))
+        .filter(|k| *k != crate::devices::Kind::Drive)
+        .map_or("", |k| k.glyph());
+    ui.set_state_glyph(glyph.into());
+    let waiting = |name: &str| {
+        ui.set_state_title(name.into());
+        ui.set_state_note(PHONE_WAITING.into());
+        ui.set_state("phone-waiting".into());
+    };
+    if state == "phone-waiting" {
+        if let Some(g) = &s.ctl.gone {
+            waiting(&g.name);
         }
-        None => ui.set_state(state.into()),
+        return;
     }
+    if state != "empty" {
+        ui.set_state(state.into());
+        return;
+    }
+    // A phone's top folder lists its storages; empty, it hasn't allowed
+    // access yet.
+    if let Some(name) = waiting_phone(s) {
+        waiting(&name);
+        return;
+    }
+    if let Some(name) = read_only_drive(s) {
+        ui.set_state_title(format!("{name} is read-only").into());
+        ui.set_state_note("Files can be opened but not changed".into());
+        ui.set_state("read-only".into());
+        return;
+    }
+    // A folder a phone takes nothing in: the read-only look, with why.
+    if let Some(why) = s.ctl.limits().write {
+        ui.set_state_title("Nothing can be added here".into());
+        ui.set_state_note(why.into());
+        ui.set_state("read-only".into());
+        return;
+    }
+    ui.set_state(state.into());
+}
+
+/// The no-trash confirm's title: a phone's, a camera's, or a drive's.
+pub fn trash_no_title(ctl: &Controller) -> &'static str {
+    match crate::devices::device_of(&ctl.devices, &ctl.dir).map(|d| d.kind) {
+        Some(crate::devices::Kind::Phone) => "This phone has no trash",
+        Some(crate::devices::Kind::Camera) => "This camera has no trash",
+        _ if crate::devices::gvfs_media_root(&ctl.dir).is_some() => "This phone has no trash",
+        _ => "This drive has no trash",
+    }
+}
+
+/// The note under a phone that waits for access (DESIGN §3).
+pub const PHONE_WAITING: &str = "Unlock your phone and allow file access";
+
+/// The phone whose (empty) top folder is open.
+fn waiting_phone(s: &State) -> Option<String> {
+    s.side
+        .devices
+        .iter()
+        .find(|e| e.kind == crate::devices::Kind::Phone && e.mounted && e.path == s.ctl.dir)
+        .map(|e| e.name.clone())
 }
 
 /// The name of the read-only drive the open folder is on, if it is.
@@ -5902,7 +6242,9 @@ fn read_only_drive(s: &State) -> Option<String> {
 fn pane_state(ctl: &Controller) -> &'static str {
     let n = ctl.listing.view().len();
     if let Some(g) = &ctl.gone {
-        if g.removed {
+        if g.waiting {
+            "phone-waiting"
+        } else if g.removed {
             "ejected"
         } else {
             "unmounted"
@@ -6030,6 +6372,7 @@ fn redraw(ui: &AppWindow, s: &State) {
                     ui.set_confirm_names_count(names.len().min(6) as i32);
                 }
                 Dialog::Trash(names) | Dialog::TrashNo(names) | Dialog::Delete(names) => {
+                    ui.set_trash_no_title(trash_no_title(ctl).into());
                     ui.set_confirm_noun(noun(names).into());
                     ui.set_confirm_names(names_text(names).into());
                     ui.set_confirm_names_count(names.len().min(6) as i32);
@@ -6127,6 +6470,11 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
             ui.set_view_full(full);
         }
         Action::ClearThumbs(cache) => clear_thumbs(ui, st, cache),
+        Action::Refuse(why) => show_toast(ui, st, "warning", why, Vec::new(), false, ""),
+        Action::Reread => {
+            let ticket = st.borrow_mut().ctl.begin_refresh();
+            start_read(ticket);
+        }
         Action::Answer(choice) => {
             if let Some(tx) = st.borrow_mut().reply.take() {
                 let _ = tx.send(choice);
@@ -6152,6 +6500,13 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
             ui.set_job_detail("Cancelling after this item…".into());
         }
         Action::Run(job) => {
+            // What a phone can't do is refused before it starts, not
+            // part-way through.
+            let refused = job_refusal(&st.borrow().ctl, &job);
+            if let Some(why) = refused {
+                show_toast(ui, st, "warning", why, Vec::new(), false, "");
+                return;
+            }
             st.borrow_mut().queue.push_back(job);
             redraw(ui, &st.borrow());
             pump(ui, st);
@@ -6166,9 +6521,12 @@ fn pump(ui: &AppWindow, st: &Shared) {
         if s.ctl.job_running {
             return;
         }
-        let Some(job) = s.queue.pop_front() else {
+        let Some(mut job) = s.queue.pop_front() else {
             return;
         };
+        // On a phone, copies skip metadata and moves copy then delete.
+        job.src_media = s.ctl.limits_at(&job.src).slow;
+        job.dest_media = s.ctl.limits_at(&job.dest).slow;
         s.ctl.job_running = true;
         s.running = Some(job.clone());
         let cancel = Arc::new(Cancel::new());
@@ -6180,7 +6538,14 @@ fn pump(ui: &AppWindow, st: &Shared) {
     // Free space and FAT32's file limit, read before a byte is written.
     let preflight = move |job: &Job| {
         let (name, mount, fat, mounts) = check?;
-        let free = mounts.space(&mount).map(|s| s.free).unwrap_or(u64::MAX);
+        // A phone's top folder spans its storages and reports no size:
+        // ask the storage the copy goes to. No size reads as unknown.
+        let at = if job.dest_media { &job.dest } else { &mount };
+        let free = mounts
+            .space(at)
+            .ok()
+            .filter(|s| s.total > 0)
+            .map_or(u64::MAX, |s| s.free);
         crate::devices::preflight(&job.src, &job.names, free, fat).map(|p| (name, p))
     };
     ui.set_job_on(true);
@@ -6706,6 +7071,8 @@ mod tests {
             read_only: false,
             drive: None,
             fs_type: String::new(),
+            kind: crate::devices::Kind::Drive,
+            waiting: false,
         };
         assert_eq!(
             labels(&[named]),
@@ -9597,6 +9964,8 @@ mod tests {
             mount: pics.clone(),
             removed: false,
             drive: Some("sda1".into()),
+            waiting: false,
+            kind: crate::devices::Kind::Drive,
         });
         assert_eq!(pane_state(&c), "unmounted");
         assert!(c.begin_refresh().is_none(), "no reread walks up from it");
@@ -9671,5 +10040,90 @@ mod tests {
             removed_text(&n(&["A", "B", "C"])),
             "A, B and C were removed without being ejected"
         );
+    }
+
+    /// A controller with a mounted, allowed Pixel 8 whose internal
+    /// storage holds `DCIM/a.jpg`, pacing its listings by `delay`.
+    fn on_phone(label: &str, delay: Option<std::time::Duration>) -> (Controller, PathBuf) {
+        let mut c = setup(label);
+        let root = c.env.home.clone().unwrap();
+        let fake = crate::devices::FakeDevices::new();
+        let mut p = crate::devices::FakeDrive::phone(
+            "pixel",
+            "Pixel 8",
+            &root.join("gvfs/mtp:host=Google_Pixel_8_X"),
+        );
+        p.list_delay = delay;
+        fake.plug(p);
+        let at = crate::devices::DeviceBackend::mount(fake.as_ref(), "pixel").unwrap();
+        let dcim = at.join("Internal shared storage/DCIM");
+        fs::create_dir_all(dcim.join("Camera")).unwrap();
+        fs::write(dcim.join("a.jpg"), b"a").unwrap();
+        c.devices = crate::devices::DeviceBackend::drives(fake.as_ref()).unwrap();
+        c.pacer = Some(fake);
+        (c, at)
+    }
+
+    #[test]
+    fn a_phone_top_folder_refuses_deletes_and_new_folders_with_the_reason() {
+        let (mut c, at) = on_phone("phone-top", None);
+        go(&mut c, at.clone());
+        c.listing.select_only("Internal shared storage".into());
+        assert_eq!(
+            c.remove(false),
+            Action::Refuse("Pixel 8's storages can't be deleted".into())
+        );
+        assert_eq!(
+            c.new_folder(),
+            Action::Refuse("Files can only go inside a storage on Pixel 8".into())
+        );
+        let pics = c.env.home.clone().unwrap().join("Pictures");
+        let copy = Job::new(JobKind::Copy, &pics, vec!["a.jpg".into()], &at);
+        assert_eq!(
+            job_refusal(&c, &copy).as_deref(),
+            Some("Files can only go inside a storage on Pixel 8")
+        );
+        let inside = at.join("Internal shared storage/DCIM");
+        let ok = Job::new(JobKind::Copy, &pics, vec!["a.jpg".into()], &inside);
+        assert_eq!(job_refusal(&c, &ok), None, "inside a storage is fine");
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn deleting_on_a_phone_says_it_has_no_trash() {
+        let (mut c, at) = on_phone("phone-trash", None);
+        go(&mut c, at.join("Internal shared storage/DCIM"));
+        c.listing.select_only("a.jpg".into());
+        assert!(
+            matches!(c.remove(false), Action::Open(Dialog::TrashNo(_))),
+            "never a trash on the phone"
+        );
+        assert_eq!(trash_no_title(&c), "This phone has no trash");
+        assert!(
+            matches!(c.new_folder(), Action::Reread),
+            "made, then reread off the UI thread"
+        );
+        let pics = c.env.home.clone().unwrap().join("Pictures");
+        go(&mut c, pics);
+        assert_eq!(trash_no_title(&c), "This drive has no trash");
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn a_phone_folder_waits_off_the_ui_thread_and_is_never_counted() {
+        let delay = std::time::Duration::from_millis(80);
+        let (mut c, at) = on_phone("phone-slow", Some(delay));
+        let dcim = at.join("Internal shared storage/DCIM");
+        let t = std::time::Instant::now();
+        let ticket = c.begin_navigate(dcim.clone());
+        assert!(t.elapsed() < delay, "the UI thread only hands the read off");
+        let t = std::time::Instant::now();
+        let (read, follow) = ticket.perform_listing();
+        assert!(t.elapsed() >= delay, "the worker waits on the phone");
+        assert!(follow.is_none(), "no count pass over USB");
+        c.land(read);
+        assert_eq!(c.dir, dcim);
+        assert!(c.counts.is_empty(), "Camera stays blank, never 0");
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
     }
 }

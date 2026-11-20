@@ -60,6 +60,23 @@ pub fn scripted(view: &str) -> bool {
             | "stats-scanning"
             | "stats-scanning-first"
             | "devices-plugged"
+            | "phones-plugged"
+            | "phones-row"
+            | "phones-waiting"
+            | "phones-still-waiting"
+            | "phones-allowed"
+            | "phones-storage"
+            | "phones-loading"
+            | "phones-top-refused"
+            | "phones-no-write"
+            | "phones-no-trash"
+            | "phones-copying"
+            | "phones-copied"
+            | "phones-busy-copy"
+            | "phones-safe-unplug"
+            | "phones-removed"
+            | "phones-removed-elsewhere"
+            | "phones-menu"
             | "devices-mounted"
             | "devices-read-only"
             | "devices-busy-copy"
@@ -99,6 +116,294 @@ fn sandisk(root: &Path, view: &str) -> crate::devices::FakeDrive {
         d.drive.mount_points = vec![root.join("media/sky/SANDISK")];
     }
     d
+}
+
+/// Where the `phones-*` scenes' Pixel 8 shows up, as gvfsd-fuse would put it.
+fn pixel_mount(root: &Path) -> PathBuf {
+    root.join("run/user/1000/gvfs/mtp:host=Google_Pixel_8_37281FDJH00ABC")
+}
+
+/// The `phones-*` scenes' Pixel 8: locked in the waiting scenes, slow in
+/// the loading one, with a scripted no-write folder, and (once it allows
+/// access) a DCIM with photos on its internal storage.
+fn pixel(root: &Path, view: &str) -> crate::devices::FakeDrive {
+    let mut p = crate::devices::FakeDrive::phone("pixel", "Pixel 8", &pixel_mount(root));
+    p.storages = vec!["Internal shared storage".into(), "SD card".into()];
+    p.locked = matches!(
+        view,
+        "phones-waiting" | "phones-still-waiting" | "phones-allowed"
+    );
+    if view == "phones-loading" {
+        p.list_delay = Some(std::time::Duration::from_millis(50));
+    }
+    let data = pixel_mount(root).join("Internal shared storage/Android/data");
+    p.drive.no_write = vec![(data, "Pixel 8 doesn't allow changes in Android/data".into())];
+    p
+}
+
+/// Photos and folders on the Pixel's internal storage, written once it
+/// is mounted and allowed (a locked phone lists nothing).
+fn seed_pixel(root: &Path, home: &Path) -> Result<PathBuf> {
+    let storage = pixel_mount(root).join("Internal shared storage");
+    let dcim = storage.join("DCIM");
+    for d in [
+        dcim.join("Camera"),
+        dcim.join("Screenshots"),
+        storage.join("Android/data"),
+        storage.join("Download"),
+    ] {
+        std::fs::create_dir_all(&d).map_err(|e| Error::io(&d, e))?;
+    }
+    for n in [
+        "PXL_20261118_101204.jpg",
+        "PXL_20261118_101233.jpg",
+        "PXL_20261119_174502.mp4",
+    ] {
+        let from = home.join("Pictures/dune-sunset-0412.jpg");
+        let to = dcim.join(n);
+        std::fs::copy(&from, &to).map_err(|e| Error::io(&to, e))?;
+    }
+    crate::fixture::freeze_times(&pixel_mount(root), FIXTURE_MTIME)?;
+    Ok(dcim)
+}
+
+/// Play a `phones-*` scene against the fake backend.
+fn phone_scene(
+    ui: &AppWindow,
+    view: &str,
+    root: &Path,
+    home: &Path,
+    fake: &crate::devices::FakeDevices,
+) -> Result<()> {
+    use crate::ops::{Job, JobKind};
+    let check = |what: &str, got: String, want: &str| {
+        if got == want {
+            Ok(())
+        } else {
+            Err(Error::Message(format!("{what}: {got:?}, want {want:?}")))
+        }
+    };
+    let names = |n: &[&str]| n.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+    match view {
+        "phones-plugged" => {
+            fake.plug(pixel(root, view));
+            app::devices_poll();
+            app::land_reads();
+            return check(
+                "arrival toast",
+                ui.get_toast_text().to_string(),
+                "Pixel 8 connected",
+            );
+        }
+        // Unmounted rows: the phone's and a camera's glyph, both muted.
+        "phones-row" => return Ok(()),
+        "phones-menu" => {
+            ui.invoke_place_menu(device_row(ui, "Pixel 8")?, 150.0, 380.0);
+            return Ok(());
+        }
+        _ => {}
+    }
+    // Every other scene opens the phone with a click on its row.
+    ui.invoke_place_open(1, device_row(ui, "Pixel 8")?);
+    app::land_reads();
+    let mount = pixel_mount(root);
+    if matches!(
+        view,
+        "phones-waiting" | "phones-still-waiting" | "phones-allowed"
+    ) {
+        check("waiting state", ui.get_state().to_string(), "phone-waiting")?;
+        check(
+            "waiting note",
+            ui.get_state_note().to_string(),
+            app::PHONE_WAITING,
+        )?;
+        match view {
+            "phones-still-waiting" => {
+                app::press_state("retry");
+                app::land_reads();
+                check(
+                    "retry toast",
+                    ui.get_toast_text().to_string(),
+                    &app::still_waiting_text("Pixel 8"),
+                )?;
+            }
+            // Allow tapped on the phone, then [Retry]: its storages list.
+            "phones-allowed" => {
+                fake.allow("pixel");
+                crate::fixture::freeze_times(&mount, FIXTURE_MTIME)?;
+                app::press_state("retry");
+                app::land_reads();
+                check("allowed", ui.get_state().to_string(), "files")?;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    let dcim = seed_pixel(root, home)?;
+    let pictures = home.join("Pictures");
+    let back_home = |ui: &AppWindow| {
+        app::go(pictures.clone());
+        app::land_reads();
+        let _ = ui;
+    };
+    match view {
+        "phones-storage" => {
+            app::go(dcim.clone());
+            app::land_reads();
+        }
+        // A slow listing: the pane shows it is reading while the UI keeps
+        // running (the read is on its own thread in the app).
+        "phones-loading" => {
+            app::navigate_pending(dcim.clone(), std::time::Instant::now(), 0.45);
+        }
+        "phones-top-refused" => {
+            app::run_job(Job::new(
+                JobKind::Copy,
+                &pictures,
+                names(&["dune-sunset-0412.jpg"]),
+                &mount,
+            ));
+            check(
+                "refused toast",
+                ui.get_toast_text().to_string(),
+                "Files can only go inside a storage on Pixel 8",
+            )?;
+        }
+        "phones-no-write" => {
+            app::go(mount.join("Internal shared storage/Android/data"));
+            app::land_reads();
+            check(
+                "no-write title",
+                ui.get_state_title().to_string(),
+                "Nothing can be added here",
+            )?;
+        }
+        "phones-no-trash" => {
+            app::go(dcim.clone());
+            app::land_reads();
+            select_row(ui, "PXL_20261118_101204.jpg");
+            ui.invoke_key(app::keys::DELETE.into(), false, false, false);
+            check(
+                "trash title",
+                ui.get_trash_no_title().to_string(),
+                "This phone has no trash",
+            )?;
+        }
+        "phones-copying" => {
+            app::go(dcim.clone());
+            app::land_reads();
+            app::hold_job(Job::new(
+                JobKind::Copy,
+                &pictures,
+                names(&[
+                    "dune-sunset-0412.jpg",
+                    "dune-sunset-0413.jpg",
+                    "speeder-run.mp4",
+                ]),
+                &dcim,
+            ));
+        }
+        // Through the op queue for real: the files land under their own
+        // names, with no partial file left on the phone.
+        "phones-copied" => {
+            app::go(dcim.clone());
+            app::land_reads();
+            app::run_job(Job::new(
+                JobKind::Copy,
+                &pictures,
+                names(&["dune-sunset-0412.jpg", "dune-sunset-0413.jpg"]),
+                &dcim,
+            ));
+            app::land_reads();
+            for n in ["dune-sunset-0412.jpg", "dune-sunset-0413.jpg"] {
+                if !dcim.join(n).is_file() {
+                    return Err(Error::Message(format!("{n} didn't land on the phone")));
+                }
+            }
+            let partial = std::fs::read_dir(&dcim)
+                .map_err(|e| Error::io(&dcim, e))?
+                .flatten()
+                .any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(".robin-partial")
+                });
+            if partial {
+                return Err(Error::Message(
+                    "a partial file was left on the phone".into(),
+                ));
+            }
+            // A phone keeps no source times, so pin them for a stable frame.
+            crate::fixture::freeze_times(&dcim, FIXTURE_MTIME)?;
+            app::go(dcim.clone());
+            app::land_reads();
+        }
+        "phones-busy-copy" => {
+            back_home(ui);
+            app::hold_job(Job::new(
+                JobKind::Copy,
+                &pictures,
+                names(&[
+                    "dune-sunset-0412.jpg",
+                    "dune-sunset-0413.jpg",
+                    "speeder-run.mp4",
+                ]),
+                &dcim,
+            ));
+            ui.invoke_place_eject(device_row(ui, "Pixel 8")?);
+            check(
+                "busy toast",
+                ui.get_toast_text().to_string(),
+                "Copying 3 items to Pixel 8",
+            )?;
+        }
+        "phones-safe-unplug" => {
+            ui.invoke_place_eject(device_row(ui, "Pixel 8")?);
+            app::land_reads();
+            check(
+                "unplug toast",
+                ui.get_toast_text().to_string(),
+                "Pixel 8 can be unplugged",
+            )?;
+            if device_names(ui).iter().any(|n| n == "Pixel 8") {
+                return Err(Error::Message("the phone's row stayed".into()));
+            }
+            if fake
+                .log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|l| l.starts_with("power-off"))
+            {
+                return Err(Error::Message("a phone was powered off".into()));
+            }
+        }
+        "phones-removed" => {
+            app::go(dcim.clone());
+            app::land_reads();
+            fake.unplug("pixel");
+            app::devices_poll();
+            app::land_reads();
+            check(
+                "removed title",
+                ui.get_state_title().to_string(),
+                "Pixel 8 was removed",
+            )?;
+        }
+        "phones-removed-elsewhere" => {
+            back_home(ui);
+            fake.unplug("pixel");
+            app::devices_poll();
+            app::land_reads();
+            check(
+                "removed toast",
+                ui.get_toast_text().to_string(),
+                "Pixel 8 was removed without being ejected",
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// The DEVICES row named `name`, as a click would find it.
@@ -465,6 +770,25 @@ fn paint_in(
         }
         fake.clone() as Arc<dyn crate::devices::DeviceBackend>
     });
+    // The phone scenes plug the Pixel 8 (and, for the rows, a camera).
+    let devices = devices.or_else(|| {
+        view.starts_with("phones-").then(|| {
+            if view != "phones-plugged" {
+                fake.plug(pixel(root, view));
+            }
+            if view == "phones-row" {
+                let mut cam = crate::devices::FakeDrive::phone(
+                    "eos",
+                    "Canon EOS R6",
+                    &root.join("run/user/1000/gvfs/gphoto2:host=Canon_Inc._Canon_Digital_Camera"),
+                );
+                cam.drive.kind = crate::devices::Kind::Camera;
+                cam.drive.fs_type = "gphoto2".into();
+                fake.plug(cam);
+            }
+            fake.clone() as Arc<dyn crate::devices::DeviceBackend>
+        })
+    });
     if devices.is_some() && view != "devices-stats" {
         mounts = mounts.without("/dev/sda1");
     }
@@ -685,6 +1009,7 @@ fn paint_in(
             app::land_reads();
         }
         v if v.starts_with("devices-") => device_scene(&ui, v, root, home, &fake)?,
+        v if v.starts_with("phones-") => phone_scene(&ui, v, root, home, &fake)?,
         _ => {}
     }
     snapshot(&ui, size, out)

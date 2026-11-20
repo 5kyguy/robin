@@ -249,6 +249,10 @@ pub struct Job {
     /// Empty Trash: after the deletes, prune orphan trashinfo and stale
     /// directorysizes lines.
     pub empty_trash: bool,
+    /// `src` / `dest` is on a phone or camera, as the window's device list
+    /// says (gvfs paths are recognised without it).
+    pub src_media: bool,
+    pub dest_media: bool,
 }
 
 impl Job {
@@ -260,7 +264,20 @@ impl Job {
             dest: dest.to_path_buf(),
             restore: Vec::new(),
             empty_trash: false,
+            src_media: false,
+            dest_media: false,
         }
+    }
+
+    /// Writes land on a phone or camera.
+    pub fn onto_media(&self) -> bool {
+        matches!(self.kind, JobKind::Copy | JobKind::Move)
+            && (self.dest_media || crate::devices::gvfs_media_root(&self.dest).is_some())
+    }
+
+    /// Reads come off a phone or camera.
+    pub fn from_media(&self) -> bool {
+        self.src_media || crate::devices::gvfs_media_root(&self.src).is_some()
     }
 
     /// Undo a trash job on the job thread.
@@ -281,6 +298,8 @@ impl Job {
             dest: first,
             restore: items,
             empty_trash: false,
+            src_media: false,
+            dest_media: false,
         }
     }
 
@@ -588,6 +607,11 @@ impl Env {
 
 /// Whether Del can trash things in `dir`, or must offer a permanent delete.
 pub fn trash_choice(dir: &Path, env: &Env) -> TrashChoice {
+    // A phone or camera has no trash, and a .Trash folder made on one
+    // would only be another folder on the phone.
+    if crate::devices::gvfs_media_root(dir).is_some() {
+        return TrashChoice::Ask;
+    }
     if env.home.as_deref().is_some_and(|h| same_filesystem(dir, h)) {
         return TrashChoice::Home;
     }
@@ -682,6 +706,7 @@ pub fn run_asking(
                 cancel: &item,
                 policy: &mut policy,
                 ask: &mut *ask,
+                plain: false,
             };
             match restore_one(t, env, &mut opts, &mut out.recreated) {
                 Ok(fsops::Restored::Restored) => out.done += 1,
@@ -755,6 +780,7 @@ pub fn run_asking(
                     cancel: &item,
                     policy: &mut policy,
                     ask: &mut *ask,
+                    plain: job.onto_media(),
                 };
                 let dest = dest.as_ref().unwrap();
                 if job.kind == JobKind::Copy {
@@ -946,6 +972,7 @@ fn copy_one(
             cancel: opts.cancel,
             policy: &mut *opts.policy,
             ask: &mut *opts.ask,
+            plain: opts.plain,
         },
     )?;
     merge(&mut out.report, report);
@@ -964,8 +991,10 @@ fn move_one(
         return Ok(());
     }
     into_itself(job, name)?;
+    // MTP may have no move at all, and gvfs would turn a rename into a
+    // download and re-upload: on a phone, a move is a copy, then a delete.
     let mut opts = MoveOpts {
-        force_copy: false,
+        force_copy: job.onto_media() || job.from_media(),
         fail_before_unlink: false,
         copy,
         report: TransferReport::default(),
@@ -1277,6 +1306,42 @@ mod tests {
         let out = run(&into, &env(&root), &cancel, &mut |_| {});
         assert_eq!(out.failed.len(), 1);
         assert!(a.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn moves_onto_a_phone_copy_then_delete_and_leave_no_partial() {
+        use std::os::unix::fs::MetadataExt;
+        let root = scratch("onto-phone");
+        let pics = root.join("Pictures");
+        let phone = root.join("gvfs/mtp:host=Pixel/Internal shared storage/DCIM");
+        fs::create_dir_all(&pics).unwrap();
+        fs::create_dir_all(&phone).unwrap();
+        fs::write(pics.join("a.jpg"), "a").unwrap();
+        fs::write(pics.join("b.jpg"), "b").unwrap();
+        let ino = fs::metadata(pics.join("a.jpg")).unwrap().ino();
+        let cancel = Cancel::new();
+        let mut mv = Job::new(JobKind::Move, &pics, names(&["a.jpg"]), &phone);
+        mv.dest_media = true;
+        assert!(mv.onto_media() && !mv.from_media());
+        let out = run(&mv, &env(&root), &cancel, &mut |_| {});
+        assert_eq!(out.done, 1, "{out:?}");
+        assert!(!pics.join("a.jpg").exists());
+        assert_ne!(
+            fs::metadata(phone.join("a.jpg")).unwrap().ino(),
+            ino,
+            "copied and deleted, never renamed across"
+        );
+        // A gvfs path counts as a phone even when no flag was set.
+        let cp = Job::new(JobKind::Copy, &pics, names(&["b.jpg"]), &phone);
+        assert!(cp.onto_media());
+        assert_eq!(run(&cp, &env(&root), &cancel, &mut |_| {}).done, 1);
+        let mut left: Vec<String> = fs::read_dir(&phone)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["a.jpg", "b.jpg"], "no partial files on the phone");
         fs::remove_dir_all(&root).unwrap();
     }
 

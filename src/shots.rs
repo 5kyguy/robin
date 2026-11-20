@@ -57,6 +57,14 @@ pub fn known(view: &str) -> bool {
             | "device-unlock"
             | "device-unlock-wrong"
             | "phone-waiting"
+            | "phone-row"
+            | "phone-plugged"
+            | "phone-still-waiting"
+            | "phone-top-refused"
+            | "phone-no-write"
+            | "phone-no-trash"
+            | "phone-busy-copy"
+            | "phone-safe-unplug"
             | "device-read-only-empty"
             | "device-removed-elsewhere"
             | "device-power-off"
@@ -154,8 +162,8 @@ fn scene_state(view: &str) -> &'static str {
         "permission-denied" => "denied",
         "device-unmounted" => "unmounted",
         "device-ejected" => "ejected",
-        "phone-waiting" => "phone-waiting",
-        "device-read-only-empty" => "read-only",
+        "phone-waiting" | "phone-still-waiting" => "phone-waiting",
+        "device-read-only-empty" | "phone-no-write" => "read-only",
         "search-no-results" => "nosearch",
         _ => "files",
     }
@@ -222,8 +230,15 @@ fn apply_scene(ui: &AppWindow, view: &str) {
     } else {
         "~  ›  Pictures".into()
     });
-    if view == "phone-waiting" {
-        ui.set_crumbs("Pixel 8".into());
+    if view.starts_with("phone-") {
+        ui.set_crumbs(match view {
+            "phone-waiting" | "phone-still-waiting" | "phone-top-refused" => "Pixel 8".into(),
+            "phone-no-write" => "Pixel 8  ›  …  ›  Android  ›  data".into(),
+            _ => "Pixel 8  ›  Internal shared storage  ›  DCIM".into(),
+        });
+        // A phone's free space isn't read: every call crosses USB.
+        ui.set_status_right("".into());
+        ui.set_status_free_short("".into());
     }
     if view == "device-read-only-empty" {
         ui.set_crumbs("SANDISK".into());
@@ -253,7 +268,13 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             ui.set_state_title("SANDISK is read-only".into());
             ui.set_state_note("Files can be opened but not changed".into());
         }
-        "phone-waiting" => {
+        "phone-no-write" => {
+            ui.set_state_title("Nothing can be added here".into());
+            ui.set_state_note("Pixel 8 doesn't allow changes in Android/data".into());
+            ui.set_state_glyph(crate::devices::Kind::Phone.glyph().into());
+            ui.set_status_left("0 items".into());
+        }
+        "phone-waiting" | "phone-still-waiting" => {
             ui.set_state_title("Pixel 8".into());
             ui.set_state_note("Unlock your phone and allow file access".into());
             ui.set_status_left("".into());
@@ -361,7 +382,7 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             "search-results" | "search-no-results" => "search",
             "confirm-trash" => "trash",
             "confirm-delete" => "delete",
-            "confirm-trash-no-trash" => "trash-no",
+            "confirm-trash-no-trash" | "phone-no-trash" => "trash-no",
             "confirm-delete-permanent" => "delete",
             "conflict" => "conflict",
             "conflict-all" => "conflict-all",
@@ -564,7 +585,7 @@ fn open_folder(view: &str) -> &'static str {
     match view {
         "empty-folder" => "~/Pictures/empty",
         "start-denied" => "~/secret",
-        "phone-waiting" => "Pixel 8",
+        v if v.starts_with("phone-") => "Pixel 8",
         "device-read-only-empty" => "SANDISK",
         _ => "~/Pictures",
     }
@@ -708,26 +729,43 @@ fn places(view: &str) -> Vec<Place> {
     ) {
         rows.retain(|row| row.name != "SANDISK");
     }
-    if view == "phone-waiting" {
+    // A phone (and, in phone-row, a camera) below the drives. Muted while
+    // it waits for access; gone once ejected.
+    if view.starts_with("phone-") && view != "phone-safe-unplug" {
         let at = rows
             .iter()
             .position(|r| r.section == 2)
             .unwrap_or(rows.len());
-        rows.insert(
-            at,
-            Place {
-                glyph: "󰄜".into(),
-                name: "Pixel 8".into(),
+        let waiting = matches!(view, "phone-waiting" | "phone-still-waiting");
+        let mut add = vec![Place {
+            glyph: crate::devices::Kind::Phone.glyph().into(),
+            name: "Pixel 8".into(),
+            count: "".into(),
+            selected: view != "phone-plugged",
+            usage: -1.0,
+            level: 0,
+            section: 1,
+            dim: waiting || view == "phone-plugged",
+            eject: true,
+            pill: "".into(),
+        }];
+        if view == "phone-row" {
+            add.push(Place {
+                glyph: crate::devices::Kind::Camera.glyph().into(),
+                name: "Canon EOS R6".into(),
                 count: "".into(),
-                selected: true,
+                selected: false,
                 usage: -1.0,
                 level: 0,
                 section: 1,
                 dim: true,
-                eject: false,
+                eject: true,
                 pill: "".into(),
-            },
-        );
+            });
+        }
+        for (i, p) in add.into_iter().enumerate() {
+            rows.insert(at + i, p);
+        }
     }
     let pinned: Vec<&'static str> = [
         "Home",
@@ -1291,6 +1329,48 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
         }
         "device-plugged" => {
             device_toast(ui, "info", "SANDISK connected · 29.8 GB", "Open", "");
+        }
+        // gvfs gives no size for a phone, so the arrival names it alone.
+        "phone-plugged" => {
+            device_toast(ui, "info", "Pixel 8 connected", "Open", "");
+        }
+        "phone-still-waiting" => {
+            device_toast(
+                ui,
+                "info",
+                &crate::app::still_waiting_text("Pixel 8"),
+                "",
+                "",
+            );
+        }
+        "phone-top-refused" => {
+            device_toast(
+                ui,
+                "warning",
+                "Files can only go inside a storage on Pixel 8",
+                "",
+                "",
+            );
+        }
+        "phone-busy-copy" => {
+            ui.set_job_on(true);
+            ui.set_job_glyph("󰆏".into());
+            ui.set_job_label("Copying 3 items to DCIM".into());
+            ui.set_job_detail("2 of 3 items · speeder-run.mp4".into());
+            ui.set_job_amount(0.66);
+            device_toast(
+                ui,
+                "warning",
+                "Copying 3 items to Pixel 8",
+                "Wait",
+                "Cancel copy",
+            );
+        }
+        "phone-safe-unplug" => {
+            device_toast(ui, "", "Pixel 8 can be unplugged", "", "");
+        }
+        "phone-no-trash" => {
+            ui.set_trash_no_title("This phone has no trash".into());
         }
         "device-busy-copy" => {
             ui.set_job_on(true);
