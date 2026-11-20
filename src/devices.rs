@@ -842,6 +842,14 @@ mod tests {
             .current_dir(&root)
             .spawn()
             .unwrap();
+        // Until the exec lands, the child still carries the test's name.
+        let comm = format!("/proc/{}/comm", child.id());
+        let started = std::time::Instant::now();
+        while std::fs::read_to_string(&comm).map_or(true, |c| c.trim() != "sleep")
+            && started.elapsed() < std::time::Duration::from_secs(5)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let got = holder(&root);
         child.kill().unwrap();
         let _ = child.wait();
