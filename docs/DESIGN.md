@@ -94,7 +94,18 @@ Glyph sizes: 14 in rows and the sidebar (FolderSidebar glyph 14 in an 18px box) 
 - Padding is 8. Each section has a header row 24px tall in `t-label` style.
 - Sections, in order:
   - **PINNED**: Home, Desktop, Documents, Downloads, Pictures, Videos, plus user pins added by drag-in or the context menu "Pin".
-  - **DEVICES**: mounts from `/proc/self/mountinfo` with real filesystems. Each row has a 3px usage bar beneath it: `accent`, or `warning` at ≥85%, or `danger` at ≥95%. Removable devices show an eject glyph `󰕓` button 22×22 on hover.
+  - **DEVICES**: mounts from `/proc/self/mountinfo` with real filesystems, plus the removable drives UDisks2 lists (USB sticks, SD cards, external disks). Each mounted row has a 3px usage bar beneath it: `accent`, or `warning` at ≥85%, or `danger` at ≥95%. Removable devices show an eject glyph `󰕓` button 22×22 on hover, in place of the count.
+    - **Plugged in, not mounted:** the row's name is `muted`, with no count and no usage bar. One click mounts the drive (UDisks2 `Filesystem.Mount`, no `pkexec`) and opens it. A mount that fails shows a `danger` toast, "Couldn't mount SANDISK: <reason>". The hover eject button still shows, and only powers the drive off.
+    - **Read-only:** a small `muted` pill "Read-only" (`t-small`, `text@8%` fill, radius `r-sm`) sits left of the count; the usage bar stays. Pastes and drops onto it get the existing refused-move state.
+    - **Arrival:** a drive plugged in while Robin runs shows an info toast "SANDISK connected · 29.8 GB" with [Open], gone after 4s. Drives already present at startup get no toast. A drive with no label is named by its size, "29.8 GB drive".
+    - **Eject:** the hover button, the row's right-click menu (Open, a separator, Eject) and the statistics DISKS card all eject: unmount, then power the drive off, or unmount only when it can't be powered off. Success shows "SANDISK can be unplugged" and the row disappears. If the open folder is on the drive, Robin goes Home first.
+    - **Busy on eject**, as a `warning` toast:
+      - Robin's own job on the drive: "Copying 3 items to SANDISK" with [Wait] [Cancel copy] and no Force. [Wait] ejects as soon as the job finishes ("SANDISK will eject when the copy finishes"); [Cancel copy] cancels it and then ejects.
+      - Another program: "SANDISK is in use by vlc" with [Retry] [Force] (Force in `danger`). The program is found by scanning `/proc/*/fd` and `cwd` for the mount, else "another program". Force is a UDisks2 unmount with `force`.
+    - **Pulled out without eject:** the row disappears; if the open folder was on it, the pane shows "SANDISK was removed" (section 3). A Robin job on the drive stops with a `danger` toast, "SANDISK was removed: copied 3 of 8 items".
+    - **Copies onto a drive** check free space first ("Not enough space on SANDISK: 7.0 GB needed, 6.0 GB free", `danger`) and, on FAT32, files over 4 GB ("holo.img is too big for SANDISK", `warning`, Details: "FAT32 drives hold files up to 4 GB each. Nothing was copied."). Nothing is copied in either case.
+    - **Without UDisks2** (no system bus): rows come from mountinfo alone, so there are no unmounted rows and no eject buttons; a mount that vanishes still shows the removed state.
+    - **Phones (phase 2, not built):** a phone row uses `󰄜`; while it waits for access the pane shows the phone's name, the `muted` note "Unlock your phone and allow file access" and [Retry].
   - **NETWORK** appears only when gvfs or sshfs mounts exist.
   - **TRASH** has its count in `muted`.
   - The bottom-pinned row "󰄨 Statistics" opens the statistics view.
@@ -157,7 +168,8 @@ All empty and error states are centred in the content area: glyph 64 `muted@60%`
 | Empty folder | `󰉖` | "This folder is empty" / "Drop files here or press Ctrl+N" | [New folder] | — (the whole area is a drop target) |
 | Permission denied | `󰌾` | "No permission to open ~/x" / "Owned by root (drwx------)" | [Open as admin…] (spawns `pkexec` only on click) [Go back] | glyph `warning` |
 | Unmounted device | `󰕓` | "SANDISK is not mounted" | [Mount] (primary) | — |
-| Ejected while open | `󰕓` | "SANDISK was removed" | [Go to Home]; a toast appears too | glyph `warning` |
+| Ejected while open | `󰕓` | "SANDISK was removed" | [Go to Home]; a `warning` toast "SANDISK was removed while it was open" appears too | glyph `warning` |
+| Phone waiting for access (phase 2) | `󰄜` | "Pixel 8" / "Unlock your phone and allow file access" | [Retry] | — |
 | Loading a large dir | — | Rows stream in. Show 12 skeleton rows of `text@6%` bars that pulse between 4% and 8% opacity over 900ms (no pulse under reduced motion). A 2px indeterminate `accent` bar sits under the toolbar. The status bar reads `Reading… 18 240 items`. Over 300ms, the first batch of 200 renders. | Esc cancels | |
 | Search, no results | `󰍉` | "Nothing matches "kotlin"" / "Searched 4 812 items in ~/Projects" | [Search hidden files] [Clear] | |
 | Hidden files shown | — | Hidden files have 60% name opacity, and the status bar eye glyph is `accent`. There is no banner. | | |
@@ -173,6 +185,12 @@ All empty and error states are centred in the content area: glyph 64 `muted@60%`
   - Secondary: transparent with a 1px `line` border and `text`.
   - Danger: `danger` fill with `on_danger` text.
 - Enter triggers the default button and Esc cancels. Dialogs enter with a scale from 0.96 to 1 plus opacity (enter curve) and exit with fade only.
+
+### Unlock dialog (400 wide, encrypted drives)
+- Lock glyph `󰌾` in `muted` + title "Unlock SANDISK"; body "SANDISK is encrypted. Enter its passphrase to open it."
+- A 36px passphrase field (dots), focused. A wrong passphrase turns its ring `danger` and shows "Wrong passphrase. Try again." in `danger` under it, keeping the dialog open.
+- Buttons [Cancel] [Unlock] (primary). Unlock mounts and opens the drive like a click on its row.
+- Phase 1 has the mock only (`device-unlock`, `device-unlock-wrong`); encrypted drives aren't listed yet.
 
 ### Inline rename (`F2`)
 - The name cell becomes a 1px-ring `focus_ring` input in place, at the same height as the row.
@@ -214,6 +232,7 @@ All empty and error states are centred in the content area: glyph 64 `muted@60%`
 - Up to 3 stack with an 8px gap. New toasts slide in 24px up over 180ms, and dismissal uses the 120ms exit.
 - Variants change only the glyph colour: info `accent`, warning `warning`, error `danger`.
 - "Moved 3 items to trash · Undo" is the canonical toast.
+- A toast can carry two actions ("Wait · Cancel copy", "Retry · Force"); a destructive second action is drawn in `danger`.
 
 ## 5. Media viewer (Viewer.qml, ViewerToolbar, ViewerFilmstrip, ViewerTransport, ViewerInfoPanel, ViewerKeys, ViewerShortcutHelp)
 
@@ -250,7 +269,7 @@ All empty and error states are centred in the content area: glyph 64 `muted@60%`
 - Single scroll page, padding 24, max content width 1120.
 - Cards use `surface` fill, 1px `hairline`, radius `r-lg`, padding 16, and a `t-label` header with `muted` glyph (den-den-mushi dashboard card style). Card gap is 16.
 
-1. **DISKS:** one row per mount, 56 tall. Drive glyph → name and mountpoint → a 10px pill bar → `t-display` percent on the right and `t-small` "812 GB free of 1.8 TB". The bar fill is `accent`, or `warning` at ≥85%, or `danger` at ≥95%. Removable devices get an eject button.
+1. **DISKS:** one row per mount, 56 tall. Drive glyph → name and mountpoint → a 10px pill bar → `t-display` percent on the right and `t-small` "812 GB free of 1.8 TB". The bar fill is `accent`, or `warning` at ≥85%, or `danger` at ≥95%. Removable devices get a 22×22 eject button right of the percent, which ejects as the sidebar does.
 2. **LARGEST FOLDERS — treemap** (squarified), 2/3 width × 320.
    - **Why a treemap over a sunburst:** rectangles let names and sizes sit inside the cells as plain text. Area is easier to compare than arc angle. It fills the card's rectangle with no wasted corners, and it is simpler to hit-test and lay out in Slint (no arc text).
    - Cell colouring: depth-1 cells are `accent@(70→25)%` by rank, and their children nest at −10% alpha.
@@ -306,7 +325,8 @@ Things that never animate: scrolling content, list sorting (it cuts), and typing
 7. search-results and search-no-results
 8. empty-folder
 9. permission-denied
-10. device-unmounted and device-ejected
+10. device-unmounted (muted row, no bar) and device-ejected (row gone)
+10a. device-plugged (arrival toast), device-read-only, device-menu, device-busy-copy, device-busy-other, device-safe-unplug, device-unlock and device-unlock-wrong, phone-waiting
 11. loading-large-dir (skeleton)
 12. hidden-files-shown
 13. rename-inline and rename-collision

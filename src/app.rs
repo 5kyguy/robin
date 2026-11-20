@@ -294,6 +294,26 @@ pub struct Controller {
     /// Folders stepped back out of, most recent last: the forward
     /// button's stack. A new navigation clears it.
     forward: Vec<PathBuf>,
+    /// The drive the open folder is on went away: the pane shows "was
+    /// removed" or "is not mounted" until something else is opened.
+    pub gone: Option<Gone>,
+    /// The DEVICES row whose right-click menu is open.
+    pub device_menu: Option<usize>,
+}
+
+/// The open folder's drive, gone from under it (DESIGN §3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gone {
+    /// "SANDISK".
+    pub name: String,
+    /// Where it was mounted.
+    pub mount: PathBuf,
+    /// Pulled out ("was removed"), or still plugged in but unmounted by
+    /// something else ("is not mounted", with [Mount]).
+    pub removed: bool,
+    /// The backend's id while it is still plugged in, so [Mount] can
+    /// mount it again.
+    pub drive: Option<String>,
 }
 
 /// Grid tile widths (S/M/L) per density, from the spec's density table.
@@ -792,7 +812,34 @@ impl Controller {
             dont_ask: false,
             back: Vec::new(),
             forward: Vec::new(),
+            gone: None,
+            device_menu: None,
         }
+    }
+
+    /// Forget the reread in flight; its result will be dropped.
+    pub fn drop_refresh(&mut self) {
+        if self.in_flight == Some(ReadKind::Refresh) {
+            self.in_flight = None;
+            self.read_gen += 1;
+        }
+    }
+
+    /// The open folder's drive went away. Its listing is kept but not
+    /// shown, a reread that would walk up out of it is dropped, and the
+    /// viewer closes: the pane says what happened instead.
+    pub fn device_gone(&mut self, gone: Gone) {
+        self.drop_refresh();
+        self.viewer = None;
+        self.searching = false;
+        // Nothing on the drive can be selected, cut or dragged any more.
+        let (key, order) = self.listing.sort();
+        let hidden = self.listing.show_hidden();
+        self.listing = Listing::default();
+        self.listing.set_sort(key, order);
+        self.listing.set_show_hidden(hidden);
+        self.counts.clear();
+        self.gone = Some(gone);
     }
 
     /// Ask to open `dir`. The current folder stays until the read lands.
@@ -941,7 +988,9 @@ impl Controller {
     /// Ask to reread the open folder; `None` while a navigation is in
     /// flight, since its result will replace this folder anyway.
     pub fn begin_refresh(&mut self) -> Option<ReadTicket> {
-        if self.in_flight == Some(ReadKind::Navigate) {
+        // A gone drive keeps its state until something else is opened;
+        // a reread would only walk up to the folder it was mounted in.
+        if self.in_flight == Some(ReadKind::Navigate) || self.gone.is_some() {
             return None;
         }
         Some(self.ticket(self.dir.clone(), ReadKind::Refresh))
@@ -1058,6 +1107,7 @@ impl Controller {
             .and_then(|n| n.step);
         if read.result.is_ok() {
             self.trash = read.trash.unwrap_or_default();
+            self.gone = None;
         }
         let was_loaded = std::mem::replace(&mut self.loaded, true);
         let was_unreadable = self.unreadable.take().is_some();
@@ -1387,6 +1437,13 @@ impl Controller {
     }
 
     pub fn key(&mut self, text: &str, ctrl: bool, shift: bool) -> Action {
+        if self.device_menu.is_some() {
+            if text == keys::ESCAPE {
+                self.device_menu = None;
+                return Action::Redraw;
+            }
+            return Action::None;
+        }
         if self.dialog.is_some() {
             return self.dialog_key(text, shift);
         }
@@ -2098,6 +2155,53 @@ struct State {
     marks_model: RefCell<Option<Rc<VecModel<Mark>>>>,
     grid_model: RefCell<Option<Rc<VecModel<GridLine>>>>,
     row_fill_queued: std::cell::Cell<bool>,
+    /// The job on the job thread, so eject can tell whether it writes to
+    /// (or reads from) the drive.
+    running: Option<Job>,
+    dev: Devices,
+}
+
+/// Removable drives as the window knows them (DESIGN §2 DEVICES).
+#[derive(Default)]
+struct Devices {
+    /// UDisks2, a fake, or none (mountinfo only: no hotplug, no eject).
+    backend: Option<Arc<dyn crate::devices::DeviceBackend>>,
+    /// The last listing; `None` until the first one lands, so drives
+    /// already plugged in at startup don't toast.
+    drives: Option<Vec<crate::devices::Drive>>,
+    /// Ejected drives that stay listed (a card reader can't power off):
+    /// their rows stay hidden until they are pulled out.
+    hidden: std::collections::HashSet<String>,
+    /// Ids with a mount or eject on a worker, so a second click waits.
+    busy: std::collections::HashSet<String>,
+    /// The drive being ejected: its mounts going away is not a removal.
+    ejecting: Option<String>,
+    /// [Wait] on a busy eject: eject once Robin's own copy is done.
+    eject_after: Option<String>,
+    /// The running job's drive was pulled out: its toast says so.
+    yanked: Option<String>,
+    /// What the toast's buttons do while a device toast shows.
+    toast: Option<DeviceToast>,
+    /// What each line of the open device menu does.
+    menu: Vec<MenuAct>,
+}
+
+/// The buttons on a device toast, by drive id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DeviceToast {
+    /// "SANDISK connected" [Open].
+    Open(String),
+    /// "Copying 3 items to SANDISK" [Wait] [Cancel copy].
+    BusyOwn(String),
+    /// "SANDISK is in use by vlc" [Retry] [Force].
+    BusyOther(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MenuAct {
+    Open(usize),
+    Eject(usize),
+    None,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -2156,6 +2260,7 @@ fn start_side(s: &mut State) {
         mounts: s.ctl.mounts.clone(),
         dir: s.ctl.dir.clone(),
         probe: s.probe.clone(),
+        drives: visible_drives(&s.dev),
     };
     if SCRIPTED.with(|s| s.get()) {
         PENDING_SIDE.with(|p| p.borrow_mut().push_back((gen, job)));
@@ -2244,6 +2349,7 @@ fn open_stats(ui: &AppWindow, st: &Shared) {
                 r,
                 &scanned_line(&s.ctl, s.stats_at, true),
                 s.ctl.listing.show_hidden(),
+                &ejectable_mounts(&s),
             );
         }
         ui.set_stat_has_results(s.stats.is_some());
@@ -2325,6 +2431,7 @@ fn stats_landed(ui: &AppWindow, st: &Shared, gen: u64, report: crate::stats::Rep
                 r,
                 &scanned_line(&s.ctl, s.stats_at, false),
                 s.ctl.listing.show_hidden(),
+                &ejectable_mounts(&s),
             ),
             None => ui.set_stat_scanned("Scan cancelled · Rescan".into()),
         }
@@ -2338,6 +2445,7 @@ fn stats_landed(ui: &AppWindow, st: &Shared, gen: u64, report: crate::stats::Rep
             &report,
             &scanned_line(&s.ctl, s.stats_at, false),
             s.ctl.listing.show_hidden(),
+            &ejectable_mounts(&s),
         );
     }
     s.stats = Some(report);
@@ -2373,7 +2481,13 @@ pub fn skipped_line(scan: &crate::stats::Scan) -> (String, String) {
 }
 
 /// Fill the Statistics view from a report. `stale` marks a rescan running.
-pub fn show_stats(ui: &AppWindow, r: &crate::stats::Report, scanned: &str, hidden: bool) {
+pub fn show_stats(
+    ui: &AppWindow,
+    r: &crate::stats::Report,
+    scanned: &str,
+    hidden: bool,
+    ejectable: &[PathBuf],
+) {
     use crate::stats::UsageLevel;
     let (skipped, tip) = skipped_line(&r.home);
     ui.set_stat_skipped(skipped.into());
@@ -2394,6 +2508,7 @@ pub fn show_stats(ui: &AppWindow, r: &crate::stats::Report, scanned: &str, hidde
                 },
                 pct: format!("{:.0}%", ratio * 100.0).into(),
                 free: format!("{} free of {}", human(d.free), human(d.total)).into(),
+                eject: ejectable.iter().any(|m| m.as_path() == Path::new(&d.mount)),
             }
         })
         .collect();
@@ -2536,10 +2651,15 @@ fn draw_crumbs(ui: &AppWindow, s: &State) -> Vec<String> {
         ui.set_crumbs("Trash".into());
         return vec!["Trash".into()];
     }
-    let crumbs: Vec<String> = crumbs_for(s.ctl.crumb_dir(), home, &s.side.devices, user.as_deref())
-        .iter()
-        .map(|c| c.label.clone())
-        .collect();
+    let mut crumbs = crumbs_for(s.ctl.crumb_dir(), home, &s.side.devices, user.as_deref());
+    // A removed drive has left the side job, but the crumb still names it.
+    if let Some(g) = &s.ctl.gone {
+        if s.ctl.crumb_dir().starts_with(&g.mount) {
+            let devices = [(g.mount.clone(), g.name.clone())];
+            crumbs = crate::model::breadcrumbs_on(s.ctl.crumb_dir(), home, &devices);
+        }
+    }
+    let crumbs: Vec<String> = crumbs.iter().map(|c| c.label.clone()).collect();
     ui.set_crumbs(crumbs.join("  ›  ").into());
     crumbs
 }
@@ -2656,7 +2776,17 @@ fn side_landed(ui: &AppWindow, st: &Shared, gen: u64, data: crate::sidebar::Side
 /// the open folder's row lit.
 fn draw_side(ui: &AppWindow, s: &State) {
     let side = &s.side;
-    let lit = crate::sidebar::picked(side, &s.ctl.dir);
+    // A drive that went away under the open folder lights its own row
+    // while it is still plugged in, and nothing once it is gone, rather
+    // than whatever holds the dead mount point (System).
+    let lit = match &s.ctl.gone {
+        Some(g) => side
+            .devices
+            .iter()
+            .position(|e| e.drive.is_some() && e.drive == g.drive)
+            .map(|i| (1, i)),
+        None => crate::sidebar::picked(side, &s.ctl.dir),
+    };
     let rows = |section: usize, entries: &[crate::sidebar::SideEntry]| {
         let places: Vec<crate::Place> = entries
             .iter()
@@ -2669,6 +2799,13 @@ fn draw_side(ui: &AppWindow, s: &State) {
                 usage: e.usage.unwrap_or(-1.0),
                 level: e.usage.map(crate::sidebar::level).unwrap_or(0),
                 section: section as i32,
+                dim: !e.mounted,
+                eject: e.drive.is_some(),
+                pill: if e.read_only && e.mounted {
+                    "Read-only".into()
+                } else {
+                    SharedString::new()
+                },
             })
             .collect();
         ModelRc::new(Rc::new(VecModel::from(places)))
@@ -2678,6 +2815,743 @@ fn draw_side(ui: &AppWindow, s: &State) {
     ui.set_trash_places(rows(2, &side.trash));
     ui.set_status_right(side.space.clone().into());
     ui.set_status_free_short(short_free(&side.space).into());
+}
+
+// ---- Removable drives (DESIGN §2 DEVICES, §3) ------------------------------
+
+/// The drives the sidebar shows: the last listing less ejected ones.
+fn visible_drives(dev: &Devices) -> Vec<crate::devices::Drive> {
+    dev.drives
+        .iter()
+        .flatten()
+        .filter(|d| !dev.hidden.contains(&d.id))
+        .cloned()
+        .collect()
+}
+
+fn drive_by_id<'a>(dev: &'a Devices, id: &str) -> Option<&'a crate::devices::Drive> {
+    dev.drives.iter().flatten().find(|d| d.id == id)
+}
+
+/// A drive's name as its row shows it: the folder it is mounted on (what
+/// the breadcrumb says too), or its label while unmounted.
+fn drive_name(d: &crate::devices::Drive) -> String {
+    d.mounted()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| d.name())
+}
+
+/// Mounts the "Eject" button can act on, for the statistics DISKS card.
+fn ejectable_mounts(s: &State) -> Vec<PathBuf> {
+    s.side
+        .devices
+        .iter()
+        .filter(|r| r.drive.is_some() && r.mounted)
+        .map(|r| r.path.clone())
+        .collect()
+}
+
+/// Whether `job` reads from or writes to the filesystem mounted at `mount`.
+fn job_touches(job: &Job, mount: &Path) -> bool {
+    job.src.starts_with(mount)
+        || (matches!(
+            job.kind,
+            ops::JobKind::Copy | ops::JobKind::Move | ops::JobKind::Restore
+        ) && job.dest.starts_with(mount))
+}
+
+/// What the busy toast says when Robin's own job holds the drive:
+/// "Copying 3 items to SANDISK". `None` when `job` doesn't touch it.
+pub fn blocker_label(job: &Job, name: &str, on: impl Fn(&Path) -> bool) -> Option<String> {
+    use ops::JobKind;
+    let n = ops::count(job.names.len());
+    let to = on(&job.dest);
+    let from = on(&job.src);
+    Some(match job.kind {
+        JobKind::Copy if to => format!("Copying {n} to {name}"),
+        JobKind::Move if to => format!("Moving {n} to {name}"),
+        JobKind::Copy if from => format!("Copying {n} from {name}"),
+        JobKind::Move if from => format!("Moving {n} from {name}"),
+        JobKind::Trash if from => format!("Moving {n} on {name} to trash"),
+        JobKind::Delete if from => format!("Deleting {n} on {name}"),
+        JobKind::Restore if to => format!("Restoring {n} to {name}"),
+        _ => return None,
+    })
+}
+
+/// Robin's running or queued job that holds `drive`, as the busy toast
+/// names it.
+fn own_blocker(s: &State, drive: &crate::devices::Drive) -> Option<String> {
+    let name = drive_name(drive);
+    s.running
+        .iter()
+        .chain(s.queue.iter())
+        .find_map(|j| blocker_label(j, &name, |p| drive.holds(p)))
+}
+
+/// Run a device call off the UI thread and land its result there; in
+/// renders, right away.
+fn run_device<T: Send + 'static>(
+    ui: &AppWindow,
+    st: &Shared,
+    work: impl FnOnce() -> T + Send + 'static,
+    land: impl FnOnce(&AppWindow, &Shared, T) + Send + 'static,
+) {
+    if SCRIPTED.with(|s| s.get()) {
+        let got = work();
+        land(ui, st, got);
+        return;
+    }
+    std::thread::spawn(move || {
+        let got = work();
+        let _ = slint::invoke_from_event_loop(move || {
+            with_state(|ui, st| land(&ui, st, got));
+        });
+    });
+}
+
+/// Read the drive list at startup and again after every hotplug signal,
+/// on a worker: D-Bus calls can stall.
+fn start_devices(ui: &AppWindow, st: &Shared) {
+    let Some(backend) = st.borrow().dev.backend.clone() else {
+        return;
+    };
+    if SCRIPTED.with(|s| s.get()) {
+        drives_landed(ui, st, backend.drives());
+        return;
+    }
+    std::thread::spawn(move || {
+        let rx = backend.watch();
+        loop {
+            let got = backend.drives();
+            if slint::invoke_from_event_loop(move || {
+                with_state(|ui, st| drives_landed(&ui, st, got));
+            })
+            .is_err()
+            {
+                break;
+            }
+            let Some(rx) = &rx else { break };
+            if rx.recv().is_err() {
+                break;
+            }
+            // A stick brings a burst of signals: read once they settle.
+            std::thread::sleep(Duration::from_millis(150));
+            while rx.try_recv().is_ok() {}
+        }
+    });
+}
+
+/// Renders: reread the fake's drives and land them now, as a hotplug
+/// signal would.
+pub fn devices_poll() {
+    with_state(|ui, st| relist(&ui, st));
+}
+
+/// Renders: queue a job as a paste or drop would.
+pub fn run_job(job: Job) {
+    with_state(|ui, st| apply(&ui, st, Action::Run(job)));
+}
+
+/// Renders: show `job` as running on the job thread without running it,
+/// so a frame can catch what happens meanwhile.
+pub fn hold_job(job: Job) {
+    with_state(|ui, st| {
+        ui.set_job_on(true);
+        ui.set_job_glyph(job.glyph().into());
+        ui.set_job_label(job.label().into());
+        ui.set_job_detail(format!("1 of {}", ops::count(job.names.len())).into());
+        ui.set_job_amount(1.0 / job.names.len().max(1) as f32);
+        let mut s = st.borrow_mut();
+        s.ctl.job_running = true;
+        s.cancel = Some(Arc::new(Cancel::new()));
+        s.running = Some(job);
+    });
+}
+
+/// After a mount or eject in a render, where no watcher thread runs.
+fn relist(ui: &AppWindow, st: &Shared) {
+    if !SCRIPTED.with(|s| s.get()) {
+        return;
+    }
+    let Some(b) = st.borrow().dev.backend.clone() else {
+        return;
+    };
+    drives_landed(ui, st, b.drives());
+}
+
+/// A fresh drive list: redraw DEVICES, toast an arrival, and catch a
+/// drive pulled out (or unmounted elsewhere) from under the open folder
+/// or a running copy.
+fn drives_landed(
+    ui: &AppWindow,
+    st: &Shared,
+    got: std::result::Result<Vec<crate::devices::Drive>, crate::devices::DeviceError>,
+) {
+    // UDisks2 stopped answering: keep what the sidebar has.
+    let Ok(now) = got else { return };
+    let (arrived, lost) = {
+        let mut s = st.borrow_mut();
+        let prev = s.dev.drives.take();
+        // An ejected reader shows again once it's pulled out and back, or
+        // something else mounts it.
+        s.dev
+            .hidden
+            .retain(|id| now.iter().any(|d| d.id == *id && d.mounted().is_none()));
+        let arrived: Vec<_> = crate::devices::arrivals(prev.as_deref(), &now)
+            .into_iter()
+            .cloned()
+            .collect();
+        let lost = prev
+            .as_deref()
+            .map(|p| crate::devices::lost_mounts(p, &now))
+            .unwrap_or_default();
+        s.dev.drives = Some(now);
+        start_side(&mut s);
+        (arrived, lost)
+    };
+    for l in lost {
+        mount_lost(ui, st, l);
+    }
+    if let Some(d) = arrived.last() {
+        device_toast(
+            ui,
+            st,
+            "info",
+            connected_text(d),
+            ("Open", ""),
+            DeviceToast::Open(d.id.clone()),
+            4,
+        );
+    }
+}
+
+/// "SANDISK connected · 29.8 GB".
+pub fn connected_text(d: &crate::devices::Drive) -> String {
+    format!(
+        "{} connected · {}",
+        d.name(),
+        crate::devices::size_text(d.size)
+    )
+}
+
+/// A mount went away without Robin ejecting it.
+fn mount_lost(ui: &AppWindow, st: &Shared, l: crate::devices::Lost) {
+    let name = l
+        .mount
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| l.drive.name());
+    let (open_on, job_on) = {
+        let s = st.borrow();
+        if s.dev.ejecting.as_deref() == Some(l.drive.id.as_str()) {
+            return;
+        }
+        (
+            s.ctl.dir.starts_with(&l.mount),
+            s.running.as_ref().is_some_and(|j| job_touches(j, &l.mount)),
+        )
+    };
+    if job_on && !l.still_plugged {
+        // Pulled out mid-copy: stop the job and anything queued for the
+        // drive; its toast says what happened.
+        let mut s = st.borrow_mut();
+        s.dev.yanked = Some(name.clone());
+        s.queue.retain(|j| !job_touches(j, &l.mount));
+        if let Some(c) = &s.cancel {
+            c.cancel();
+        }
+        drop(s);
+        ui.set_job_detail(format!("{name} was removed · stopping…").into());
+    }
+    if open_on {
+        show_gone(
+            ui,
+            st,
+            Gone {
+                name,
+                mount: l.mount.clone(),
+                removed: !l.still_plugged,
+                drive: l.still_plugged.then(|| l.drive.id.clone()),
+            },
+        );
+    }
+}
+
+/// Put the pane in the drive's gone state; a removal toasts once.
+fn show_gone(ui: &AppWindow, st: &Shared, gone: Gone) {
+    let toast = {
+        let mut s = st.borrow_mut();
+        let was_removed = s.ctl.gone.as_ref().is_some_and(|g| g.removed);
+        let toast = gone.removed && !was_removed && s.dev.yanked.is_none();
+        s.ctl.device_gone(gone.clone());
+        toast
+    };
+    redraw(ui, &st.borrow());
+    if toast {
+        show_toast(
+            ui,
+            st,
+            "warning",
+            format!("{} was removed while it was open", gone.name),
+            Vec::new(),
+            false,
+            "",
+        );
+    }
+}
+
+/// A reread walking up out of the open folder because its drive's mount
+/// is gone (the kernel saw it before UDisks2 said so): the drive's gone
+/// state, or `None` when only the folder went away.
+fn gone_under(s: &State) -> Option<Gone> {
+    let dir = &s.ctl.dir;
+    let row = s
+        .side
+        .devices
+        .iter()
+        .filter(|r| r.removable && r.mounted && !r.path.as_os_str().is_empty())
+        .filter(|r| dir.starts_with(&r.path))
+        .max_by_key(|r| r.path.components().count())?;
+    let in_table = s
+        .ctl
+        .mounts
+        .volumes()
+        .map(|v| v.iter().any(|v| Path::new(&v.mount_point) == row.path))
+        .unwrap_or(true);
+    let listed = s
+        .dev
+        .drives
+        .iter()
+        .flatten()
+        .any(|d| d.mount_points.contains(&row.path));
+    if in_table || listed {
+        return None;
+    }
+    let plugged = row.drive.as_deref().and_then(|id| drive_by_id(&s.dev, id));
+    Some(Gone {
+        name: row.name.clone(),
+        mount: row.path.clone(),
+        removed: plugged.is_none(),
+        drive: plugged.map(|d| d.id.clone()),
+    })
+}
+
+/// Whether the open folder is on the drive being ejected.
+fn on_ejecting(s: &State) -> bool {
+    let Some(id) = s.dev.ejecting.as_deref() else {
+        return false;
+    };
+    drive_by_id(&s.dev, id).is_some_and(|d| d.holds(&s.ctl.dir))
+}
+
+/// A toast with up to two buttons that act on a drive.
+fn device_toast(
+    ui: &AppWindow,
+    st: &Shared,
+    tone: &str,
+    text: String,
+    (first, second): (&str, &str),
+    kind: DeviceToast,
+    secs: u64,
+) {
+    bind_toast(ui, st, tone, text, Vec::new(), false, first);
+    ui.set_toast_action2(second.into());
+    ui.set_toast_action2_danger(second == "Force");
+    st.borrow_mut().dev.toast = Some(kind);
+    hide_toast_after(ui, st, secs);
+}
+
+/// Mount a drive if it isn't, then open `open` (a folder on it), or the
+/// drive itself.
+fn open_drive(ui: &AppWindow, st: &Shared, id: &str, open: Option<PathBuf>) {
+    let (backend, drive) = {
+        let s = st.borrow();
+        (s.dev.backend.clone(), drive_by_id(&s.dev, id).cloned())
+    };
+    let Some(drive) = drive else { return };
+    if let Some(m) = drive.mounted() {
+        let target = open
+            .filter(|o| o.starts_with(m))
+            .unwrap_or_else(|| m.to_path_buf());
+        apply(ui, st, Action::Navigate(target));
+        return;
+    }
+    let Some(backend) = backend else { return };
+    if !st.borrow_mut().dev.busy.insert(id.to_string()) {
+        return;
+    }
+    let id = id.to_string();
+    let name = drive.name();
+    let call = id.clone();
+    run_device(
+        ui,
+        st,
+        move || backend.mount(&call),
+        move |ui, st, got| mount_landed(ui, st, &id, &name, open, got),
+    );
+}
+
+fn mount_landed(
+    ui: &AppWindow,
+    st: &Shared,
+    id: &str,
+    name: &str,
+    open: Option<PathBuf>,
+    got: std::result::Result<PathBuf, crate::devices::DeviceError>,
+) {
+    st.borrow_mut().dev.busy.remove(id);
+    match got {
+        Ok(at) => {
+            {
+                let mut s = st.borrow_mut();
+                if let Some(d) = s.dev.drives.iter_mut().flatten().find(|d| d.id == id) {
+                    d.mount_points = vec![at.clone()];
+                }
+                s.dev.hidden.remove(id);
+                start_side(&mut s);
+            }
+            relist(ui, st);
+            let target = open.filter(|o| o.starts_with(&at)).unwrap_or(at);
+            apply(ui, st, Action::Navigate(target));
+        }
+        Err(e) => {
+            relist(ui, st);
+            show_toast(
+                ui,
+                st,
+                "danger",
+                format!("Couldn't mount {name}: {e}"),
+                Vec::new(),
+                false,
+                "",
+            );
+        }
+    }
+}
+
+/// Eject: unmount, then power the drive off. Refused with a busy toast
+/// while Robin's own job reads or writes it; `force` (the busy toast's
+/// [Force], only offered when another program holds it) unmounts anyway.
+fn eject_drive(ui: &AppWindow, st: &Shared, id: &str, force: bool) {
+    let (backend, drive, blocker) = {
+        let s = st.borrow();
+        let Some(d) = drive_by_id(&s.dev, id).cloned() else {
+            return;
+        };
+        let blocker = own_blocker(&s, &d);
+        (s.dev.backend.clone(), d, blocker)
+    };
+    if let Some(label) = blocker {
+        device_toast(
+            ui,
+            st,
+            "warning",
+            label,
+            ("Wait", "Cancel copy"),
+            DeviceToast::BusyOwn(id.to_string()),
+            8,
+        );
+        return;
+    }
+    let Some(backend) = backend else { return };
+    {
+        let mut s = st.borrow_mut();
+        if !s.dev.busy.insert(id.to_string()) {
+            return;
+        }
+        s.dev.ejecting = Some(id.to_string());
+        if s.dev.eject_after.as_deref() == Some(id) {
+            s.dev.eject_after = None;
+        }
+        // Robin's own hold: a video or song playing off the drive.
+        if s.ctl.viewer.is_some() && drive.holds(&s.ctl.dir) {
+            s.ctl.close_viewer();
+        }
+    }
+    redraw(ui, &st.borrow());
+    let id = id.to_string();
+    let name = drive_name(&drive);
+    run_device(
+        ui,
+        st,
+        move || {
+            let got = crate::devices::eject(backend.as_ref(), &drive, force);
+            let holder = match &got {
+                Err(crate::devices::DeviceError::Busy) => {
+                    drive.mounted().and_then(|m| backend.holder(m))
+                }
+                _ => None,
+            };
+            (got, holder, drive)
+        },
+        move |ui, st, (got, holder, drive)| eject_landed(ui, st, &id, &name, &drive, got, holder),
+    );
+}
+
+/// "SANDISK is in use by vlc", or by "another program" when the holder
+/// can't be seen.
+pub fn in_use_text(name: &str, holder: Option<&str>) -> String {
+    format!(
+        "{name} is in use by {}",
+        holder.unwrap_or("another program")
+    )
+}
+
+fn eject_landed(
+    ui: &AppWindow,
+    st: &Shared,
+    id: &str,
+    name: &str,
+    drive: &crate::devices::Drive,
+    got: std::result::Result<crate::devices::Ejected, crate::devices::DeviceError>,
+    holder: Option<String>,
+) {
+    use crate::devices::{DeviceError, Ejected};
+    let home = {
+        let mut s = st.borrow_mut();
+        s.dev.busy.remove(id);
+        s.dev.ejecting = None;
+        let home = got.is_ok() && drive.holds(&s.ctl.dir);
+        if let Ok(how) = &got {
+            // The next listing must not read our own unmount as a removal.
+            match how {
+                Ejected::PoweredOff => {
+                    if let Some(all) = s.dev.drives.as_mut() {
+                        all.retain(|d| d.id != id);
+                    }
+                }
+                Ejected::Unmounted => {
+                    if let Some(d) = s.dev.drives.iter_mut().flatten().find(|d| d.id == id) {
+                        d.mount_points.clear();
+                    }
+                    s.dev.hidden.insert(id.to_string());
+                }
+            }
+            start_side(&mut s);
+        }
+        home.then(|| s.ctl.env.home.clone()).flatten()
+    };
+    relist(ui, st);
+    match got {
+        Ok(_) => {
+            if let Some(h) = home {
+                apply(ui, st, Action::Navigate(h));
+            }
+            show_toast(
+                ui,
+                st,
+                "",
+                format!("{name} can be unplugged"),
+                Vec::new(),
+                false,
+                "",
+            );
+        }
+        Err(DeviceError::Busy) => device_toast(
+            ui,
+            st,
+            "warning",
+            in_use_text(name, holder.as_deref()),
+            ("Retry", "Force"),
+            DeviceToast::BusyOther(id.to_string()),
+            8,
+        ),
+        Err(e) => show_toast(
+            ui,
+            st,
+            "danger",
+            format!("Couldn't eject {name}: {e}"),
+            Vec::new(),
+            false,
+            "",
+        ),
+    }
+}
+
+/// [Wait] or [Cancel copy] armed an eject: run it once nothing of
+/// Robin's holds the drive any more.
+fn eject_when_free(ui: &AppWindow, st: &Shared) {
+    let ready = {
+        let s = st.borrow();
+        s.dev
+            .eject_after
+            .clone()
+            .filter(|id| drive_by_id(&s.dev, id).is_some_and(|d| own_blocker(&s, d).is_none()))
+    };
+    if let Some(id) = ready {
+        eject_drive(ui, st, &id, false);
+    }
+}
+
+/// A device toast's first (`second` false) or second button.
+fn device_toast_button(ui: &AppWindow, st: &Shared, second: bool) -> bool {
+    let Some(kind) = st.borrow_mut().dev.toast.take() else {
+        return false;
+    };
+    ui.set_toast_on(false);
+    match (kind, second) {
+        (DeviceToast::Open(id), _) => open_drive(ui, st, &id, None),
+        (DeviceToast::BusyOwn(id), false) => {
+            let name = drive_by_id(&st.borrow().dev, &id)
+                .map(drive_name)
+                .unwrap_or_default();
+            st.borrow_mut().dev.eject_after = Some(id);
+            show_toast(
+                ui,
+                st,
+                "",
+                format!("{name} will eject when the copy finishes"),
+                Vec::new(),
+                false,
+                "",
+            );
+        }
+        (DeviceToast::BusyOwn(id), true) => {
+            st.borrow_mut().dev.eject_after = Some(id);
+            apply(ui, st, Action::CancelJob);
+        }
+        (DeviceToast::BusyOther(id), false) => eject_drive(ui, st, &id, false),
+        (DeviceToast::BusyOther(id), true) => eject_drive(ui, st, &id, true),
+    }
+    true
+}
+
+/// The right-click menu on a DEVICES row: Open (mounting first), Eject.
+fn open_device_menu(ui: &AppWindow, st: &Shared, index: usize, x: f32, y: f32) {
+    let Some(row) = st.borrow().side.devices.get(index).cloned() else {
+        return;
+    };
+    let item = |glyph: &str, label: &str| crate::MenuItem {
+        glyph: glyph.into(),
+        label: label.into(),
+        shortcut: SharedString::new(),
+        danger: false,
+        sub: false,
+        sep: false,
+    };
+    let sep = crate::MenuItem {
+        sep: true,
+        ..item("", "")
+    };
+    let mut items = vec![item("󰉋", "Open")];
+    let mut acts = vec![MenuAct::Open(index)];
+    if row.drive.is_some() {
+        items.extend([sep, item("󰕓", "Eject")]);
+        acts.extend([MenuAct::None, MenuAct::Eject(index)]);
+    }
+    ui.set_device_menu_items(ModelRc::new(Rc::new(VecModel::from(items))));
+    ui.set_menu_at_x(x);
+    ui.set_menu_at_y(y);
+    {
+        let mut s = st.borrow_mut();
+        s.dev.menu = acts;
+        s.ctl.device_menu = Some(index);
+    }
+    redraw(ui, &st.borrow());
+}
+
+/// A click on a DEVICES row: open it, mounting an unmounted drive first.
+fn open_device_row(ui: &AppWindow, st: &Shared, index: usize) {
+    let Some(row) = st.borrow().side.devices.get(index).cloned() else {
+        return;
+    };
+    match (&row.drive, row.mounted) {
+        (Some(id), false) => open_drive(ui, st, id, None),
+        _ => apply(ui, st, Action::Navigate(row.path)),
+    }
+}
+
+fn eject_device_row(ui: &AppWindow, st: &Shared, index: usize) {
+    let id = st
+        .borrow()
+        .side
+        .devices
+        .get(index)
+        .and_then(|r| r.drive.clone());
+    if let Some(id) = id {
+        eject_drive(ui, st, &id, false);
+    }
+}
+
+/// What a copy onto a drive is checked against before it starts: the
+/// drive's name, mount and whether it is FAT32.
+fn copy_check(s: &State, job: &Job) -> Option<(String, PathBuf, bool)> {
+    if !matches!(job.kind, ops::JobKind::Copy | ops::JobKind::Move) {
+        return None;
+    }
+    let row = s
+        .side
+        .devices
+        .iter()
+        .filter(|r| r.removable && r.mounted && !r.path.as_os_str().is_empty())
+        .filter(|r| job.dest.starts_with(&r.path))
+        .max_by_key(|r| r.path.components().count())?;
+    // A move within the drive writes nothing new.
+    if job.kind == ops::JobKind::Move && job.src.starts_with(&row.path) {
+        return None;
+    }
+    Some((
+        row.name.clone(),
+        row.path.clone(),
+        crate::devices::is_fat(&row.fs_type),
+    ))
+}
+
+/// The toast for a copy the check refused: (tone, text, details).
+pub fn preflight_toast(
+    name: &str,
+    p: &crate::devices::Preflight,
+) -> (&'static str, String, Vec<String>) {
+    use crate::devices::{size_text, Preflight};
+    match p {
+        Preflight::NoSpace { need, free } => (
+            "danger",
+            format!(
+                "Not enough space on {name}: {} needed, {} free",
+                size_text(*need),
+                size_text(*free)
+            ),
+            Vec::new(),
+        ),
+        Preflight::TooBig(files) => {
+            let text = match files.as_slice() {
+                [(one, _)] => format!(
+                    "{} is too big for {name}",
+                    Path::new(one)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| one.clone())
+                ),
+                _ => format!("{} files are too big for {name}", files.len()),
+            };
+            let mut details =
+                vec!["FAT32 drives hold files up to 4 GB each. Nothing was copied.".to_string()];
+            details.extend(
+                files
+                    .iter()
+                    .map(|(f, n)| format!("{f} — {}", size_text(*n))),
+            );
+            ("warning", text, details)
+        }
+    }
+}
+
+/// A copy the check refused before it wrote anything.
+fn preflight_refused(ui: &AppWindow, st: &Shared, name: &str, p: crate::devices::Preflight) {
+    ui.set_job_on(false);
+    {
+        let mut s = st.borrow_mut();
+        s.ctl.job_running = false;
+        s.cancel = None;
+        s.running = None;
+    }
+    let (tone, text, details) = preflight_toast(name, &p);
+    let pinned = !details.is_empty();
+    show_toast(ui, st, tone, text, details, pinned, "");
+    pump(ui, st);
+    eject_when_free(ui, st);
 }
 
 /// Start a navigation to `target` at `t0` and hold its read, then move the
@@ -2707,6 +3581,8 @@ pub struct Launch {
     /// Where the view settings are remembered; None never reads or
     /// writes them (renders, tests).
     pub prefs: Option<PathBuf>,
+    /// Removable drives: UDisks2, a fake in renders, or none.
+    pub devices: Option<Arc<dyn crate::devices::DeviceBackend>>,
 }
 
 impl Launch {
@@ -2721,6 +3597,7 @@ impl Launch {
             compact: false,
             clock: None,
             mounts: std::sync::Arc::new(crate::mounts::SystemMounts),
+            devices: crate::devices::from_env(),
         }
     }
 }
@@ -2815,11 +3692,17 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         marks_model: RefCell::new(None),
         grid_model: RefCell::new(None),
         row_fill_queued: std::cell::Cell::new(false),
+        running: None,
+        dev: Devices {
+            backend: launch.devices,
+            ..Default::default()
+        },
     }));
     STATE.with(|s| *s.borrow_mut() = Some((state.clone(), ui.as_weak())));
     redraw(&ui, &state.borrow());
     start_read(startup);
     start_side(&mut state.borrow_mut());
+    start_devices(&ui, &state);
     {
         // Inbound drops from other apps. winit reports one DroppedFile per
         // path (X11 only in winit 0.30) and no pointer position, so they
@@ -2872,6 +3755,16 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     let w = ui.as_weak();
     let st = state.clone();
     ui.on_state_action(move |which| {
+        if which == "mount" {
+            let gone = st.borrow().ctl.gone.clone();
+            if let (Some(ui), Some(g)) = (w.upgrade(), gone) {
+                if let Some(id) = g.drive {
+                    let dir = st.borrow().ctl.dir.clone();
+                    open_drive(&ui, &st, &id, Some(dir));
+                }
+            }
+            return;
+        }
         let action = st.borrow_mut().ctl.state_action(&which);
         if let Some(ui) = w.upgrade() {
             apply(&ui, &st, action);
@@ -3055,6 +3948,12 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     let w = ui.as_weak();
     let st = state.clone();
     ui.on_place_open(move |section, index| {
+        if section == 1 {
+            if let Some(ui) = w.upgrade() {
+                open_device_row(&ui, &st, index.max(0) as usize);
+            }
+            return;
+        }
         let target = {
             let s = st.borrow();
             let rows = match section {
@@ -3129,8 +4028,72 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     });
     let w = ui.as_weak();
     let st = state.clone();
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_toast_link2(move || {
+        if let Some(ui) = w2.upgrade() {
+            device_toast_button(&ui, &st2, true);
+        }
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_place_eject(move |index| {
+        if let Some(ui) = w2.upgrade() {
+            eject_device_row(&ui, &st2, index.max(0) as usize);
+        }
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_place_menu(move |index, x, y| {
+        if let Some(ui) = w2.upgrade() {
+            open_device_menu(&ui, &st2, index.max(0) as usize, x, y);
+        }
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_device_menu_pick(move |line| {
+        let Some(ui) = w2.upgrade() else { return };
+        let act = {
+            let mut s = st2.borrow_mut();
+            s.ctl.device_menu = None;
+            s.dev.menu.get(line.max(0) as usize).cloned()
+        };
+        redraw(&ui, &st2.borrow());
+        match act {
+            Some(MenuAct::Open(i)) => open_device_row(&ui, &st2, i),
+            Some(MenuAct::Eject(i)) => eject_device_row(&ui, &st2, i),
+            _ => {}
+        }
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_menu_dismiss(move || {
+        st2.borrow_mut().ctl.device_menu = None;
+        if let Some(ui) = w2.upgrade() {
+            redraw(&ui, &st2.borrow());
+        }
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_stats_eject(move |index| {
+        let Some(ui) = w2.upgrade() else { return };
+        let id = {
+            let s = st2.borrow();
+            let mount = ui
+                .get_stat_disks()
+                .row_data(index.max(0) as usize)
+                .map(|d| PathBuf::from(d.mount.as_str()));
+            mount.and_then(|m| {
+                s.side
+                    .devices
+                    .iter()
+                    .find(|r| r.path == m)
+                    .and_then(|r| r.drive.clone())
+            })
+        };
+        if let Some(id) = id {
+            eject_drive(&ui, &st2, &id, false);
+        }
+    });
     ui.on_toast_link(move || {
         let Some(ui) = w.upgrade() else { return };
+        if device_toast_button(&ui, &st, false) {
+            return;
+        }
         if ui.get_toast_details().row_count() > 0 || !ui.get_toast_pin().is_empty() {
             let open = {
                 let mut s = st.borrow_mut();
@@ -3543,6 +4506,18 @@ fn landed(ui: &AppWindow, st: &Shared, read: ReadResult) {
     // (they fail cleanly if it is already gone) instead of misdirecting
     // them into the ancestor.
     if refresh_walks_up(&read, &st.borrow().ctl.dir) {
+        // The drive under the open folder went away: say so rather than
+        // dropping into the folder it was mounted in. While Robin ejects
+        // it, hold the folder until the eject lands and goes Home.
+        if on_ejecting(&st.borrow()) {
+            st.borrow_mut().ctl.drop_refresh();
+            return;
+        }
+        let gone = gone_under(&st.borrow());
+        if let Some(g) = gone {
+            show_gone(ui, st, g);
+            return;
+        }
         flush_drops(ui, st);
     }
     let mut s = st.borrow_mut();
@@ -4798,7 +5773,13 @@ fn fill_rows(ui: &AppWindow, s: &State, budget: usize) -> bool {
 /// which draws placeholder rows: never a listing or a selection.
 fn pane_state(ctl: &Controller) -> &'static str {
     let n = ctl.listing.view().len();
-    if !ctl.loaded {
+    if let Some(g) = &ctl.gone {
+        if g.removed {
+            "ejected"
+        } else {
+            "unmounted"
+        }
+    } else if !ctl.loaded {
         "loading"
     } else if ctl.unreadable.is_some() {
         "denied"
@@ -4866,6 +5847,17 @@ fn redraw(ui: &AppWindow, s: &State) {
             .into(),
         );
     }
+    if let Some(g) = &ctl.gone {
+        ui.set_state_title(
+            if g.removed {
+                format!("{} was removed", g.name)
+            } else {
+                format!("{} is not mounted", g.name)
+            }
+            .into(),
+        );
+        ui.set_state_note(SharedString::new());
+    }
     // Rows still streaming in: the bar under the toolbar runs and the
     // status bar says so instead of showing a count that is still growing.
     ui.set_reading(!ctl.loaded || filling);
@@ -4930,6 +5922,7 @@ fn redraw(ui: &AppWindow, s: &State) {
                 Dialog::Conflict { ask, apply_all } => conflict_props(ui, ask, *apply_all),
             }
         }
+        None if ctl.device_menu.is_some() => ui.set_overlay("menu-device".into()),
         None if ctl.searching => ui.set_overlay("search".into()),
         None => ui.set_overlay(SharedString::new()),
     }
@@ -5049,9 +6042,18 @@ fn pump(ui: &AppWindow, st: &Shared) {
             return;
         };
         s.ctl.job_running = true;
+        s.running = Some(job.clone());
         let cancel = Arc::new(Cancel::new());
         s.cancel = Some(cancel.clone());
         (job, s.ctl.env.clone(), cancel)
+    };
+    let check = copy_check(&st.borrow(), &job)
+        .map(|(name, mount, fat)| (name, mount, fat, st.borrow().ctl.mounts.clone()));
+    // Free space and FAT32's file limit, read before a byte is written.
+    let preflight = move |job: &Job| {
+        let (name, mount, fat, mounts) = check?;
+        let free = mounts.space(&mount).map(|s| s.free).unwrap_or(u64::MAX);
+        crate::devices::preflight(&job.src, &job.names, free, fat).map(|p| (name, p))
     };
     ui.set_job_on(true);
     ui.set_job_glyph(job.glyph().into());
@@ -5060,6 +6062,10 @@ fn pump(ui: &AppWindow, st: &Shared) {
     ui.set_job_amount(0.0);
     // Renders have no event loop to post back to: run the job here.
     if SCRIPTED.with(|s| s.get()) {
+        if let Some((name, p)) = preflight(&job) {
+            preflight_refused(ui, st, &name, p);
+            return;
+        }
         let outcome = ops::run(&job, &env, &cancel, &mut |_| {});
         done(ui, st, job, outcome);
         return;
@@ -5069,6 +6075,12 @@ fn pump(ui: &AppWindow, st: &Shared) {
         |n| n.to_string_lossy().into_owned(),
     );
     std::thread::spawn(move || {
+        if let Some((name, p)) = preflight(&job) {
+            let _ = slint::invoke_from_event_loop(move || {
+                with_state(|ui, st| preflight_refused(&ui, st, &name, p));
+            });
+            return;
+        }
         let total = job.names.len();
         let mut seen = 0usize;
         let mut ask = |prompt: &ConflictPrompt| -> Result<ConflictChoice> {
@@ -5330,17 +6342,26 @@ fn with_state(f: impl FnOnce(AppWindow, &Shared)) {
 
 fn done(ui: &AppWindow, st: &Shared, job: Job, outcome: Outcome) {
     ui.set_job_on(false);
+    let yanked = st.borrow_mut().dev.yanked.take();
     let dialog = {
         let mut s = st.borrow_mut();
         s.ctl.job_running = false;
         s.cancel = None;
+        s.running = None;
         let ticket = s.ctl.begin_refresh();
         start_read(ticket);
         s.ctl.finish(&job, &outcome)
     };
     redraw(ui, &st.borrow());
-    let toast = outcome.toast(job.kind);
-    if outcome.done > 0 || !toast.details.is_empty() || outcome.cancelled {
+    let mut toast = outcome.toast(job.kind);
+    let was_yanked = yanked.is_some();
+    if let Some(name) = yanked {
+        // Pulled out mid-job: say so instead of "…, 5 failed, then cancelled".
+        toast.tone = "danger";
+        toast.text = yanked_text(&name, &job, outcome.done);
+        toast.undo = false;
+    }
+    if outcome.done > 0 || !toast.details.is_empty() || outcome.cancelled || was_yanked {
         if toast.undo {
             st.borrow_mut().undo = outcome.trashed.clone();
         }
@@ -5361,6 +6382,20 @@ fn done(ui: &AppWindow, st: &Shared, job: Job, outcome: Outcome) {
         apply(ui, st, Action::Open(d));
     }
     pump(ui, st);
+    eject_when_free(ui, st);
+}
+
+/// "SANDISK was removed: copied 3 of 8 items".
+pub fn yanked_text(name: &str, job: &Job, done: usize) -> String {
+    let verb = match job.kind {
+        ops::JobKind::Copy => "copied",
+        ops::JobKind::Move => "moved",
+        _ => "finished",
+    };
+    format!(
+        "{name} was removed: {verb} {done} of {}",
+        ops::count(job.names.len())
+    )
 }
 
 pub fn set_refusal(ui: &AppWindow, r: &RefusalView) {
@@ -5397,6 +6432,12 @@ fn show_toast(
     } else {
         8
     };
+    hide_toast_after(ui, st, secs);
+}
+
+/// Hide the toast showing now after `secs`, unless another replaced it
+/// or its details were opened.
+fn hide_toast_after(ui: &AppWindow, st: &Shared, secs: u64) {
     let gen = st.borrow().toast_gen;
     let w = ui.as_weak();
     let st = st.clone();
@@ -5404,6 +6445,7 @@ fn show_toast(
         let mut s = st.borrow_mut();
         if s.toast_gen == gen && !s.toast_open {
             s.undo.clear();
+            s.dev.toast = None;
             if let Some(ui) = w.upgrade() {
                 ui.set_toast_on(false);
             }
@@ -5439,7 +6481,10 @@ fn bind_toast(
         s.toast_open = false;
         s.toast_all = details.clone();
         s.toast_pinned = pinned;
+        s.dev.toast = None;
     }
+    ui.set_toast_action2(SharedString::new());
+    ui.set_toast_action2_danger(false);
     ui.set_toast_tone(tone.into());
     ui.set_toast_glyph(toast_glyph(tone).into());
     ui.set_toast_text(text.into());
@@ -5529,6 +6574,10 @@ mod tests {
             count: String::new(),
             usage: None,
             removable: true,
+            mounted: true,
+            read_only: false,
+            drive: None,
+            fs_type: String::new(),
         };
         assert_eq!(
             labels(&[named]),
@@ -8309,5 +9358,115 @@ mod tests {
         cmd.args(["-c", "test \"$(ps -o sid= -p $$ | tr -d ' ')\" = \"$$\""]);
         let status = own_session(&mut cmd).status().unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn eject_blockers_name_our_own_job_on_the_drive() {
+        use crate::ops::{Job, JobKind};
+        let on = |p: &Path| p.starts_with("/run/media/sky/SANDISK");
+        let names = |n: &[&str]| n.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        let to = Job::new(
+            JobKind::Copy,
+            Path::new("/home/sky/Pictures"),
+            names(&["a.jpg", "b.jpg", "c.jpg"]),
+            Path::new("/run/media/sky/SANDISK/photos"),
+        );
+        assert_eq!(
+            blocker_label(&to, "SANDISK", on).as_deref(),
+            Some("Copying 3 items to SANDISK")
+        );
+        let from = Job::new(
+            JobKind::Move,
+            Path::new("/run/media/sky/SANDISK"),
+            names(&["a.jpg"]),
+            Path::new("/home/sky"),
+        );
+        assert_eq!(
+            blocker_label(&from, "SANDISK", on).as_deref(),
+            Some("Moving 1 item from SANDISK")
+        );
+        let elsewhere = Job::new(
+            JobKind::Copy,
+            Path::new("/home/sky"),
+            names(&["a.jpg"]),
+            Path::new("/home/sky/Pictures"),
+        );
+        assert_eq!(blocker_label(&elsewhere, "SANDISK", on), None);
+    }
+
+    #[test]
+    fn device_toasts_read_as_designed() {
+        let d = crate::devices::FakeDrive::stick(
+            "sda1",
+            "SANDISK",
+            29_800_000_000,
+            Path::new("/run/media/sky/SANDISK"),
+        )
+        .drive;
+        assert_eq!(connected_text(&d), "SANDISK connected · 29.8 GB");
+        assert_eq!(
+            in_use_text("SANDISK", Some("vlc")),
+            "SANDISK is in use by vlc"
+        );
+        assert_eq!(
+            in_use_text("SANDISK", None),
+            "SANDISK is in use by another program"
+        );
+        let job = crate::ops::Job::new(
+            crate::ops::JobKind::Copy,
+            Path::new("/home/sky"),
+            (0..8).map(|i| format!("{i}.jpg").into()).collect(),
+            Path::new("/run/media/sky/SANDISK"),
+        );
+        assert_eq!(
+            yanked_text("SANDISK", &job, 3),
+            "SANDISK was removed: copied 3 of 8 items"
+        );
+    }
+
+    #[test]
+    fn copy_preflight_explains_space_and_fat32() {
+        use crate::devices::Preflight;
+        let (tone, text, _) = preflight_toast(
+            "SANDISK",
+            &Preflight::NoSpace {
+                need: 7_000_000_000,
+                free: 6_000_000_000,
+            },
+        );
+        assert_eq!(tone, "danger");
+        assert_eq!(
+            text,
+            "Not enough space on SANDISK: 7.0 GB needed, 6.0 GB free"
+        );
+        let one = Preflight::TooBig(vec![("holo.img".into(), 5_000_000_000)]);
+        let (tone, text, detail) = preflight_toast("SANDISK", &one);
+        assert_eq!(tone, "warning");
+        assert_eq!(text, "holo.img is too big for SANDISK");
+        assert!(detail.iter().any(|l| l.contains("FAT32")));
+        let two = Preflight::TooBig(vec![("a".into(), 5 << 30), ("b".into(), 6 << 30)]);
+        assert_eq!(
+            preflight_toast("SANDISK", &two).1,
+            "2 files are too big for SANDISK"
+        );
+    }
+
+    #[test]
+    fn a_gone_drive_holds_its_state_until_something_else_opens() {
+        let mut c = setup("gone-drive");
+        let pics = c.dir.clone();
+        c.device_gone(Gone {
+            name: "SANDISK".into(),
+            mount: pics.clone(),
+            removed: false,
+            drive: Some("sda1".into()),
+        });
+        assert_eq!(pane_state(&c), "unmounted");
+        assert!(c.begin_refresh().is_none(), "no reread walks up from it");
+        c.gone.as_mut().unwrap().removed = true;
+        assert_eq!(pane_state(&c), "ejected");
+        go(&mut c, pics.join("raw-exports"));
+        assert!(c.gone.is_none());
+        assert_ne!(pane_state(&c), "ejected");
     }
 }

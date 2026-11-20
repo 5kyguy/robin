@@ -18,6 +18,9 @@ pub struct Volume {
     /// The subtree of the source this mount shows (`/` for a whole
     /// filesystem, `/@home` for a btrfs subvolume).
     pub root: String,
+    /// Mounted `ro`: a write-protected card, or a filesystem the kernel
+    /// would only mount read-only.
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +47,9 @@ pub fn volumes_from_mountinfo(text: &str) -> Vec<Volume> {
         let Some(mount_point) = fields.next() else {
             continue;
         };
+        let read_only = fields
+            .next()
+            .is_some_and(|opts| opts.split(',').any(|o| o == "ro"));
         let mut rest = right.split_whitespace();
         let Some(fs_type) = rest.next() else { continue };
         let Some(source) = rest.next() else { continue };
@@ -58,6 +64,7 @@ pub fn volumes_from_mountinfo(text: &str) -> Vec<Volume> {
             fs_type: fs_type.to_string(),
             source: unescape(source),
             root: unescape(root),
+            read_only,
         });
     }
     out
@@ -261,6 +268,24 @@ impl FixtureMounts {
     }
 }
 
+impl FixtureMounts {
+    /// The same table less the mounts of `source`: a stick the device
+    /// renders plug in unmounted.
+    pub fn without(mut self, source: &str) -> Self {
+        self.mountinfo = self
+            .mountinfo
+            .lines()
+            .filter(|l| {
+                volumes_from_mountinfo(l)
+                    .first()
+                    .is_none_or(|v| v.source != source)
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        self
+    }
+}
+
 impl MountSource for FixtureMounts {
     fn volumes(&self) -> Result<Vec<Volume>> {
         Ok(volumes_from_mountinfo(&self.mountinfo))
@@ -354,6 +379,7 @@ mod tests {
             fs_type: "ext4".into(),
             source: "/dev/robin-none".into(),
             root: "/".into(),
+            read_only: false,
         };
         assert!(system_removable(&v("/media/sky/STICK"), Some("sky")));
         assert_eq!(
@@ -379,6 +405,15 @@ mod tests {
             "30 1 0:40 /@ / rw - btrfs /dev/sda2 rw\n31 1 0:40 /@home /home rw - btrfs /dev/sda2 rw\n",
         );
         assert_eq!((v[0].root.as_str(), v[1].root.as_str()), ("/@", "/@home"));
+    }
+
+    #[test]
+    fn mountinfo_reads_the_read_only_flag() {
+        let v = volumes_from_mountinfo(
+            "41 22 8:17 / /run/media/sky/CARD ro,nosuid,nodev - vfat /dev/sdb1 ro\n42 22 8:18 / /run/media/sky/STICK rw,nosuid - exfat /dev/sdc1 rw\n",
+        );
+        assert!(v[0].read_only);
+        assert!(!v[1].read_only, "rw, and `nosuid` isn't `ro`");
     }
 
     #[test]

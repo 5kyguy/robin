@@ -59,7 +59,151 @@ pub fn scripted(view: &str) -> bool {
             | "stats-real"
             | "stats-scanning"
             | "stats-scanning-first"
+            | "devices-plugged"
+            | "devices-mounted"
+            | "devices-read-only"
+            | "devices-busy-copy"
+            | "devices-busy-other"
+            | "devices-safe-unplug"
+            | "devices-removed"
+            | "devices-unmounted"
+            | "devices-no-space"
+            | "devices-fat-too-big"
+            | "devices-stats"
+            | "devices-menu"
     )
+}
+
+/// The fake stick the `devices-*` scenes plug in: the fixture's SANDISK,
+/// unmounted until the scene mounts it.
+fn sandisk(root: &Path, view: &str) -> crate::devices::FakeDrive {
+    let mut d = crate::devices::FakeDrive::stick(
+        "sda1",
+        "SANDISK",
+        29_800_000_000,
+        &root.join("media/sky/SANDISK"),
+    );
+    d.read_only = view == "devices-read-only";
+    if view == "devices-fat-too-big" {
+        d.drive.fs_type = "vfat".into();
+    }
+    d.busy = view == "devices-busy-other";
+    // The statistics scene keeps the fixture's mount table, where SANDISK
+    // is already mounted, so its DISKS card lists the drive.
+    if view == "devices-stats" {
+        d.drive.mount_points = vec![root.join("media/sky/SANDISK")];
+    }
+    d
+}
+
+/// The DEVICES row named `name`, as a click would find it.
+fn device_row(ui: &AppWindow, name: &str) -> Result<i32> {
+    use slint::Model;
+    let rows = ui.get_device_places();
+    (0..rows.row_count())
+        .find(|&i| rows.row_data(i).is_some_and(|p| p.name == name))
+        .map(|i| i as i32)
+        .ok_or_else(|| Error::Message(format!("no DEVICES row named {name}")))
+}
+
+/// Play a `devices-*` scene against the fake backend.
+fn device_scene(
+    ui: &AppWindow,
+    view: &str,
+    root: &Path,
+    home: &Path,
+    fake: &crate::devices::FakeDevices,
+) -> Result<()> {
+    use crate::ops::{Job, JobKind};
+    let stick = root.join("media/sky/SANDISK");
+    // Every scene but the arrival starts with the stick already in, so
+    // it gets no toast (it was there at startup), then mounts it with a
+    // click on its row.
+    if view == "devices-plugged" {
+        fake.plug(sandisk(root, view));
+        app::devices_poll();
+        app::land_reads();
+        return Ok(());
+    }
+    let mount = |ui: &AppWindow| -> Result<()> {
+        ui.invoke_place_open(1, device_row(ui, "SANDISK")?);
+        app::land_reads();
+        Ok(())
+    };
+    mount(ui)?;
+    let back_home = |ui: &AppWindow| {
+        use slint::Model;
+        let pinned = ui.get_pinned_places();
+        let at = (0..pinned.row_count())
+            .find(|&i| pinned.row_data(i).is_some_and(|p| p.name == "Pictures"))
+            .unwrap_or(0);
+        ui.invoke_place_open(0, at as i32);
+        app::land_reads();
+    };
+    let names = |n: &[&str]| n.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+    match view {
+        "devices-busy-copy" => {
+            back_home(ui);
+            app::hold_job(Job::new(
+                JobKind::Copy,
+                &home.join("Pictures"),
+                names(&[
+                    "dune-sunset-0412.jpg",
+                    "dune-sunset-0413.jpg",
+                    "speeder-run.mp4",
+                ]),
+                &stick,
+            ));
+            ui.invoke_place_eject(device_row(ui, "SANDISK")?);
+        }
+        "devices-busy-other" => {
+            back_home(ui);
+            *fake.holder.lock().unwrap_or_else(|e| e.into_inner()) = Some("vlc".into());
+            ui.invoke_place_eject(device_row(ui, "SANDISK")?);
+        }
+        "devices-safe-unplug" => {
+            ui.invoke_place_eject(device_row(ui, "SANDISK")?);
+            app::land_reads();
+        }
+        "devices-removed" => {
+            fake.unplug("sda1");
+            app::devices_poll();
+            app::land_reads();
+        }
+        "devices-unmounted" => {
+            fake.unmount_elsewhere("sda1");
+            app::devices_poll();
+            app::land_reads();
+        }
+        "devices-menu" => {
+            back_home(ui);
+            // Just under the row, where a right-click on it opens the menu.
+            ui.invoke_place_menu(device_row(ui, "SANDISK")?, 150.0, 380.0);
+        }
+        "devices-stats" => {
+            ui.invoke_stats_open();
+            app::land_reads();
+        }
+        "devices-no-space" | "devices-fat-too-big" => {
+            back_home(ui);
+            // Sparse: 7 GB on paper, nothing on disk. The fixture leaves
+            // SANDISK 6 GB free; FAT32 refuses it for size alone.
+            let src = home.join("Downloads");
+            let img = src.join("holo-archive.img");
+            let f = std::fs::File::create(&img).map_err(|e| Error::io(&img, e))?;
+            f.set_len(7_000_000_000).map_err(|e| Error::io(&img, e))?;
+            app::run_job(Job::new(
+                JobKind::Copy,
+                &src,
+                names(&["holo-archive.img"]),
+                &stick,
+            ));
+            app::land_reads();
+            let _ = std::fs::remove_file(&img);
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub struct Options<'a> {
@@ -189,7 +333,18 @@ fn paint_in(
         seed_media(view, home)?;
         crate::fixture::freeze_times(root, FIXTURE_MTIME)?;
     }
-    let mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(root))?;
+    let mut mounts = crate::mounts::FixtureMounts::load(&crate::fixture::mounts_dir(root))?;
+    // The device scenes plug SANDISK in through the fake backend instead.
+    let fake = crate::devices::FakeDevices::new();
+    let devices = view.starts_with("devices-").then(|| {
+        if view != "devices-plugged" {
+            fake.plug(sandisk(root, view));
+        }
+        fake.clone() as Arc<dyn crate::devices::DeviceBackend>
+    });
+    if devices.is_some() && view != "devices-stats" {
+        mounts = mounts.without("/dev/sda1");
+    }
     if view.starts_with("stats-") {
         seed_cache(home)?;
     }
@@ -215,6 +370,7 @@ fn paint_in(
         clock: Some((FROZEN_NOW, FROZEN_OFFSET)),
         mounts: Arc::new(mounts),
         prefs,
+        devices,
     })?;
     // A view file left by a build that still had the density toggle:
     // the app stays comfortable whatever it says.
@@ -405,6 +561,7 @@ fn paint_in(
             ui.invoke_trash_restore();
             app::land_reads();
         }
+        v if v.starts_with("devices-") => device_scene(&ui, v, root, home, &fake)?,
         _ => {}
     }
     snapshot(&ui, size, out)

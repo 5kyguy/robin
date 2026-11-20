@@ -53,6 +53,19 @@ fn scripted_views_render_through_the_real_app() {
         ("stats-real", 1100),
         ("stats-scanning", 1100),
         ("stats-scanning-first", 1100),
+        // Removable drives against the fake backend.
+        ("devices-plugged", 800),
+        ("devices-mounted", 800),
+        ("devices-read-only", 800),
+        ("devices-busy-copy", 800),
+        ("devices-busy-other", 800),
+        ("devices-safe-unplug", 800),
+        ("devices-removed", 800),
+        ("devices-unmounted", 800),
+        ("devices-no-space", 800),
+        ("devices-fat-too-big", 800),
+        ("devices-stats", 1100),
+        ("devices-menu", 800),
         // The 480px floor: the info panel floats, the filmstrip is cut
         // to the window, and the statistics cards stack.
         ("view-info", 480),

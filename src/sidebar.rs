@@ -25,6 +25,16 @@ pub struct SideEntry {
     pub usage: Option<f32>,
     /// A drive meant to be unplugged; breadcrumbs root at its label.
     pub removable: bool,
+    /// False for a drive plugged in but not mounted: its name is muted,
+    /// it has no bar, and a click mounts it. `path` is empty then.
+    pub mounted: bool,
+    /// Mounted read-only: the row gets a "Read-only" pill.
+    pub read_only: bool,
+    /// The device backend's id, when the backend knows this drive: it
+    /// can be mounted and ejected.
+    pub drive: Option<String>,
+    /// The mount's filesystem, for the FAT32 file-size check.
+    pub fs_type: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -45,6 +55,9 @@ pub struct SideJob {
     pub dir: PathBuf,
     /// Shared across jobs so a hung drive is probed by one thread at most.
     pub probe: Arc<SpaceProbe>,
+    /// Removable drives the device backend lists (none without one):
+    /// unmounted ones get their own rows, mounted ones their id.
+    pub drives: Vec<crate::devices::Drive>,
 }
 
 /// One side job in flight at a time. A request while one runs marks the
@@ -330,24 +343,70 @@ impl SideJob {
 
     fn devices(&self, volumes: &[Volume]) -> Vec<SideEntry> {
         let removable = |v: &Volume| self.mounts.removable(v);
-        devices(volumes, self.env.home.as_deref(), &removable)
+        let mut out: Vec<SideEntry> = devices(volumes, self.env.home.as_deref(), &removable)
             .into_iter()
             .map(|(v, glyph, name, removable)| {
                 let path = PathBuf::from(&v.mount_point);
-                let space = self.probe.space(&self.mounts, &path);
-                let usage = space.and_then(used);
+                let drive = self.drives.iter().find(|d| d.mount_points.contains(&path));
+                let usage = self.probe.space(&self.mounts, &path).and_then(used);
                 SideEntry {
-                    glyph,
+                    glyph: if drive.is_some() { "󰕓" } else { glyph },
                     name,
                     path,
-                    count: usage
-                        .map(|u| format!("{}%", (u * 100.0).round() as u32))
-                        .unwrap_or_default(),
+                    count: percent(usage),
                     usage,
-                    removable,
+                    removable: removable || drive.is_some(),
+                    mounted: true,
+                    read_only: v.read_only || drive.is_some_and(|d| d.read_only),
+                    drive: drive.map(|d| d.id.clone()),
+                    fs_type: v.fs_type.clone(),
                 }
             })
-            .collect()
+            .collect();
+        // Drives the mount table doesn't show: plugged in but not mounted,
+        // or mounted where this process's mountinfo can't see.
+        for d in &self.drives {
+            if out
+                .iter()
+                .any(|r| r.drive.as_deref() == Some(d.id.as_str()))
+            {
+                continue;
+            }
+            let row = match d.mounted() {
+                Some(m) => {
+                    let usage = self.probe.space(&self.mounts, m).and_then(used);
+                    SideEntry {
+                        glyph: "󰕓",
+                        name: m
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| d.name()),
+                        path: m.to_path_buf(),
+                        count: percent(usage),
+                        usage,
+                        removable: true,
+                        mounted: true,
+                        read_only: d.read_only,
+                        drive: Some(d.id.clone()),
+                        fs_type: d.fs_type.clone(),
+                    }
+                }
+                None => SideEntry {
+                    glyph: "󰕓",
+                    name: d.name(),
+                    path: PathBuf::new(),
+                    count: String::new(),
+                    usage: None,
+                    removable: true,
+                    mounted: false,
+                    read_only: false,
+                    drive: Some(d.id.clone()),
+                    fs_type: d.fs_type.clone(),
+                },
+            };
+            out.push(row);
+        }
+        out
     }
 
     fn trash(&self) -> SideEntry {
@@ -364,6 +423,10 @@ impl SideJob {
             path: files,
             usage: None,
             removable: false,
+            mounted: true,
+            read_only: false,
+            drive: None,
+            fs_type: String::new(),
         }
     }
 
@@ -383,7 +446,18 @@ fn folder(glyph: &'static str, name: String, path: PathBuf, count: String) -> Si
         count,
         usage: None,
         removable: false,
+        mounted: true,
+        read_only: false,
+        drive: None,
+        fs_type: String::new(),
     }
+}
+
+/// "42%" for a device's count column; blank when its space is unknown.
+fn percent(usage: Option<f32>) -> String {
+    usage
+        .map(|u| format!("{}%", (u * 100.0).round() as u32))
+        .unwrap_or_default()
 }
 
 /// Entries not starting with `.`, counted only for a real folder (not a
@@ -578,7 +652,8 @@ pub fn picked(data: &SideData, dir: &Path) -> Option<(usize, usize)> {
         .enumerate()
     {
         for (i, r) in rows.iter().enumerate() {
-            if !dir.starts_with(&r.path) {
+            // An unmounted drive has no folder to be in.
+            if r.path.as_os_str().is_empty() || !dir.starts_with(&r.path) {
                 continue;
             }
             let depth = r.path.components().count();
@@ -601,6 +676,7 @@ mod tests {
             fs_type: fs.into(),
             source: source.into(),
             root: "/".into(),
+            read_only: false,
         }
     }
 
@@ -693,6 +769,7 @@ mod tests {
             mounts: Arc::new(FixtureMounts::load(&crate::fixture::mounts_dir(&top)).unwrap()),
             dir: stick.clone(),
             probe: SpaceProbe::new(Duration::from_secs(5)),
+            drives: Vec::new(),
         };
         let d = job.perform();
         let pinned: Vec<_> = d
@@ -745,12 +822,52 @@ mod tests {
     }
 
     #[test]
+    fn backend_drives_mark_their_rows_and_add_unmounted_ones() {
+        let root = std::env::temp_dir().join(format!("robin-side-drives-{}", std::process::id()));
+        let _ = crate::fixture::remove(&root);
+        crate::fixture::materialize(&root).unwrap();
+        let top = root.clone();
+        let home = crate::fixture::home(&top);
+        let stick = top.join("media/sky/SANDISK");
+        let mut mounted =
+            crate::devices::FakeDrive::stick("sda1", "SANDISK", 64 << 30, &stick).drive;
+        mounted.mount_points = vec![stick.clone()];
+        mounted.read_only = true;
+        let mut card = crate::devices::FakeDrive::stick("sdb1", "CARD", 32 << 30, &stick).drive;
+        card.mount_points.clear();
+        let job = SideJob {
+            env: Env::for_home(&home),
+            mounts: Arc::new(FixtureMounts::load(&crate::fixture::mounts_dir(&top)).unwrap()),
+            dir: home.clone(),
+            probe: SpaceProbe::new(Duration::from_secs(5)),
+            drives: vec![mounted, card],
+        };
+        let d = job.perform();
+        let sandisk = d.devices.iter().find(|e| e.name == "SANDISK").unwrap();
+        assert_eq!(sandisk.drive.as_deref(), Some("sda1"));
+        assert!(sandisk.mounted && sandisk.read_only && sandisk.removable);
+        let card = d.devices.iter().find(|e| e.name == "CARD").unwrap();
+        assert!(!card.mounted && card.path.as_os_str().is_empty());
+        assert_eq!(
+            (card.count.as_str(), card.drive.as_deref()),
+            ("", Some("sdb1"))
+        );
+        assert_eq!(
+            picked(&d, Path::new("/")),
+            Some((1, 0)),
+            "an unmounted row never lights for a folder"
+        );
+        crate::fixture::remove(&top).unwrap();
+    }
+
+    #[test]
     fn no_home_means_no_pinned_but_still_trash() {
         let job = SideJob {
             env: Env::from_vars(None, Some("/nonexistent-data".into())),
             mounts: Arc::new(crate::mounts::SystemMounts),
             dir: PathBuf::from("/"),
             probe: SpaceProbe::new(Duration::from_secs(5)),
+            drives: Vec::new(),
         };
         let d = job.perform();
         assert!(d.pinned.is_empty());
@@ -805,6 +922,7 @@ mod tests {
             mounts: Arc::new(crate::mounts::SystemMounts),
             dir: home.clone(),
             probe: SpaceProbe::new(Duration::from_secs(5)),
+            drives: Vec::new(),
         };
         assert!(job.pinned().iter().any(|e| e.name == "Snaps"));
         std::fs::remove_dir_all(&root).unwrap();
@@ -866,6 +984,7 @@ mod tests {
             mounts: Arc::new(crate::mounts::SystemMounts),
             dir: home.clone(),
             probe: SpaceProbe::new(Duration::from_secs(5)),
+            drives: Vec::new(),
         };
         let names: Vec<String> = job.pinned().into_iter().map(|e| e.name).collect();
         assert_eq!(names, ["Home"], "a link and a file are skipped");

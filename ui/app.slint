@@ -52,6 +52,12 @@ export struct Place {
     usage: float,
     level: int,
     section: int,
+    // A drive plugged in but not mounted: name in `muted`, no bar.
+    dim: bool,
+    // The backend can eject it: the 22×22 eject button shows on hover.
+    eject: bool,
+    // "Read-only", drawn as a small `muted` pill; empty for none.
+    pill: string,
 }
 
 // A searched name split around the part that matched.
@@ -117,6 +123,8 @@ export struct StatDisk {
     level: int,
     pct: string,
     free: string,
+    // A removable drive Robin can eject: the row gets an eject button.
+    eject: bool,
 }
 
 export struct StatType {
@@ -225,10 +233,27 @@ component SideRow inherits Rectangle {
     // usage bar is gone, a dot on the icon says so.
     in property <bool> dot;
     in property <color> dot-color;
+    // DEVICES rows: an unmounted drive's muted name, the read-only pill,
+    // and the eject button shown on hover.
+    in property <bool> dim;
+    in property <string> pill;
+    in property <bool> eject;
+    in property <color> hover-bg;
     callback clicked;
+    callback eject-clicked;
+    // A right click, at the pointer in window coordinates.
+    callback menu(length, length);
     height: side-row;
     border-radius: 6px;
-    TouchArea { clicked => { root.clicked(); } }
+    property <bool> show-eject: eject && !rail && (row-touch.has-hover || eject-touch.has-hover);
+    row-touch := TouchArea {
+        clicked => { root.clicked(); }
+        pointer-event(ev) => {
+            if ev.button == PointerEventButton.right && ev.kind == PointerEventKind.down {
+                root.menu(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y);
+            }
+        }
+    }
     background: picked ? selected-bg : transparent;
     border-width: picked ? 1px : 0px;
     border-color: accent;
@@ -255,15 +280,42 @@ component SideRow inherits Rectangle {
         text: name;
         x: 38px;
         y: 0px;
-        width: parent.width - 38px - 72px;
+        width: parent.width - 38px - 72px - (pill != "" ? pill-box.width + 6px - 36px : 0px);
         height: parent.height;
         font-size: 12px;
-        color: ink;
+        color: dim ? muted : ink;
         horizontal-alignment: left;
         vertical-alignment: center;
         overflow: elide;
     }
-    if !rail: Text {
+    pill-box := Rectangle {
+        visible: !rail && pill != "";
+        width: pill-text.preferred-width + 12px;
+        height: 16px;
+        x: parent.width - 8px - 36px - self.width;
+        y: (parent.height - self.height) / 2;
+        border-radius: 8px;
+        background: muted.with-alpha(0.14);
+        pill-text := Text { text: pill; font-size: 10px; color: muted; horizontal-alignment: center; vertical-alignment: center; }
+    }
+    if show-eject: Rectangle {
+        x: parent.width - 4px - 22px;
+        y: (parent.height - 22px) / 2;
+        width: 22px;
+        height: 22px;
+        border-radius: 4px;
+        background: eject-touch.has-hover ? hover-bg : transparent;
+        Text { text: "󰕓"; font-size: 14px; color: eject-touch.has-hover ? ink : muted; horizontal-alignment: center; vertical-alignment: center; }
+    }
+    eject-touch := TouchArea {
+        x: parent.width - 4px - 22px;
+        y: (parent.height - 22px) / 2;
+        width: eject && !rail ? 22px : 0px;
+        height: 22px;
+        mouse-cursor: pointer;
+        clicked => { root.eject-clicked(); }
+    }
+    if !rail && !show-eject: Text {
         text: count;
         x: parent.width - 8px - 64px;
         y: 0px;
@@ -954,6 +1006,19 @@ export component AppWindow inherits Window {
     in property <float> job-amount;
     in property <bool> toast-on: false;
     in property <string> toast-action: "";
+    // A second button right of the first: [Wait] [Cancel copy] or
+    // [Retry] [Force]. Force is drawn in `danger`.
+    in property <string> toast-action2: "";
+    in property <bool> toast-action2-danger: false;
+    // The DEVICES row menu: its lines and where it was opened.
+    in property <[MenuItem]> device-menu-items;
+    in property <length> menu-at-x: 0px;
+    in property <length> menu-at-y: 0px;
+    // The LUKS unlock dialog (mock only): the typed passphrase as dots,
+    // and the inline error after a wrong one.
+    in property <string> unlock-name: "";
+    in property <string> unlock-text: "";
+    in property <string> unlock-error: "";
     in property <bool> toast-open: false;
     // "Copy 2 items to raw-exports" while a drag is over a folder.
     in property <string> drag-label: "";
@@ -967,6 +1032,15 @@ export component AppWindow inherits Window {
     callback row-open(int);
     /// A sidebar row: section 0 pinned, 1 devices, 2 trash.
     callback place-open(int, int);
+    // DEVICES: a row's eject button, and its right-click menu.
+    callback place-eject(int);
+    callback place-menu(int, length, length);
+    callback device-menu-pick(int);
+    callback menu-dismiss();
+    // The statistics DISKS card's eject button, by disk row.
+    callback stats-eject(int);
+    // A device toast's second button: [Cancel copy] or [Force].
+    callback toast-link2();
     callback dialog-button(int);
     callback job-cancel();
     callback toast-link();
@@ -1083,6 +1157,12 @@ export component AppWindow inherits Window {
                     spacing: 1px;
                     SideRow {
                         clicked => { root.place-open(1, i); }
+                        eject-clicked => { root.place-eject(i); }
+                        menu(x, y) => { root.place-menu(i, x, y); }
+                        dim: place.dim;
+                        pill: place.pill;
+                        eject: place.eject;
+                        hover-bg: root.hover;
                         glyph: place.glyph;
                         name: place.name;
                         count: place.count;
@@ -1625,11 +1705,11 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                if state == "empty" || state == "trash-empty" || state == "denied" || state == "unmounted" || state == "ejected" || state == "nosearch": VerticalLayout {
+                if state == "empty" || state == "trash-empty" || state == "denied" || state == "unmounted" || state == "ejected" || state == "nosearch" || state == "phone-waiting": VerticalLayout {
                     alignment: center;
                     width: parent.width;
                     Text {
-                        text: state == "empty" ? "󰉖" : state == "trash-empty" ? "󰩺" : state == "denied" ? "󰌾" : state == "nosearch" ? "󰍉" : "󰕓";
+                        text: state == "empty" ? "󰉖" : state == "trash-empty" ? "󰩺" : state == "denied" ? "󰌾" : state == "nosearch" ? "󰍉" : state == "phone-waiting" ? "󰄜" : "󰕓";
                         font-size: 64px;
                         color: state == "denied" || state == "ejected" ? warning.with-alpha(0.6) : muted.with-alpha(0.6);
                         horizontal-alignment: center;
@@ -1637,7 +1717,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 12px; }
                     Text {
-                        text: state == "empty" ? "This folder is empty" : state == "trash-empty" ? "Trash is empty" : state == "denied" ? state-title : state == "unmounted" ? "SANDISK is not mounted" : state == "ejected" ? "SANDISK was removed" : state-title;
+                        text: state == "empty" ? "This folder is empty" : state == "trash-empty" ? "Trash is empty" : state == "denied" ? state-title : state-title;
                         font-size: 18px;
                         font-weight: 700;
                         color: text;
@@ -1646,7 +1726,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 6px; }
                     Text {
-                        text: state == "empty" ? "Drop files here or press Ctrl+N" : state == "trash-empty" ? "Files you move to the trash wait here until you empty it." : state == "denied" ? state-note : state == "nosearch" ? state-note : "";
+                        text: state == "empty" ? "Drop files here or press Ctrl+N" : state == "trash-empty" ? "Files you move to the trash wait here until you empty it." : state == "denied" || state == "nosearch" || state == "phone-waiting" ? state-note : "";
                         font-size: 11px;
                         color: muted;
                         horizontal-alignment: center;
@@ -1688,6 +1768,11 @@ export component AppWindow inherits Window {
                             label: "Search hidden files";
                             ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover;
                             clicked => { root.state-action("search-hidden"); }
+                        }
+                        if state == "phone-waiting": StateButton {
+                            label: "Retry";
+                            ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover;
+                            clicked => { root.state-action("retry"); }
                         }
                         if state == "nosearch": StateButton {
                             label: "Clear";
@@ -1812,7 +1897,10 @@ export component AppWindow inherits Window {
         property <color> tone: toast-tone == "warning" ? warning : toast-tone == "danger" ? danger : muted;
         property <length> line-h: 20px;
         // Fit the line, 520px to 800px, and never wider than the window.
-        width: min(max(520px, min(800px, toast-line.preferred-width + 42px + 120px)), parent.width - side-w - 32px);
+        // The buttons' room on the right: 96 for one, both side by side
+        // (16 apart) for a device toast's pair.
+        property <length> acts-w: toast-action2 == "" ? 96px : act1.preferred-width + 16px + act2.preferred-width;
+        width: min(max(520px, min(800px, toast-line.preferred-width + 42px + acts-w + 24px)), parent.width - side-w - 32px);
         // A pinned line, then up to seven items and "+N more"; expanded,
         // the items scroll past 240px so the toast never covers the list.
         property <length> pin-h: toast-pin != "" ? line-h : 0px;
@@ -1853,18 +1941,33 @@ export component AppWindow inherits Window {
             text: toast-text;
             x: 42px;
             y: 0px;
-            width: parent.width - 42px - 120px;
+            width: parent.width - 42px - parent.acts-w - 24px;
             height: 52px;
             font-size: 13px;
             color: text;
             overflow: elide;
             vertical-alignment: center;
         }
-        Text {
-            text: toast-details.length == 0 ? toast-action : open ? "Hide details" : "Details";
-            x: parent.width - 16px - self.width;
+        act2 := Text {
+            visible: toast-action2 != "";
+            text: toast-action2;
+            x: parent.width - 16px - self.preferred-width;
             y: 0px;
-            width: 96px;
+            width: self.preferred-width;
+            height: 52px;
+            font-size: 12px;
+            color: toast-action2-danger ? danger : accent;
+            vertical-alignment: center;
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.toast-link2(); }
+            }
+        }
+        act1 := Text {
+            text: toast-details.length == 0 ? toast-action : open ? "Hide details" : "Details";
+            x: toast-action2 == "" ? parent.width - 16px - self.width : parent.width - 16px - act2.preferred-width - 16px - self.width;
+            y: 0px;
+            width: toast-action2 == "" ? 96px : self.preferred-width;
             height: 52px;
             font-size: 12px;
             color: accent;
@@ -2138,6 +2241,95 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+            }
+        }
+    }
+
+    // The DEVICES row menu, at the pointer; a click anywhere else closes it.
+    if !harness && overlay == "menu-device": Rectangle {
+        TouchArea { clicked => { root.menu-dismiss(); } }
+        Rectangle {
+            width: min(200px, parent.width - 16px);
+            height: min(device-menu-list.preferred-height, parent.height - 16px);
+            x: menu-at-x + self.width + 8px <= parent.width ? menu-at-x : max(8px, min(menu-at-x, parent.width - 8px) - self.width);
+            y: menu-at-y + self.height + 8px <= parent.height ? menu-at-y : max(8px, min(menu-at-y, parent.height - 8px) - self.height);
+            clip: true;
+            background: surface;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #000000.with-alpha(0.35);
+            device-menu-list := VerticalLayout {
+                padding: 4px;
+                spacing: 0px;
+                for item[i] in device-menu-items: Rectangle {
+                    height: item.sep ? 9px : 28px;
+                    if item.sep: Rectangle { x: 4px; y: 4px; width: parent.width - 8px; height: 1px; background: divider; }
+                    if !item.sep: Rectangle {
+                        border-radius: 6px;
+                        background: device-item-touch.has-hover ? selected : transparent;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 8px;
+                            Text { text: item.glyph; width: 16px; font-size: 14px; color: muted; vertical-alignment: center; horizontal-alignment: center; }
+                            Text { text: item.label; font-size: 12px; color: text; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                        }
+                        device-item-touch := TouchArea { clicked => { root.device-menu-pick(i); } }
+                    }
+                }
+            }
+        }
+    }
+
+    // Unlock an encrypted drive (DESIGN §4): 400 wide, a passphrase
+    // field, [Cancel] [Unlock]; a wrong passphrase shows inline in
+    // `danger`. Drawn by --render-mock only in this release.
+    if !harness && overlay == "unlock": Rectangle {
+        background: #000000.with-alpha(0.6);
+        TouchArea { }
+        Rectangle {
+            width: min(400px, parent.width - 32px);
+            height: unlock-error != "" ? 196px : 172px;
+            x: (parent.width - self.width) / 2;
+            y: max(0px, (parent.height - self.height) / 2);
+            background: surface;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            Text { text: "󰌾"; x: 20px; y: 18px; width: 18px; height: 22px; font-size: 16px; color: muted; vertical-alignment: center; }
+            Text { text: "Unlock " + unlock-name; x: 46px; y: 18px; width: parent.width - 66px; height: 22px; font-size: 13px; font-weight: 700; color: text; overflow: elide; vertical-alignment: center; }
+            Text { text: unlock-name + " is encrypted. Enter its passphrase to open it."; x: 20px; y: 46px; width: parent.width - 40px; height: 18px; font-size: 11px; color: muted; overflow: elide; vertical-alignment: center; }
+            Rectangle {
+                x: 20px;
+                y: 74px;
+                width: parent.width - 40px;
+                height: 30px;
+                border-radius: 6px;
+                background: bg;
+                border-width: unlock-error != "" ? 1px : 2px;
+                border-color: unlock-error != "" ? danger : accent;
+                Text {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    height: parent.height;
+                    text: unlock-text == "" ? "Passphrase" : unlock-text;
+                    font-size: 12px;
+                    color: unlock-text == "" ? muted : text;
+                    vertical-alignment: center;
+                }
+            }
+            if unlock-error != "": Text { text: unlock-error; x: 20px; y: 110px; width: parent.width - 40px; height: 18px; font-size: 11px; color: danger; overflow: elide; vertical-alignment: center; }
+            HorizontalLayout {
+                x: 20px;
+                y: parent.height - 16px - 32px;
+                width: parent.width - 40px;
+                height: 32px;
+                alignment: end;
+                spacing: 8px;
+                StateButton { label: "Cancel"; ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover; }
+                StateButton { label: "Unlock"; primary: true; ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover; }
             }
         }
     }
@@ -3214,8 +3406,20 @@ export component AppWindow inherits Window {
                     fill: d.level == 2 ? root.danger : d.level == 1 ? root.warning : root.accent;
                     track: root.text.with-alpha(0.12);
                 }
-                Text { text: d.pct; x: parent.tight ? parent.width - 16px - 72px : parent.width - 268px; y: -4px; width: 72px; height: 28px; font-size: 22px; font-weight: 700; color: text; horizontal-alignment: right; }
-                Text { text: d.free; x: parent.tight ? 160px : parent.width - 188px; y: parent.tight ? 18px : 2px; width: parent.tight ? max(0px, parent.meter-w) : 172px; height: parent.tight ? 16px : 20px; font-size: 11px; color: muted; overflow: elide; }
+                // Room for the eject button at the right edge.
+                property <length> ej: d.eject ? 30px : 0px;
+                Text { text: d.pct; x: parent.tight ? parent.width - 16px - 72px - parent.ej : parent.width - 268px - parent.ej; y: -4px; width: 72px; height: 28px; font-size: 22px; font-weight: 700; color: text; horizontal-alignment: right; }
+                Text { text: d.free; x: parent.tight ? 160px : parent.width - 188px - parent.ej; y: parent.tight ? 18px : 2px; width: parent.tight ? max(0px, parent.meter-w - parent.ej) : 172px; height: parent.tight ? 16px : 20px; font-size: 11px; color: muted; overflow: elide; }
+                if d.eject: Rectangle {
+                    x: parent.width - 12px - 22px;
+                    y: 7px;
+                    width: 22px;
+                    height: 22px;
+                    border-radius: 4px;
+                    background: disk-eject.has-hover ? root.hover : transparent;
+                    Text { text: "󰕓"; font-size: 14px; color: disk-eject.has-hover ? root.text : root.muted; horizontal-alignment: center; vertical-alignment: center; }
+                    disk-eject := TouchArea { mouse-cursor: pointer; clicked => { root.stats-eject(i); } }
+                }
             }
         }
         Rectangle {

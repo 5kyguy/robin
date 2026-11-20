@@ -559,6 +559,7 @@ mod tests {
                 fs_type: "ext4".into(),
                 source: source.into(),
                 root: "/".into(),
+                read_only: false,
             };
             Ok(vec![
                 v("/", "/dev/nvme0n1p2"),
