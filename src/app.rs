@@ -5171,6 +5171,12 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         st_more.borrow_mut().toasts.set_stack_expanded(true);
         bind_toasts(&ui, &st_more);
     });
+    let (w_fewer, st_fewer) = (ui.as_weak(), state.clone());
+    ui.on_parked_more_collapse(move || {
+        let Some(ui) = w_fewer.upgrade() else { return };
+        st_fewer.borrow_mut().toasts.set_stack_expanded(false);
+        bind_toasts(&ui, &st_fewer);
+    });
     ui.on_toast_link(move || {
         let Some(ui) = w.upgrade() else { return };
         if device_toast_button(&ui, &st, false) {
@@ -8098,6 +8104,7 @@ fn bind_toasts(ui: &AppWindow, st: &Shared) {
             .collect::<Vec<_>>(),
     ))));
     ui.set_parked_more(s.toasts.collapsed_count(height) as i32);
+    ui.set_parked_footer(s.toasts.footer(height).into());
 }
 
 /// Logical window height, for how many sticky toasts are drawn in full.

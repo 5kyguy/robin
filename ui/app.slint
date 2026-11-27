@@ -1138,6 +1138,8 @@ export component AppWindow inherits Window {
     // 600px tall); older ones are counted in parked-more.
     in property <[ParkedToast]> parked-toasts;
     in property <int> parked-more: 0;
+    // "+N more" or "Show fewer"; empty when every sticky toast is shown.
+    in property <string> parked-footer: "";
     // "Copy 2 items to raw-exports" while a drag is over a folder.
     in property <string> drag-label: "";
     in property <string> drag-glyph: "󰆏";
@@ -1198,8 +1200,9 @@ export component AppWindow inherits Window {
     // [Dismiss] (or Cancel) on a parked sticky toast; the int is its
     // index in parked-toasts (0 is the newest one currently drawn).
     callback parked-toast-link(int);
-    // Expand the muted "+N more" line under the sticky stack.
+    // Expand or collapse the muted "+N more" / "Show fewer" line.
     callback parked-more-expand();
+    callback parked-more-collapse();
     forward-focus: keys;
 
     title: "Robin";
@@ -1218,10 +1221,14 @@ export component AppWindow inherits Window {
     // Toasts sit 16px above the status bar, or above the progress strip
     // while it shows, so they never hide a job's progress or its Cancel.
     property <length> toast-floor: status-h + (job-on && !view-on ? 44px : 0px);
-    // Height of the parked sticky stack (and its "+N more" line), used
-    // to lift a timed toast 8px above it. The sticky stack itself sits
-    // 16px above toast-floor.
-    property <length> under-toast-stack: (parked-toasts.length > 0 || parked-more > 0) ? parked-stack.height + 8px : 0px;
+    // Height of the parked sticky stack (and its footer), used to lift
+    // a timed toast 8px above it. The sticky stack itself sits 16px
+    // above toast-floor. The whole stack, including the current toast,
+    // is capped 16px below the toolbar.
+    out property <length> toast-stack-room: max(0px, root.height - toolbar-h - toast-floor - 32px);
+    out property <length> parked-stack-h: parked-stack.height;
+    property <length> parked-budget: max(0px, toast-stack-room - (toast-on ? current-toast.height + 8px : 0px));
+    property <length> under-toast-stack: (parked-toasts.length > 0 || parked-footer != "") ? parked-stack.height + 8px : 0px;
     // Below 720px the sidebar folds to its icon rail on its own.
     property <bool> rail-on: collapsed || root.width < 720px;
     property <length> side-w: rail-on ? 52px : 232px;
@@ -2201,16 +2208,27 @@ export component AppWindow inherits Window {
     // progress strip, 8px apart, newest nearest the top. Older ones
     // past the cap collapse into a muted "+N more" line under the stack.
     parked-stack := Rectangle {
-        visible: !harness && (parked-toasts.length > 0 || parked-more > 0);
+        visible: !harness && (parked-toasts.length > 0 || parked-footer != "");
         y: parent.height - toast-floor - 16px - self.height;
         x: side-w;
         width: parent.width - side-w;
-        height: parked-col.preferred-height;
-        parked-col := VerticalLayout {
+        property <length> footer-slot: parked-footer == "" ? 0px : 28px;
+        property <length> parked-natural: parked-col.preferred-height + footer-slot;
+        height: min(parked-natural, max(parked-budget, footer-slot));
+        VerticalLayout {
             spacing: 8px;
             width: 100%;
-            alignment: start;
-            for card[i] in parked-toasts: Rectangle {
+            height: 100%;
+            Flickable {
+                width: 100%;
+                vertical-stretch: 1;
+                viewport-width: self.width;
+                viewport-height: parked-col.preferred-height;
+                parked-col := VerticalLayout {
+                spacing: 8px;
+                width: 100%;
+                alignment: start;
+                for card[i] in parked-toasts: Rectangle {
             property <color> tone: card.tone == "warning" ? warning : card.tone == "danger" ? danger : muted;
             property <length> line-h: 20px;
             property <length> acts-w: 96px;
@@ -2291,27 +2309,37 @@ export component AppWindow inherits Window {
                 }
             }
         }
-            if parked-more > 0: Rectangle {
-                height: 20px;
+            }
+        }
+        if parked-footer != "": Rectangle {
+            height: 20px;
+            width: 100%;
+            vertical-stretch: 0;
+            Text {
+                text: parked-footer;
                 width: 100%;
-                Text {
-                    text: "+" + parked-more + " more";
-                    width: 100%;
-                    height: 100%;
-                    font-size: 11px;
-                    color: muted;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                    TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.parked-more-expand(); }
+                height: 100%;
+                font-size: 11px;
+                color: muted;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        if parked-footer == "Show fewer" {
+                            root.parked-more-collapse();
+                        } else {
+                            root.parked-more-expand();
+                        }
                     }
                 }
             }
         }
     }
+    }
 
-    if !harness && (toast-on || overlay == "skipped" || overlay == "skipped-details" || overlay == "toast-details"): Rectangle {
+    current-toast := Rectangle {
+        visible: !harness && (toast-on || overlay == "skipped" || overlay == "skipped-details" || overlay == "toast-details");
         property <bool> open: overlay == "skipped-details" || overlay == "toast-details" || toast-open;
         property <color> tone: toast-tone == "warning" ? warning : toast-tone == "danger" ? danger : muted;
         property <length> line-h: 20px;

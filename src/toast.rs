@@ -11,7 +11,9 @@
 //! At most [`FULL_STICKY_TOASTS`] sticky toasts are drawn in full (or
 //! [`SHORT_STICKY_TOASTS`] when the window is shorter than
 //! [`SHORT_WINDOW`]). Older ones collapse into a "+N more" line under
-//! the stack; expanding that line shows the full list.
+//! the stack; expanding that line shows the full list, with a "Show
+//! fewer" line to collapse it again. The expanded stack is capped at
+//! [`stack_room`] and the parked list scrolls under the current toast.
 
 /// One toast's content, as bound to the window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -45,6 +47,12 @@ pub const SHORT_STICKY_TOASTS: usize = 1;
 /// Window height, in logical pixels, below which only one sticky toast
 /// is drawn in full.
 pub const SHORT_WINDOW: i32 = 600;
+
+/// Gap kept below the toolbar and above the status bar or progress strip.
+pub const STACK_CLEARANCE: i32 = 16;
+
+/// The muted line under an expanded sticky list.
+pub const SHOW_FEWER: &str = "Show fewer";
 
 /// The toast showing now, and any number of sticky toasts parked under
 /// it, oldest first. Closing the current toast brings back the newest
@@ -85,6 +93,33 @@ impl ToastStack {
     /// Show or hide the full sticky list under the "+N more" line.
     pub fn set_stack_expanded(&mut self, expanded: bool) {
         self.expanded = expanded;
+    }
+
+    /// How many sticky toasts are drawn in full when the list is not
+    /// expanded, at this window height.
+    pub fn unexpanded_cap(&self, window_height: i32) -> usize {
+        if window_height < SHORT_WINDOW {
+            SHORT_STICKY_TOASTS
+        } else {
+            FULL_STICKY_TOASTS
+        }
+    }
+
+    /// The muted line under the parked stack: "+N more", "Show fewer",
+    /// or empty when every sticky toast is already shown in full.
+    pub fn footer(&self, window_height: i32) -> String {
+        if self.expanded {
+            if self.sticky_count() > self.unexpanded_cap(window_height) {
+                SHOW_FEWER.into()
+            } else {
+                String::new()
+            }
+        } else {
+            match self.collapsed_count(window_height) {
+                0 => String::new(),
+                n => format!("+{n} more"),
+            }
+        }
     }
 
     /// Sticky toasts in the stack: the current one when it is sticky,
@@ -206,6 +241,23 @@ impl ToastStack {
             self.current = self.parked.pop();
             self.gen = self.gen.saturating_add(1);
         }
+    }
+}
+
+/// Max height of the whole toast stack (the current toast, the parked
+/// list, and the footer), leaving [`STACK_CLEARANCE`] below the toolbar
+/// and above the status bar or progress strip.
+pub fn stack_room(window_height: i32, toolbar_h: i32, toast_floor: i32) -> i32 {
+    (window_height - toolbar_h - toast_floor - STACK_CLEARANCE - STACK_CLEARANCE).max(0)
+}
+
+/// Max height of the parked list, including its footer, when a current
+/// toast of `current_h` sits 8px above it.
+pub fn parked_budget(room: i32, current_h: i32) -> i32 {
+    if current_h > 0 {
+        (room - current_h - 8).max(0)
+    } else {
+        room
     }
 }
 
@@ -462,5 +514,46 @@ mod tests {
         assert_eq!(s.current().unwrap().text, "Copied 1 path");
         assert_eq!(s.parked().len(), 4);
         assert_eq!(s.parked()[3].details, ["file-3.jpg"]);
+    }
+
+    #[test]
+    fn collapsing_the_list_restores_the_plus_more_line() {
+        let mut s = ToastStack::default();
+        five_stranded(&mut s);
+        s.push(timed("Copied 1 path"));
+        assert_eq!(s.footer(TALL), "+2 more");
+        s.set_stack_expanded(true);
+        assert_eq!(s.footer(TALL), SHOW_FEWER);
+        assert_eq!(s.visible_parked(TALL).len(), 5);
+        s.set_stack_expanded(false);
+        assert_eq!(s.footer(TALL), "+2 more");
+        assert_eq!(s.visible_parked(TALL).len(), 3);
+        assert_eq!(s.collapsed_count(TALL), 2);
+        assert_eq!(s.parked().len(), 5);
+    }
+
+    #[test]
+    fn the_expanded_stack_is_capped_under_the_toolbar() {
+        // Comfortable density at 1280×800: 46px toolbar, 26px status bar.
+        assert_eq!(stack_room(800, 46, 26), 696);
+        assert_eq!(parked_budget(696, 52), 636);
+        // A shorter window tightens the cap; resize re-applies it.
+        assert_eq!(stack_room(700, 46, 26), 596);
+        assert!(stack_room(700, 46, 26) < stack_room(800, 46, 26));
+        // Eight open sticky toasts plus the footer do not fit in the
+        // parked budget, so the list must scroll; they all stay in the
+        // model.
+        const CARD: i32 = 96;
+        const FOOTER: i32 = 28;
+        let cards = 8 * CARD + 7 * 8;
+        assert!(cards + FOOTER > parked_budget(stack_room(800, 46, 26), 52));
+        let mut s = ToastStack::default();
+        for i in 0..8 {
+            s.push(sticky(HEAD, &format!("file-{i}.jpg"), "Dismiss"));
+        }
+        s.push(timed("Copied 1 path"));
+        s.set_stack_expanded(true);
+        assert_eq!(s.visible_parked(TALL).len(), 8);
+        assert_eq!(s.footer(TALL), SHOW_FEWER);
     }
 }

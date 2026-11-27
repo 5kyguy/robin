@@ -1387,24 +1387,24 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
                 };
                 let pin = |n: u32| format!(".robin-rename-4127-0-dune-sunset-041{n}.jpg");
                 // Newest first, matching bind_toasts.
-                let (parked, more) = match view {
-                    "toast-stack-two" => (vec![card(hidden_b), card(hidden)], 0),
-                    "toast-stack-more" => (vec![card(&pin(6)), card(&pin(5)), card(&pin(4))], 2),
-                    "toast-stack-expanded" => (
-                        vec![
-                            card(&pin(6)),
-                            card(&pin(5)),
-                            card(&pin(4)),
-                            card(&pin(3)),
-                            card(&pin(2)),
-                        ],
-                        0,
+                let (parked, more, footer) = match view {
+                    "toast-stack-two" => (vec![card(hidden_b), card(hidden)], 0, ""),
+                    "toast-stack-more" => (
+                        vec![card(&pin(6)), card(&pin(5)), card(&pin(4))],
+                        2,
+                        "+2 more",
                     ),
-                    "toast-stack-short" => (vec![card(&pin(6))], 4),
-                    _ => (vec![card(hidden)], 0),
+                    "toast-stack-expanded" => (
+                        (2..=9).rev().map(|n| card(&pin(n))).collect(),
+                        0,
+                        crate::toast::SHOW_FEWER,
+                    ),
+                    "toast-stack-short" => (vec![card(&pin(6))], 4, "+4 more"),
+                    _ => (vec![card(hidden)], 0, ""),
                 };
                 ui.set_parked_toasts(ModelRc::new(Rc::new(VecModel::from(parked))));
                 ui.set_parked_more(more);
+                ui.set_parked_footer(footer.into());
             }
         }
         "properties" => {

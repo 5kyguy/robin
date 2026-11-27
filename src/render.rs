@@ -1643,16 +1643,18 @@ fn hidden_pin(n: u32) -> String {
     format!(".robin-rename-4127-0-dune-sunset-041{n}.jpg")
 }
 
-/// Five sticky hidden-file toasts under a timed one: three shown and
-/// "+2 more" at full height, the full list after expand, or one shown
-/// and "+4 more" when the window is under 600px tall.
+/// Sticky hidden-file toasts under a timed one: three shown and
+/// "+N more" at full height, the full list after expand (eight toasts,
+/// capped and scrolling, with "Show fewer"), or one shown and "+4 more"
+/// when the window is under 600px tall.
 fn many_sticky_scene(
     ui: &AppWindow,
     view: &str,
     check: impl Fn(&str, String, &str) -> Result<()>,
 ) -> Result<()> {
     use slint::Model;
-    let pins: Vec<String> = (2..=6).map(hidden_pin).collect();
+    let last = if view == "toast-stack-expanded" { 9 } else { 6 };
+    let pins: Vec<String> = (2..=last).map(hidden_pin).collect();
     let pin_refs: Vec<&str> = pins.iter().map(String::as_str).collect();
     app::seed_parked_stickies(&pin_refs, "Copied 1 path", false);
     check("front", ui.get_toast_text().to_string(), "Copied 1 path")?;
@@ -1663,35 +1665,61 @@ fn many_sticky_scene(
             "1",
         )?;
         check("more", ui.get_parked_more().to_string(), "4")?;
+        check("footer", ui.get_parked_footer().to_string(), "+4 more")?;
         check("under newer", parked_pin(ui, 0)?, &hidden_pin(6))?;
         check("under action", parked_action(ui, 0)?, app::TOAST_DISMISS)?;
         return Ok(());
     }
+    let more = if view == "toast-stack-expanded" { 5 } else { 2 };
     check(
         "parked",
         ui.get_parked_toasts().row_count().to_string(),
         "3",
     )?;
-    check("more", ui.get_parked_more().to_string(), "2")?;
-    check("under newer", parked_pin(ui, 0)?, &hidden_pin(6))?;
-    check("under mid", parked_pin(ui, 1)?, &hidden_pin(5))?;
-    check("under older", parked_pin(ui, 2)?, &hidden_pin(4))?;
+    check("more", ui.get_parked_more().to_string(), &more.to_string())?;
+    check(
+        "footer",
+        ui.get_parked_footer().to_string(),
+        &format!("+{more} more"),
+    )?;
+    check("under newer", parked_pin(ui, 0)?, &hidden_pin(last))?;
+    check("under mid", parked_pin(ui, 1)?, &hidden_pin(last - 1))?;
+    check("under older", parked_pin(ui, 2)?, &hidden_pin(last - 2))?;
     check("under action", parked_action(ui, 0)?, app::TOAST_DISMISS)?;
     if view == "toast-stack-expanded" {
         ui.invoke_parked_more_expand();
         check(
             "expanded",
             ui.get_parked_toasts().row_count().to_string(),
-            "5",
+            "8",
         )?;
         check("more gone", ui.get_parked_more().to_string(), "0")?;
-        check("top", parked_pin(ui, 0)?, &hidden_pin(6))?;
-        check("bottom", parked_pin(ui, 4)?, &hidden_pin(2))?;
+        check(
+            "fewer",
+            ui.get_parked_footer().to_string(),
+            crate::toast::SHOW_FEWER,
+        )?;
+        check("top", parked_pin(ui, 0)?, &hidden_pin(9))?;
+        check("bottom", parked_pin(ui, 7)?, &hidden_pin(2))?;
         check(
             "still front",
             ui.get_toast_text().to_string(),
             "Copied 1 path",
         )?;
+        let room = ui.get_toast_stack_room();
+        let parked = ui.get_parked_stack_h();
+        let current = 52.0;
+        if parked + 8.0 + current > room + 1.0 {
+            return Err(Error::Message(format!(
+                "stack cap: parked {parked} + current {current} + 8 > room {room}"
+            )));
+        }
+        if (room - crate::toast::stack_room(800, 46, 26) as f32).abs() > 1.0 {
+            return Err(Error::Message(format!(
+                "toast-stack-room: {room}, want {}",
+                crate::toast::stack_room(800, 46, 26)
+            )));
+        }
     }
     Ok(())
 }
