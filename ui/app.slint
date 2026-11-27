@@ -1246,6 +1246,15 @@ export component AppWindow inherits Window {
     in-out property <length> parked-scroll: 0px;
     out property <bool> parked-scrolls: parked-flick.viewport-height > parked-flick.height;
     out property <length> parked-scroll-min: min(0px, parked-flick.height - parked-flick.viewport-height);
+    // Window-space geometry of the parked cards and the overflow bar.
+    // The bar sits 4px outside the right edge of the widest visible card,
+    // and stays vertically inside the list's clip.
+    out property <length> parked-card-right: parked-stack.x + parked-col.x + parked-col.width;
+    out property <length> parked-bar-x: parked-stack.x + parked-bar.x;
+    out property <length> parked-bar-y: parked-stack.y + parked-bar.y;
+    out property <length> parked-bar-h: parked-bar.height;
+    out property <length> parked-clip-y: parked-stack.y;
+    out property <length> parked-clip-h: flick-slot.height;
     property <length> parked-budget: max(0px, toast-stack-room - (toast-on ? current-toast.height + 8px : 0px));
     property <length> under-toast-stack: (parked-toasts.length > 0 || parked-footer != "") ? parked-stack.height + 8px : 0px;
     // Below 720px the sidebar folds to its icon rail on its own.
@@ -2240,7 +2249,7 @@ export component AppWindow inherits Window {
             height: 100%;
             // Clip in this rectangle (Flickable cannot take clip:) so a
             // mid-toast cut fades into bg and a thin muted scrollbar can
-            // sit inside the stack's right edge without covering Dismiss.
+            // sit 4px outside the widest card, inside the list's clip.
             flick-slot := Rectangle {
                 width: 100%;
                 vertical-stretch: 1;
@@ -2253,8 +2262,12 @@ export component AppWindow inherits Window {
                     viewport-y <=> root.parked-scroll;
                     parked-col := VerticalLayout {
                 spacing: 8px;
-                width: 100%;
                 alignment: start;
+                // Shrink-wrap to the widest card; the stack container is
+                // otherwise the full pane and would push the bar out over
+                // the Modified column.
+                x: (parent.width - self.width) / 2;
+                width: self.preferred-width;
                 for card[i] in parked-toasts: Rectangle {
             property <color> tone: card.tone == "warning" ? warning : card.tone == "danger" ? danger : muted;
             property <length> line-h: 20px;
@@ -2263,10 +2276,13 @@ export component AppWindow inherits Window {
             // The headline wraps to at most three lines, same as the
             // current toast; the cap uses this real height.
             property <length> head-h: min(80px, max(52px, parked-line.preferred-height + 28px));
+            property <length> card-w: min(max(520px, min(800px, parked-line.preferred-width + 42px + acts-w + 24px)), parked-flick.width - 32px);
+            horizontal-stretch: 0;
+            width: card-w;
             height: card.open ? head-h + 12px + pin-h + 12px : head-h;
             body := Rectangle {
-                width: min(max(520px, min(800px, parked-line.preferred-width + 42px + acts-w + 24px)), parent.width - 32px);
-                x: (parent.width - self.width) / 2;
+                width: 100%;
+                x: 0px;
                 height: parent.height;
                 background: surface;
                 border-radius: 8px;
@@ -2363,12 +2379,11 @@ export component AppWindow inherits Window {
                     height: 24px;
                     background: @linear-gradient(180deg, bg.with-alpha(0) 0%, bg 100%);
                 }
-                // Thin muted thumb, only while the list overflows, just
-                // outside the cards' right edge so it stays off [Dismiss].
-                if root.parked-scrolls: Rectangle {
-                    property <length> card-w: min(800px, parent.width - 32px);
-                    property <length> card-right: (parent.width + card-w) / 2;
-                    x: min(card-right + 6px, parent.width - 8px);
+                // Thin muted thumb, only while the list overflows, 4px
+                // outside the widest visible card and inside the clip.
+                parked-bar := Rectangle {
+                    visible: root.parked-scrolls;
+                    x: parked-col.x + parked-col.width + 4px;
                     y: thumb-y;
                     width: 3px;
                     height: thumb-h;

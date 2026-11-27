@@ -2157,6 +2157,35 @@ fn check_parked_scrollbar(ui: &AppWindow, overflows: bool) -> Result<()> {
             "no overflow but parked-scroll-min is {min}"
         )));
     }
+    if overflows {
+        check_parked_bar_placement(ui)?;
+    }
+    Ok(())
+}
+
+/// The overflow bar sits 4px outside the widest visible card and stays
+/// vertically inside the list's clip area.
+fn check_parked_bar_placement(ui: &AppWindow) -> Result<()> {
+    let card_right = ui.get_parked_card_right();
+    let bar_x = ui.get_parked_bar_x();
+    let bar_y = ui.get_parked_bar_y();
+    let bar_h = ui.get_parked_bar_h();
+    let clip_y = ui.get_parked_clip_y();
+    let clip_h = ui.get_parked_clip_h();
+    let want_x = card_right + 4.0;
+    if (bar_x - want_x).abs() > 1.0 {
+        return Err(Error::Message(format!(
+            "parked-bar x: {bar_x}, want card-right {card_right} + 4 = {want_x}"
+        )));
+    }
+    if bar_h <= 0.0 {
+        return Err(Error::Message(format!("parked-bar height {bar_h}")));
+    }
+    if bar_y < clip_y - 1.0 || bar_y + bar_h > clip_y + clip_h + 1.0 {
+        return Err(Error::Message(format!(
+            "parked-bar y={bar_y} h={bar_h} outside clip y={clip_y} h={clip_h}"
+        )));
+    }
     Ok(())
 }
 
