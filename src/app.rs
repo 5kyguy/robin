@@ -2743,7 +2743,7 @@ struct State {
     undo: Vec<Trashed>,
     /// Where the waiting job thread's conflict answer goes.
     reply: Option<mpsc::Sender<Option<ConflictChoice>>>,
-    /// The toast showing now, and a sticky one parked under it.
+    /// The toast showing now, and any sticky toasts parked under it.
     toasts: ToastStack,
     arm_timer: slint::Timer,
     /// Hides the viewer's chrome again after the mouse stops, when zoomed.
@@ -4815,6 +4815,9 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         if changed {
             redraw(&ui, &s);
         }
+        drop(s);
+        // Height can change how many sticky toasts are drawn in full.
+        bind_toasts(&ui, &st);
     });
     let w = ui.as_weak();
     let st = state.clone();
@@ -5142,22 +5145,31 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         }
     });
     let (w3, st3) = (ui.as_weak(), state.clone());
-    ui.on_under_toast_link(move || {
+    ui.on_parked_toast_link(move |index| {
         let Some(ui) = w3.upgrade() else { return };
+        let i = index.max(0) as usize;
+        let height = window_height(&ui);
         let action = st3
             .borrow()
             .toasts
-            .under()
+            .visible_parked(height)
+            .get(i)
             .map(|t| t.action.clone())
             .unwrap_or_default();
         if action == TOAST_DISMISS {
-            st3.borrow_mut().toasts.dismiss_under();
+            st3.borrow_mut().toasts.dismiss_visible(i, height);
             bind_toasts(&ui, &st3);
             return;
         }
         if action == DROP_WAIT_CANCEL {
             cancel_drop_wait(&ui, &st3);
         }
+    });
+    let (w_more, st_more) = (ui.as_weak(), state.clone());
+    ui.on_parked_more_expand(move || {
+        let Some(ui) = w_more.upgrade() else { return };
+        st_more.borrow_mut().toasts.set_stack_expanded(true);
+        bind_toasts(&ui, &st_more);
     });
     ui.on_toast_link(move || {
         let Some(ui) = w.upgrade() else { return };
@@ -8029,6 +8041,27 @@ pub fn expire_toast() {
     with_state(|ui, st| hide_front_toast(&ui, st, true));
 }
 
+/// For render scenes of a many-sticky stack: park these hidden-file
+/// toasts (oldest first), then a timed toast on top, and optionally
+/// expand the "+N more" line.
+pub fn seed_parked_stickies(pins: &[&str], timed: &str, expanded: bool) {
+    with_state(|ui, st| {
+        {
+            let mut s = st.borrow_mut();
+            s.toasts = crate::toast::ToastStack::default();
+            for pin in pins {
+                s.toasts
+                    .push(crate::toast::sticky(STRANDED_HEAD, pin, TOAST_DISMISS));
+            }
+            if !timed.is_empty() {
+                s.toasts.push(crate::toast::timed(timed));
+            }
+            s.toasts.set_stack_expanded(expanded);
+        }
+        bind_toasts(&ui, st);
+    });
+}
+
 /// Bind the current toast and any sticky toast parked under it.
 fn bind_toasts(ui: &AppWindow, st: &Shared) {
     let s = st.borrow();
@@ -8053,22 +8086,40 @@ fn bind_toasts(ui: &AppWindow, st: &Shared) {
             set_toast_rows(ui, &detail_rows(&[], false, false));
         }
     }
-    match s.toasts.under() {
-        Some(t) => {
-            ui.set_under_toast_tone(t.tone.as_str().into());
-            ui.set_under_toast_glyph(toast_glyph(&t.tone).into());
-            ui.set_under_toast_text(t.text.as_str().into());
-            set_under_toast_rows(ui, &detail_rows(&t.details, t.pinned, t.expanded));
-            ui.set_under_toast_action(t.action.as_str().into());
-            ui.set_under_toast_open(t.open);
-            ui.set_under_toast_on(true);
-        }
-        None => {
-            ui.set_under_toast_on(false);
-            ui.set_under_toast_open(false);
-            ui.set_under_toast_action("".into());
-            set_under_toast_rows(ui, &detail_rows(&[], false, false));
-        }
+    // Newest parked toast first, so it sits just under the current one;
+    // the oldest of those shown is at the bottom.
+    let height = window_height(ui);
+    ui.set_parked_toasts(ModelRc::new(Rc::new(VecModel::from(
+        s.toasts
+            .visible_parked(height)
+            .iter()
+            .rev()
+            .map(parked_card)
+            .collect::<Vec<_>>(),
+    ))));
+    ui.set_parked_more(s.toasts.collapsed_count(height) as i32);
+}
+
+/// Logical window height, for how many sticky toasts are drawn in full.
+fn window_height(ui: &AppWindow) -> i32 {
+    ui.window()
+        .size()
+        .to_logical(ui.window().scale_factor())
+        .height
+        .round() as i32
+}
+
+/// Bind one parked sticky toast, as the window draws it.
+pub fn parked_card(t: &Toast) -> crate::ParkedToast {
+    let rows = detail_rows(&t.details, t.pinned, t.expanded);
+    crate::ParkedToast {
+        text: t.text.as_str().into(),
+        tone: t.tone.as_str().into(),
+        glyph: toast_glyph(&t.tone).into(),
+        action: t.action.as_str().into(),
+        pin: rows.pin.as_str().into(),
+        has_details: rows.has_details(),
+        open: t.open,
     }
 }
 
@@ -8117,18 +8168,6 @@ pub fn set_toast_rows(ui: &AppWindow, d: &DetailRows) {
     ui.set_toast_more(d.more as i32);
     ui.set_toast_expanded(d.expanded);
     ui.set_toast_details(ModelRc::new(Rc::new(VecModel::from(
-        d.rows
-            .iter()
-            .map(|r| SharedString::from(r.as_str()))
-            .collect::<Vec<_>>(),
-    ))));
-}
-
-fn set_under_toast_rows(ui: &AppWindow, d: &DetailRows) {
-    ui.set_under_toast_has_details(d.has_details());
-    ui.set_under_toast_pin(d.pin.as_str().into());
-    ui.set_under_toast_more(d.more as i32);
-    ui.set_under_toast_details(ModelRc::new(Rc::new(VecModel::from(
         d.rows
             .iter()
             .map(|r| SharedString::from(r.as_str()))

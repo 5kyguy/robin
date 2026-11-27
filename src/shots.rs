@@ -101,6 +101,10 @@ pub fn known(view: &str) -> bool {
             | "rename-stranded"
             | "toast-stack"
             | "toast-stack-restored"
+            | "toast-stack-two"
+            | "toast-stack-more"
+            | "toast-stack-expanded"
+            | "toast-stack-short"
             | "menu-bg"
             | "shortcuts-browser"
             | "reduce-motion"
@@ -1316,7 +1320,11 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
         | "copy-path-no-tool"
         | "rename-stranded"
         | "toast-stack"
-        | "toast-stack-restored" => {
+        | "toast-stack-restored"
+        | "toast-stack-two"
+        | "toast-stack-more"
+        | "toast-stack-expanded"
+        | "toast-stack-short" => {
             use crate::clipboard::{paths_toast, Outcome};
             if view == "copy-path-done" || view == "copy-path-no-tool" {
                 // Two paths copied: two rows selected, and the status bar
@@ -1327,11 +1335,16 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
                 select(&[photo]);
             }
             let hidden = ".robin-rename-4127-0-dune-sunset-0412.jpg";
+            let hidden_b = ".robin-rename-4127-0-dune-sunset-0413.jpg";
             let stranded = ("danger", crate::app::STRANDED_HEAD.to_string());
             let (tone, text) = match view {
                 "copy-path-done" => paths_toast(&Outcome::Copied, 2),
                 "copy-path-no-tool" => paths_toast(&Outcome::NoTool, 2),
-                "toast-stack" => paths_toast(&Outcome::Copied, 1),
+                "toast-stack"
+                | "toast-stack-two"
+                | "toast-stack-more"
+                | "toast-stack-expanded"
+                | "toast-stack-short" => paths_toast(&Outcome::Copied, 1),
                 _ => stranded.clone(),
             };
             ui.set_overlay("".into());
@@ -1339,8 +1352,7 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
             ui.set_toast_tone(tone.into());
             ui.set_toast_glyph(crate::app::toast_glyph(tone).into());
             ui.set_toast_text(text.into());
-            let sticky =
-                view != "copy-path-done" && view != "copy-path-no-tool" && view != "toast-stack";
+            let sticky = matches!(view, "rename-stranded" | "toast-stack-restored");
             ui.set_toast_action(
                 if sticky {
                     crate::app::TOAST_DISMISS
@@ -1356,25 +1368,43 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
             };
             crate::app::set_toast_rows(ui, &crate::app::detail_rows(&details, true, false));
             ui.set_toast_open(sticky);
-            if view == "toast-stack" {
-                // The sticky hidden-file toast stays fully visible under
-                // the newer one, 8px below, with [Dismiss] still shown.
-                ui.set_under_toast_on(true);
-                ui.set_under_toast_tone(stranded.0.into());
-                ui.set_under_toast_glyph(crate::app::toast_glyph(stranded.0).into());
-                ui.set_under_toast_text(stranded.1.as_str().into());
-                ui.set_under_toast_action(crate::app::TOAST_DISMISS.into());
-                ui.set_under_toast_open(true);
-                let rows = crate::app::detail_rows(&[hidden.to_string()], true, false);
-                ui.set_under_toast_has_details(rows.has_details());
-                ui.set_under_toast_pin(rows.pin.as_str().into());
-                ui.set_under_toast_more(rows.more as i32);
-                ui.set_under_toast_details(ModelRc::new(Rc::new(VecModel::from(
-                    rows.rows
-                        .iter()
-                        .map(|r| slint::SharedString::from(r.as_str()))
-                        .collect::<Vec<_>>(),
-                ))));
+            if view == "toast-stack"
+                || view == "toast-stack-two"
+                || view == "toast-stack-more"
+                || view == "toast-stack-expanded"
+                || view == "toast-stack-short"
+            {
+                // Parked sticky toasts stay fully visible under the newer
+                // one, 8px apart, with the hidden name in `text` and
+                // [Dismiss] still shown. Newest is nearest the current
+                // toast; older ones past the cap sit in parked-more.
+                let card = |name: &str| {
+                    crate::app::parked_card(&crate::toast::sticky(
+                        crate::app::STRANDED_HEAD,
+                        name,
+                        crate::app::TOAST_DISMISS,
+                    ))
+                };
+                let pin = |n: u32| format!(".robin-rename-4127-0-dune-sunset-041{n}.jpg");
+                // Newest first, matching bind_toasts.
+                let (parked, more) = match view {
+                    "toast-stack-two" => (vec![card(hidden_b), card(hidden)], 0),
+                    "toast-stack-more" => (vec![card(&pin(6)), card(&pin(5)), card(&pin(4))], 2),
+                    "toast-stack-expanded" => (
+                        vec![
+                            card(&pin(6)),
+                            card(&pin(5)),
+                            card(&pin(4)),
+                            card(&pin(3)),
+                            card(&pin(2)),
+                        ],
+                        0,
+                    ),
+                    "toast-stack-short" => (vec![card(&pin(6))], 4),
+                    _ => (vec![card(hidden)], 0),
+                };
+                ui.set_parked_toasts(ModelRc::new(Rc::new(VecModel::from(parked))));
+                ui.set_parked_more(more);
             }
         }
         "properties" => {

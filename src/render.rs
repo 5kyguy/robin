@@ -116,6 +116,10 @@ pub fn scripted(view: &str) -> bool {
             | "rename-stranded-dismissed"
             | "toast-stack"
             | "toast-stack-restored"
+            | "toast-stack-two"
+            | "toast-stack-more"
+            | "toast-stack-expanded"
+            | "toast-stack-short"
     )
 }
 
@@ -1464,7 +1468,12 @@ fn file_scene(ui: &AppWindow, view: &str, size: (u32, u32)) -> Result<()> {
 /// (`-dismissed`) closes it. `toast-stack` then copies a path so a newer
 /// toast sits on top of it; `toast-stack-restored` closes that newer
 /// toast and checks the sticky one is back with its filename.
+/// `toast-stack-two` strands a second file first, so two sticky toasts
+/// sit under the newer one. `toast-stack-more`, `-expanded` and
+/// `-short` seed five sticky toasts under a timed one to check the
+/// "+N more" cap, expanding the list, and the under-600 window.
 fn stranded_scene(ui: &AppWindow, view: &str) -> Result<()> {
+    use slint::Model;
     let check = |what: &str, got: String, want: &str| {
         if got == want {
             Ok(())
@@ -1472,6 +1481,12 @@ fn stranded_scene(ui: &AppWindow, view: &str) -> Result<()> {
             Err(Error::Message(format!("{what}: {got:?}, want {want:?}")))
         }
     };
+    if matches!(
+        view,
+        "toast-stack-more" | "toast-stack-expanded" | "toast-stack-short"
+    ) {
+        return many_sticky_scene(ui, view, check);
+    }
     select_row(ui, "dune-sunset-0412.jpg");
     ui.invoke_key(app::keys::F2.into(), false, false, false);
     ui.show().map_err(|e| Error::Message(e.to_string()))?;
@@ -1497,7 +1512,33 @@ fn stranded_scene(ui: &AppWindow, view: &str) -> Result<()> {
         check("dismissed", ui.get_toast_on().to_string(), "false")?;
         return Ok(());
     }
-    if view == "toast-stack" || view == "toast-stack-restored" {
+    if view == "toast-stack-two" {
+        // A second case-only rename also gets stuck, so both hidden
+        // names sit in the stack before a newer toast arrives.
+        select_row(ui, "dune-sunset-0413.jpg");
+        ui.invoke_key(app::keys::F2.into(), false, false, false);
+        app::strand_renames(true);
+        type_field(ui, "Dune-sunset-0413");
+        type_field(ui, "\n");
+        app::strand_renames(false);
+        app::land_reads();
+        check(
+            "second",
+            ui.get_toast_text().to_string(),
+            app::STRANDED_HEAD,
+        )?;
+        check(
+            "second name",
+            ui.get_toast_pin().to_string(),
+            ".robin-rename-4127-0-dune-sunset-0413.jpg",
+        )?;
+        check(
+            "first parked",
+            parked_pin(ui, 0)?,
+            ".robin-rename-4127-0-dune-sunset-0412.jpg",
+        )?;
+    }
+    if view == "toast-stack" || view == "toast-stack-restored" || view == "toast-stack-two" {
         use crate::clipboard::Session;
         app::fake_clipboard(
             &["wl-copy"],
@@ -1507,29 +1548,45 @@ fn stranded_scene(ui: &AppWindow, view: &str) -> Result<()> {
             },
         );
         // The original photo is now the hidden file; copy another path
-        // so a newer toast arrives on top of the sticky one.
-        let j = row_index(ui, "dune-sunset-0413.jpg")?;
+        // so a newer toast arrives on top of the sticky one(s).
+        let copy = if view == "toast-stack-two" {
+            "palette.toml"
+        } else {
+            "dune-sunset-0413.jpg"
+        };
+        let j = row_index(ui, copy)?;
         ui.invoke_row_pointer(j, 0, 0, false, false, false);
         ui.invoke_row_pointer(j, 2, 0, false, false, false);
         ui.invoke_row_menu(j, 330.0, 150.0);
         ui.invoke_file_menu_pick(menu_line(ui, "Copy path")?);
         check("front", ui.get_toast_text().to_string(), "Copied 1 path")?;
-        check("under shown", ui.get_under_toast_on().to_string(), "true")?;
+        let n = if view == "toast-stack-two" { 2 } else { 1 };
         check(
-            "under",
-            ui.get_under_toast_text().to_string(),
-            app::STRANDED_HEAD,
+            "parked",
+            ui.get_parked_toasts().row_count().to_string(),
+            &n.to_string(),
         )?;
-        check(
-            "under name",
-            ui.get_under_toast_pin().to_string(),
-            ".robin-rename-4127-0-dune-sunset-0412.jpg",
-        )?;
-        check(
-            "under action",
-            ui.get_under_toast_action().to_string(),
-            app::TOAST_DISMISS,
-        )?;
+        check("under", parked_text(ui, 0)?, app::STRANDED_HEAD)?;
+        check("under action", parked_action(ui, 0)?, app::TOAST_DISMISS)?;
+        if view == "toast-stack-two" {
+            // Newest parked toast sits just under the current one.
+            check(
+                "under newer",
+                parked_pin(ui, 0)?,
+                ".robin-rename-4127-0-dune-sunset-0413.jpg",
+            )?;
+            check(
+                "under older",
+                parked_pin(ui, 1)?,
+                ".robin-rename-4127-0-dune-sunset-0412.jpg",
+            )?;
+        } else {
+            check(
+                "under name",
+                parked_pin(ui, 0)?,
+                ".robin-rename-4127-0-dune-sunset-0412.jpg",
+            )?;
+        }
         if view == "toast-stack-restored" {
             app::expire_toast();
             check(
@@ -1548,8 +1605,93 @@ fn stranded_scene(ui: &AppWindow, view: &str) -> Result<()> {
                 app::TOAST_DISMISS,
             )?;
             check("still shown", ui.get_toast_on().to_string(), "true")?;
-            check("under gone", ui.get_under_toast_on().to_string(), "false")?;
+            check(
+                "under gone",
+                ui.get_parked_toasts().row_count().to_string(),
+                "0",
+            )?;
         }
+    }
+    Ok(())
+}
+
+fn parked_text(ui: &AppWindow, i: usize) -> Result<String> {
+    use slint::Model;
+    ui.get_parked_toasts()
+        .row_data(i)
+        .map(|c| c.text.to_string())
+        .ok_or_else(|| Error::Message(format!("no parked toast {i}")))
+}
+
+fn parked_pin(ui: &AppWindow, i: usize) -> Result<String> {
+    use slint::Model;
+    ui.get_parked_toasts()
+        .row_data(i)
+        .map(|c| c.pin.to_string())
+        .ok_or_else(|| Error::Message(format!("no parked toast {i}")))
+}
+
+fn parked_action(ui: &AppWindow, i: usize) -> Result<String> {
+    use slint::Model;
+    ui.get_parked_toasts()
+        .row_data(i)
+        .map(|c| c.action.to_string())
+        .ok_or_else(|| Error::Message(format!("no parked toast {i}")))
+}
+
+fn hidden_pin(n: u32) -> String {
+    format!(".robin-rename-4127-0-dune-sunset-041{n}.jpg")
+}
+
+/// Five sticky hidden-file toasts under a timed one: three shown and
+/// "+2 more" at full height, the full list after expand, or one shown
+/// and "+4 more" when the window is under 600px tall.
+fn many_sticky_scene(
+    ui: &AppWindow,
+    view: &str,
+    check: impl Fn(&str, String, &str) -> Result<()>,
+) -> Result<()> {
+    use slint::Model;
+    let pins: Vec<String> = (2..=6).map(hidden_pin).collect();
+    let pin_refs: Vec<&str> = pins.iter().map(String::as_str).collect();
+    app::seed_parked_stickies(&pin_refs, "Copied 1 path", false);
+    check("front", ui.get_toast_text().to_string(), "Copied 1 path")?;
+    if view == "toast-stack-short" {
+        check(
+            "parked",
+            ui.get_parked_toasts().row_count().to_string(),
+            "1",
+        )?;
+        check("more", ui.get_parked_more().to_string(), "4")?;
+        check("under newer", parked_pin(ui, 0)?, &hidden_pin(6))?;
+        check("under action", parked_action(ui, 0)?, app::TOAST_DISMISS)?;
+        return Ok(());
+    }
+    check(
+        "parked",
+        ui.get_parked_toasts().row_count().to_string(),
+        "3",
+    )?;
+    check("more", ui.get_parked_more().to_string(), "2")?;
+    check("under newer", parked_pin(ui, 0)?, &hidden_pin(6))?;
+    check("under mid", parked_pin(ui, 1)?, &hidden_pin(5))?;
+    check("under older", parked_pin(ui, 2)?, &hidden_pin(4))?;
+    check("under action", parked_action(ui, 0)?, app::TOAST_DISMISS)?;
+    if view == "toast-stack-expanded" {
+        ui.invoke_parked_more_expand();
+        check(
+            "expanded",
+            ui.get_parked_toasts().row_count().to_string(),
+            "5",
+        )?;
+        check("more gone", ui.get_parked_more().to_string(), "0")?;
+        check("top", parked_pin(ui, 0)?, &hidden_pin(6))?;
+        check("bottom", parked_pin(ui, 4)?, &hidden_pin(2))?;
+        check(
+            "still front",
+            ui.get_toast_text().to_string(),
+            "Copied 1 path",
+        )?;
     }
     Ok(())
 }

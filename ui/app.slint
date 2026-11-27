@@ -115,6 +115,17 @@ export struct Fact {
     value: string,
 }
 
+// A sticky toast parked under the one showing now (DESIGN §4).
+export struct ParkedToast {
+    text: string,
+    tone: string,
+    glyph: string,
+    action: string,
+    pin: string,
+    has-details: bool,
+    open: bool,
+}
+
 export struct StatDisk {
     name: string,
     mount: string,
@@ -1122,18 +1133,11 @@ export component AppWindow inherits Window {
     in property <string> unlock-text: "";
     in property <string> unlock-error: "";
     in property <bool> toast-open: false;
-    // A sticky toast parked under the one showing now. It stays visible
-    // (8px below) until [Dismiss]; a newer toast never replaces it.
-    in property <bool> under-toast-on: false;
-    in property <string> under-toast-text: "";
-    in property <[string]> under-toast-details;
-    in property <bool> under-toast-has-details: false;
-    in property <string> under-toast-pin: "";
-    in property <int> under-toast-more: 0;
-    in property <string> under-toast-tone: "";
-    in property <string> under-toast-glyph: "󰄬";
-    in property <string> under-toast-action: "";
-    in property <bool> under-toast-open: false;
+    // Sticky toasts parked under the one showing now, newest first.
+    // At most three are drawn in full (one when the window is under
+    // 600px tall); older ones are counted in parked-more.
+    in property <[ParkedToast]> parked-toasts;
+    in property <int> parked-more: 0;
     // "Copy 2 items to raw-exports" while a drag is over a folder.
     in property <string> drag-label: "";
     in property <string> drag-glyph: "󰆏";
@@ -1191,8 +1195,11 @@ export component AppWindow inherits Window {
     callback job-cancel();
     callback toast-link();
     callback toast-expand();
-    // [Dismiss] (or Cancel) on the parked sticky toast under a newer one.
-    callback under-toast-link();
+    // [Dismiss] (or Cancel) on a parked sticky toast; the int is its
+    // index in parked-toasts (0 is the newest one currently drawn).
+    callback parked-toast-link(int);
+    // Expand the muted "+N more" line under the sticky stack.
+    callback parked-more-expand();
     forward-focus: keys;
 
     title: "Robin";
@@ -1211,10 +1218,10 @@ export component AppWindow inherits Window {
     // Toasts sit 16px above the status bar, or above the progress strip
     // while it shows, so they never hide a job's progress or its Cancel.
     property <length> toast-floor: status-h + (job-on && !view-on ? 44px : 0px);
-    // Height of a sticky toast parked under a newer one, used to lift
-    // the newer toast 8px above it. Both still sit above toast-floor.
-    property <length> under-toast-h: !under-toast-on ? 0px : (under-toast-open ? 52px + 12px + (under-toast-pin != "" ? 20px : 0px) + under-toast-details.length * 20px + (under-toast-more > 0 ? 20px : 0px) + 12px : 52px);
-    property <length> under-toast-stack: under-toast-on ? under-toast-h + 8px : 0px;
+    // Height of the parked sticky stack (and its "+N more" line), used
+    // to lift a timed toast 8px above it. The sticky stack itself sits
+    // 16px above toast-floor.
+    property <length> under-toast-stack: (parked-toasts.length > 0 || parked-more > 0) ? parked-stack.height + 8px : 0px;
     // Below 720px the sidebar folds to its icon rail on its own.
     property <bool> rail-on: collapsed || root.width < 720px;
     property <length> side-w: rail-on ? 52px : 232px;
@@ -2190,108 +2197,116 @@ export component AppWindow inherits Window {
         }
     }
 
-    // A sticky toast parked under a newer one, 16px above the status
-    // bar or the progress strip. [Dismiss] on this toast removes it
-    // and leaves the newer one in place.
-    if !harness && under-toast-on: Rectangle {
-        property <color> tone: under-toast-tone == "warning" ? warning : under-toast-tone == "danger" ? danger : muted;
-        property <length> line-h: 20px;
-        property <length> acts-w: 96px;
-        width: min(max(520px, min(800px, under-toast-line.preferred-width + 42px + acts-w + 24px)), parent.width - side-w - 32px);
-        property <length> pin-h: under-toast-pin != "" ? line-h : 0px;
-        property <length> rows-h: under-toast-details.length * line-h + (under-toast-more > 0 ? line-h : 0px);
-        height: under-toast-open ? 52px + 12px + pin-h + rows-h + 12px : 52px;
-        x: side-w + (parent.width - side-w - self.width) / 2;
+    // Sticky toasts stack upward from 16px above the status bar or the
+    // progress strip, 8px apart, newest nearest the top. Older ones
+    // past the cap collapse into a muted "+N more" line under the stack.
+    parked-stack := Rectangle {
+        visible: !harness && (parked-toasts.length > 0 || parked-more > 0);
         y: parent.height - toast-floor - 16px - self.height;
-        background: surface;
-        border-radius: 8px;
-        border-width: 1px;
-        border-color: under-toast-tone == "" || under-toast-tone == "info" ? hairline : tone;
-        drop-shadow-blur: 16px;
-        drop-shadow-color: #000000.with-alpha(0.35);
-        if under-toast-tone == "warning" || under-toast-tone == "danger": Rectangle {
-            x: 0px;
-            y: 0px;
-            width: 4px;
-            height: parent.height;
-            border-top-left-radius: 8px;
-            border-bottom-left-radius: 8px;
-            background: tone;
-        }
-        Text {
-            text: under-toast-glyph;
-            x: 16px;
-            y: 0px;
-            width: 18px;
-            height: 52px;
-            font-size: 14px;
-            color: tone;
-            vertical-alignment: center;
-        }
-        under-toast-line := Text {
-            text: under-toast-text;
-            x: 42px;
-            y: 0px;
-            width: parent.width - 42px - parent.acts-w - 24px;
-            height: 52px;
-            font-size: 13px;
-            color: text;
-            overflow: elide;
-            vertical-alignment: center;
-        }
-        Text {
-            text: under-toast-action;
-            x: parent.width - 16px - self.width;
-            y: 0px;
-            width: 96px;
-            height: 52px;
-            font-size: 12px;
-            color: accent;
-            horizontal-alignment: right;
-            vertical-alignment: center;
-            TouchArea {
-                mouse-cursor: pointer;
-                clicked => { root.under-toast-link(); }
+        x: side-w;
+        width: parent.width - side-w;
+        height: parked-col.preferred-height;
+        parked-col := VerticalLayout {
+            spacing: 8px;
+            width: 100%;
+            alignment: start;
+            for card[i] in parked-toasts: Rectangle {
+            property <color> tone: card.tone == "warning" ? warning : card.tone == "danger" ? danger : muted;
+            property <length> line-h: 20px;
+            property <length> acts-w: 96px;
+            property <length> pin-h: card.pin != "" ? line-h : 0px;
+            height: card.open ? 52px + 12px + pin-h + 12px : 52px;
+            body := Rectangle {
+                width: min(max(520px, min(800px, parked-line.preferred-width + 42px + acts-w + 24px)), parent.width - 32px);
+                x: (parent.width - self.width) / 2;
+                height: parent.height;
+                background: surface;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: card.tone == "" || card.tone == "info" ? hairline : tone;
+                drop-shadow-blur: 16px;
+                drop-shadow-color: #000000.with-alpha(0.35);
+                if card.tone == "warning" || card.tone == "danger": Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    width: 4px;
+                    height: parent.height;
+                    border-top-left-radius: 8px;
+                    border-bottom-left-radius: 8px;
+                    background: tone;
+                }
+                Text {
+                    text: card.glyph;
+                    x: 16px;
+                    y: 0px;
+                    width: 18px;
+                    height: 52px;
+                    font-size: 14px;
+                    color: tone;
+                    vertical-alignment: center;
+                }
+                parked-line := Text {
+                    text: card.text;
+                    x: 42px;
+                    y: 0px;
+                    width: parent.width - 42px - acts-w - 24px;
+                    height: 52px;
+                    font-size: 13px;
+                    color: text;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: card.action;
+                    x: parent.width - 16px - self.width;
+                    y: 0px;
+                    width: 96px;
+                    height: 52px;
+                    font-size: 12px;
+                    color: accent;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.parked-toast-link(i); }
+                    }
+                }
+                if card.open && card.has-details: Rectangle {
+                    x: 16px;
+                    y: 52px;
+                    width: parent.width - 32px;
+                    height: 1px;
+                    background: hairline;
+                }
+                if card.open && card.pin != "": Text {
+                    x: 42px;
+                    y: 52px + 12px;
+                    width: parent.width - 58px;
+                    height: line-h;
+                    font-size: 11px;
+                    color: text;
+                    overflow: elide;
+                    vertical-alignment: center;
+                    text: card.pin;
+                }
             }
         }
-        if under-toast-open && under-toast-has-details: Rectangle {
-            x: 16px;
-            y: 52px;
-            width: parent.width - 32px;
-            height: 1px;
-            background: hairline;
-        }
-        if under-toast-open && under-toast-pin != "": Text {
-            x: 42px;
-            y: 52px + 12px;
-            width: parent.width - 58px;
-            height: line-h;
-            font-size: 11px;
-            color: text;
-            overflow: elide;
-            vertical-alignment: center;
-            text: under-toast-pin;
-        }
-        if under-toast-open: VerticalLayout {
-            x: 42px;
-            y: 52px + 12px + pin-h;
-            width: parent.width - 58px;
-            height: rows-h;
-            spacing: 0px;
-            for detail in under-toast-details: Text {
-                text: detail;
-                height: line-h;
-                font-size: 11px;
-                color: muted;
-                overflow: elide;
-                vertical-alignment: center;
-            }
-            if under-toast-more > 0: Text {
-                text: "+" + under-toast-more + " more";
-                height: line-h;
-                font-size: 11px;
-                color: muted;
-                vertical-alignment: center;
+            if parked-more > 0: Rectangle {
+                height: 20px;
+                width: 100%;
+                Text {
+                    text: "+" + parked-more + " more";
+                    width: 100%;
+                    height: 100%;
+                    font-size: 11px;
+                    color: muted;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.parked-more-expand(); }
+                    }
+                }
             }
         }
     }

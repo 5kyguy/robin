@@ -4,7 +4,14 @@
 //! A case-only rename that cannot put the original name back names the
 //! hidden file on a sticky toast. A later toast must not take that name
 //! with it: it sits on top, and when it closes the sticky toast is still
-//! there. Only [Dismiss] removes a sticky toast.
+//! there. Only [Dismiss] removes a sticky toast. The stack keeps every
+//! sticky toast, newest on top, so a second stranded rename or a hung
+//! drop cannot wipe an earlier hidden name.
+//!
+//! At most [`FULL_STICKY_TOASTS`] sticky toasts are drawn in full (or
+//! [`SHORT_STICKY_TOASTS`] when the window is shorter than
+//! [`SHORT_WINDOW`]). Older ones collapse into a "+N more" line under
+//! the stack; expanding that line shows the full list.
 
 /// One toast's content, as bound to the window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -28,12 +35,27 @@ pub struct Toast {
     pub drop_wait: bool,
 }
 
-/// The toast showing now, and at most one sticky toast parked under it.
+/// How many sticky toasts are drawn in full in a tall window.
+pub const FULL_STICKY_TOASTS: usize = 3;
+
+/// How many sticky toasts are drawn in full when the window is shorter
+/// than [`SHORT_WINDOW`].
+pub const SHORT_STICKY_TOASTS: usize = 1;
+
+/// Window height, in logical pixels, below which only one sticky toast
+/// is drawn in full.
+pub const SHORT_WINDOW: i32 = 600;
+
+/// The toast showing now, and any number of sticky toasts parked under
+/// it, oldest first. Closing the current toast brings back the newest
+/// parked one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToastStack {
     current: Option<Toast>,
-    under: Option<Toast>,
+    parked: Vec<Toast>,
     gen: u64,
+    /// The "+N more" line has been expanded to the full sticky list.
+    expanded: bool,
 }
 
 impl ToastStack {
@@ -41,21 +63,75 @@ impl ToastStack {
         self.current.as_ref()
     }
 
+    /// Every parked sticky toast, oldest first, newest last (nearest
+    /// the current toast).
+    pub fn parked(&self) -> &[Toast] {
+        &self.parked
+    }
+
+    /// The newest parked sticky toast, if any.
     pub fn under(&self) -> Option<&Toast> {
-        self.under.as_ref()
+        self.parked.last()
     }
 
     pub fn gen(&self) -> u64 {
         self.gen
     }
 
+    pub fn stack_expanded(&self) -> bool {
+        self.expanded
+    }
+
+    /// Show or hide the full sticky list under the "+N more" line.
+    pub fn set_stack_expanded(&mut self, expanded: bool) {
+        self.expanded = expanded;
+    }
+
+    /// Sticky toasts in the stack: the current one when it is sticky,
+    /// plus every parked toast.
+    pub fn sticky_count(&self) -> usize {
+        self.parked.len() + usize::from(self.current.as_ref().is_some_and(|t| t.sticky))
+    }
+
+    /// How many sticky toasts may be drawn in full at this window height.
+    pub fn sticky_cap(&self, window_height: i32) -> usize {
+        if self.expanded {
+            usize::MAX
+        } else if window_height < SHORT_WINDOW {
+            SHORT_STICKY_TOASTS
+        } else {
+            FULL_STICKY_TOASTS
+        }
+    }
+
+    /// How many older sticky toasts are collapsed into "+N more".
+    pub fn collapsed_count(&self, window_height: i32) -> usize {
+        self.sticky_count()
+            .saturating_sub(self.sticky_cap(window_height))
+    }
+
+    /// Parked toasts drawn in full, oldest of that slice first. A timed
+    /// current toast is not counted in the cap; a sticky current toast
+    /// takes one of the slots. Older ones stay in the stack.
+    pub fn visible_parked(&self, window_height: i32) -> &[Toast] {
+        let cap = self.sticky_cap(window_height);
+        let parked_cap = if self.current.as_ref().is_some_and(|t| t.sticky) {
+            cap.saturating_sub(1)
+        } else {
+            cap
+        };
+        let n = self.parked.len();
+        let show = parked_cap.min(n);
+        &self.parked[n - show..]
+    }
+
     /// Show a new toast. A sticky toast that is showing is parked
-    /// underneath; a timed one is replaced. An already-parked sticky
-    /// toast stays parked when one timed toast replaces another.
+    /// underneath; a timed one is replaced. Already-parked sticky toasts
+    /// stay parked when one timed toast replaces another.
     pub fn push(&mut self, toast: Toast) -> u64 {
         if let Some(cur) = self.current.take() {
             if cur.sticky {
-                self.under = Some(cur);
+                self.parked.push(cur);
             }
         }
         self.gen = self.gen.saturating_add(1);
@@ -64,9 +140,9 @@ impl ToastStack {
     }
 
     /// The current toast closed (its timer ran out, or its action hid it).
-    /// A parked sticky toast comes back as the current one.
+    /// The newest parked sticky toast comes back as the current one.
     pub fn expire(&mut self) -> u64 {
-        self.current = self.under.take();
+        self.current = self.parked.pop();
         self.gen = self.gen.saturating_add(1);
         self.gen
     }
@@ -87,17 +163,23 @@ impl ToastStack {
         true
     }
 
-    /// [Dismiss] on the current sticky toast. A parked one comes back.
+    /// [Dismiss] on the current sticky toast. The newest parked one
+    /// comes back.
     pub fn dismiss(&mut self) -> u64 {
-        self.current = self.under.take();
+        self.current = self.parked.pop();
         self.gen = self.gen.saturating_add(1);
         self.gen
     }
 
-    /// [Dismiss] on the parked sticky toast, while a newer one is showing.
-    /// The current toast and its timer are left alone.
-    pub fn dismiss_under(&mut self) {
-        self.under = None;
+    /// [Dismiss] on a visible parked toast, `index` being 0 for the
+    /// newest one currently drawn (nearest the current toast). The
+    /// current toast and its timer are left alone.
+    pub fn dismiss_visible(&mut self, index: usize, window_height: i32) {
+        let n_vis = self.visible_parked(window_height).len();
+        if index < n_vis {
+            let at = self.parked.len() - n_vis + (n_vis - 1 - index);
+            self.parked.remove(at);
+        }
     }
 
     /// Open or close the current toast's details panel.
@@ -114,16 +196,14 @@ impl ToastStack {
         }
     }
 
-    /// Drop any toast matching `pred`. If that toast is current, a parked
-    /// sticky one comes back. The current toast's generation is bumped
-    /// only when the current toast is dropped, so a running timer still
-    /// matches if only the parked toast was removed.
+    /// Drop any toast matching `pred`. If that toast is current, the
+    /// newest parked sticky one comes back. The current toast's
+    /// generation is bumped only when the current toast is dropped, so a
+    /// running timer still matches if only a parked toast was removed.
     pub fn drop_matching(&mut self, pred: impl Fn(&Toast) -> bool) {
-        if self.under.as_ref().is_some_and(&pred) {
-            self.under = None;
-        }
+        self.parked.retain(|t| !pred(t));
         if self.current.as_ref().is_some_and(pred) {
-            self.current = self.under.take();
+            self.current = self.parked.pop();
             self.gen = self.gen.saturating_add(1);
         }
     }
@@ -158,9 +238,33 @@ mod tests {
 
     const HEAD: &str = "Couldn't finish renaming. It's now this hidden file:";
     const HIDDEN: &str = ".robin-rename-4127-0-dune-sunset-0412.jpg";
+    const HIDDEN_B: &str = ".robin-rename-4127-1-dune-sunset-0413.jpg";
+    const TALL: i32 = 800;
+    const SHORT: i32 = 599;
 
     fn stranded() -> Toast {
         sticky(HEAD, HIDDEN, "Dismiss")
+    }
+
+    fn stranded_b() -> Toast {
+        sticky(HEAD, HIDDEN_B, "Dismiss")
+    }
+
+    fn waiting() -> Toast {
+        Toast {
+            tone: "info".into(),
+            text: "Waiting to drop into Pictures…".into(),
+            action: "Cancel".into(),
+            sticky: true,
+            drop_wait: true,
+            ..Toast::default()
+        }
+    }
+
+    fn five_stranded(s: &mut ToastStack) {
+        for i in 0..5 {
+            s.push(sticky(HEAD, &format!("file-{i}.jpg"), "Dismiss"));
+        }
     }
 
     #[test]
@@ -169,7 +273,7 @@ mod tests {
         s.push(stranded());
         assert_eq!(s.current().unwrap().text, HEAD);
         assert_eq!(s.current().unwrap().details, [HIDDEN]);
-        assert!(s.under().is_none());
+        assert!(s.parked().is_empty());
 
         s.push(timed("Copied 1 path"));
         assert_eq!(s.current().unwrap().text, "Copied 1 path");
@@ -190,7 +294,7 @@ mod tests {
         assert_eq!(s.current().unwrap().text, HEAD);
         assert_eq!(s.current().unwrap().details, [HIDDEN]);
         assert!(s.current().unwrap().open && s.current().unwrap().sticky);
-        assert!(s.under().is_none());
+        assert!(s.parked().is_empty());
     }
 
     #[test]
@@ -205,7 +309,7 @@ mod tests {
         assert_eq!(s.current().unwrap().text, HEAD);
         s.dismiss();
         assert!(s.current().is_none());
-        assert!(s.under().is_none());
+        assert!(s.parked().is_empty());
     }
 
     #[test]
@@ -230,8 +334,8 @@ mod tests {
         let mut s = ToastStack::default();
         s.push(stranded());
         let g = s.push(timed("Copied 1 path"));
-        s.dismiss_under();
-        assert!(s.under().is_none());
+        s.dismiss_visible(0, TALL);
+        assert!(s.parked().is_empty());
         assert_eq!(s.current().unwrap().text, "Copied 1 path");
         assert_eq!(s.gen(), g, "the newer toast's timer still matches");
         s.expire();
@@ -254,14 +358,109 @@ mod tests {
     #[test]
     fn dropping_a_hung_drop_toast_does_not_take_a_newer_one_with_it() {
         let mut s = ToastStack::default();
-        let mut wait = timed("Waiting to drop into Pictures…");
-        wait.sticky = true;
-        wait.drop_wait = true;
-        wait.action = "Cancel".into();
-        s.push(wait);
+        s.push(waiting());
         s.push(timed("Copied 1 path"));
         s.drop_matching(|t| t.drop_wait);
-        assert!(s.under().is_none());
+        assert!(s.parked().is_empty());
         assert_eq!(s.current().unwrap().text, "Copied 1 path");
+    }
+
+    #[test]
+    fn two_stranded_toasts_are_both_kept_under_a_newer_one() {
+        let mut s = ToastStack::default();
+        s.push(stranded());
+        s.push(stranded_b());
+        assert_eq!(s.current().unwrap().details, [HIDDEN_B]);
+        assert_eq!(s.parked().len(), 1);
+        assert_eq!(s.parked()[0].details, [HIDDEN]);
+
+        s.push(timed("Copied 1 path"));
+        assert_eq!(s.current().unwrap().text, "Copied 1 path");
+        assert_eq!(s.parked().len(), 2);
+        assert_eq!(s.parked()[0].details, [HIDDEN]);
+        assert_eq!(s.parked()[1].details, [HIDDEN_B]);
+
+        s.expire();
+        assert_eq!(s.current().unwrap().details, [HIDDEN_B]);
+        s.dismiss();
+        assert_eq!(s.current().unwrap().details, [HIDDEN]);
+        s.dismiss();
+        assert!(s.current().is_none());
+        assert!(s.parked().is_empty());
+    }
+
+    #[test]
+    fn dismissing_the_top_parked_toast_leaves_the_older_one() {
+        let mut s = ToastStack::default();
+        s.push(stranded());
+        s.push(stranded_b());
+        s.push(timed("Copied 1 path"));
+        s.dismiss_visible(0, TALL);
+        assert_eq!(s.current().unwrap().text, "Copied 1 path");
+        assert_eq!(s.parked().len(), 1);
+        assert_eq!(s.parked()[0].details, [HIDDEN]);
+    }
+
+    #[test]
+    fn a_stranded_toast_under_a_waiting_toast_is_not_lost() {
+        let mut s = ToastStack::default();
+        s.push(stranded());
+        s.push(waiting());
+        assert_eq!(s.current().unwrap().text, "Waiting to drop into Pictures…");
+        assert_eq!(s.parked()[0].details, [HIDDEN]);
+
+        s.push(timed("Copied 1 path"));
+        assert_eq!(s.current().unwrap().text, "Copied 1 path");
+        assert_eq!(s.parked().len(), 2);
+        assert_eq!(s.parked()[0].details, [HIDDEN]);
+        assert!(s.parked()[1].drop_wait);
+
+        s.drop_matching(|t| t.drop_wait);
+        assert_eq!(s.current().unwrap().text, "Copied 1 path");
+        assert_eq!(s.parked().len(), 1);
+        assert_eq!(s.parked()[0].details, [HIDDEN]);
+    }
+
+    #[test]
+    fn collapse_count_at_full_height_hides_older_stickies() {
+        let mut s = ToastStack::default();
+        five_stranded(&mut s);
+        s.push(timed("Copied 1 path"));
+        assert_eq!(s.parked().len(), 5);
+        assert_eq!(s.visible_parked(TALL).len(), 3);
+        assert_eq!(s.collapsed_count(TALL), 2);
+        assert_eq!(s.visible_parked(TALL)[0].details, ["file-2.jpg"]);
+        assert_eq!(s.visible_parked(TALL)[2].details, ["file-4.jpg"]);
+        // A timed toast is not one of the three sticky slots.
+        assert_eq!(s.collapsed_count(600), 2);
+    }
+
+    #[test]
+    fn collapse_count_under_600_shows_one_sticky() {
+        let mut s = ToastStack::default();
+        five_stranded(&mut s);
+        s.push(timed("Copied 1 path"));
+        assert_eq!(s.visible_parked(SHORT).len(), 1);
+        assert_eq!(s.collapsed_count(SHORT), 4);
+        assert_eq!(s.visible_parked(SHORT)[0].details, ["file-4.jpg"]);
+        // 600px is not under 600, so the tall cap still applies.
+        assert_eq!(s.visible_parked(600).len(), 3);
+        assert_eq!(s.collapsed_count(600), 2);
+    }
+
+    #[test]
+    fn expanding_the_list_shows_every_sticky_toast() {
+        let mut s = ToastStack::default();
+        five_stranded(&mut s);
+        s.push(timed("Copied 1 path"));
+        s.set_stack_expanded(true);
+        assert_eq!(s.visible_parked(TALL).len(), 5);
+        assert_eq!(s.collapsed_count(TALL), 0);
+        assert_eq!(s.visible_parked(SHORT).len(), 5);
+        assert_eq!(s.collapsed_count(SHORT), 0);
+        s.dismiss_visible(0, TALL);
+        assert_eq!(s.current().unwrap().text, "Copied 1 path");
+        assert_eq!(s.parked().len(), 4);
+        assert_eq!(s.parked()[3].details, ["file-3.jpg"]);
     }
 }
