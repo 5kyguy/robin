@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod clipboard;
 pub mod delegate;
 pub mod devices;
 pub mod error;

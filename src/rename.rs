@@ -21,7 +21,7 @@
 //! original name back.
 
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use rustix::fs::{AtFlags, RenameFlags};
@@ -141,7 +141,8 @@ pub enum How {
     Same,
 }
 
-/// Why a rename didn't happen. The original is untouched in every case.
+/// Why a rename didn't happen. The original is untouched in every case
+/// but [`Failure::Stranded`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Failure {
     /// The name is taken (`dir`: by a folder).
@@ -156,6 +157,11 @@ pub enum Failure {
     Io(Errno),
     /// The name can't be a file name.
     Invalid,
+    /// A two-step (case-only) rename failed half way and the original
+    /// name couldn't be put back: the item is under this hidden name.
+    Stranded {
+        hidden: OsString,
+    },
 }
 
 /// The few calls a rename makes, inside one folder. [`DirOps`] makes them
@@ -345,10 +351,12 @@ fn two_step(
     place(ops, from_c, &tmp, before)?;
     match place(ops, &tmp, to_c, before) {
         Ok(_) => Ok(How::TwoStep),
-        Err(e) => {
-            let _ = place(ops, &tmp, from_c, &mut || {});
-            Err(e)
-        }
+        Err(e) => match place(ops, &tmp, from_c, &mut || {}) {
+            Ok(_) => Err(e),
+            Err(_) => Err(Failure::Stranded {
+                hidden: OsString::from_vec(tmp.into_bytes()),
+            }),
+        },
     }
 }
 
@@ -492,6 +500,9 @@ mod tests {
         refuse: bool,
         /// Fail the n-th successful-looking rename (1-based) with EIO.
         fail_nth: Cell<u32>,
+        /// After that failure, keep failing every rename.
+        stay_broken: bool,
+        broken: Cell<bool>,
         plain_calls: Cell<u32>,
     }
 
@@ -517,9 +528,13 @@ mod tests {
             self.items.borrow().iter().map(|i| i.0.clone()).collect()
         }
         fn tick(&self) -> Result<(), Errno> {
+            if self.broken.get() {
+                return Err(Errno::IO);
+            }
             let n = self.fail_nth.get();
             if n == 1 {
                 self.fail_nth.set(0);
+                self.broken.set(self.stay_broken);
                 return Err(Errno::IO);
             }
             if n > 1 {
@@ -621,6 +636,26 @@ mod tests {
             Err(Failure::Io(Errno::IO))
         );
         assert_eq!(f.names(), ["photo.jpg"]);
+    }
+
+    #[test]
+    fn a_stranded_two_step_rename_names_the_hidden_file() {
+        let f = Fake {
+            fold: true,
+            stay_broken: true,
+            ..Fake::with(&["photo.jpg"])
+        };
+        // Step 1 works; step 2 and the way back both fail.
+        f.fail_nth.set(2);
+        let got = go(&f, "photo.jpg", "Photo.JPG");
+        let hidden = format!(".robin-rename-{}-0-photo.jpg", std::process::id());
+        assert_eq!(
+            got,
+            Err(Failure::Stranded {
+                hidden: hidden.clone().into()
+            })
+        );
+        assert_eq!(f.names(), [hidden]);
     }
 
     #[test]

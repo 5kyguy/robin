@@ -96,6 +96,9 @@ pub fn known(view: &str) -> bool {
             | "rename-invalid"
             | "rename-grid"
             | "properties"
+            | "copy-path-done"
+            | "copy-path-no-tool"
+            | "rename-stranded"
             | "menu-bg"
             | "shortcuts-browser"
             | "reduce-motion"
@@ -1306,6 +1309,28 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
             ui.set_rename_stem(crate::rename::stem_len(text, false) as i32);
             ui.set_rename_error(error.into());
             ui.set_rename_at(index(photo));
+        }
+        "copy-path-done" | "copy-path-no-tool" | "rename-stranded" => {
+            use crate::clipboard::{paths_toast, Outcome};
+            select(&[photo, "dune-sunset-0413.jpg"]);
+            let (tone, text) = match view {
+                "copy-path-done" => paths_toast(&Outcome::Copied, 2),
+                "copy-path-no-tool" => paths_toast(&Outcome::NoTool, 2),
+                _ => ("danger", crate::app::STRANDED_HEAD.to_string()),
+            };
+            ui.set_overlay("".into());
+            ui.set_toast_on(true);
+            ui.set_toast_tone(tone.into());
+            ui.set_toast_glyph(crate::app::toast_glyph(tone).into());
+            ui.set_toast_text(text.into());
+            ui.set_toast_action("".into());
+            let details = if view == "rename-stranded" {
+                vec![".robin-rename-4127-0-dune-sunset-0412.jpg".to_string()]
+            } else {
+                Vec::new()
+            };
+            crate::app::set_toast_rows(ui, &crate::app::detail_rows(&details, true, false));
+            ui.set_toast_open(view == "rename-stranded");
         }
         "properties" => {
             select(&[photo]);

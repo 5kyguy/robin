@@ -109,6 +109,9 @@ pub fn scripted(view: &str) -> bool {
             | "rename-done"
             | "properties"
             | "properties-multi"
+            | "copy-path"
+            | "copy-path-xclip"
+            | "copy-path-no-tool"
     )
 }
 
@@ -1139,7 +1142,8 @@ fn paint_in(
         }
         v if v.starts_with("context-menu")
             || v.starts_with("rename-")
-            || v.starts_with("properties") =>
+            || v.starts_with("properties")
+            || v.starts_with("copy-path") =>
         {
             file_scene(&ui, v, size)?
         }
@@ -1391,6 +1395,45 @@ fn file_scene(ui: &AppWindow, view: &str, size: (u32, u32)) -> Result<()> {
             ui.invoke_key(app::keys::F2.into(), false, false, false);
             ui.show().map_err(|e| Error::Message(e.to_string()))?;
             type_field(ui, "dune-sunset-0413");
+        }
+        // Copy path against a stand-in clipboard: wl-copy on Wayland,
+        // xclip on X11 without wl-copy, and nothing installed at all.
+        "copy-path" | "copy-path-xclip" | "copy-path-no-tool" => {
+            use crate::clipboard::Session;
+            let (tools, session, want): (&[&'static str], _, _) = match view {
+                "copy-path" => (
+                    &["wl-copy"],
+                    Session {
+                        wayland: true,
+                        x11: false,
+                    },
+                    "Copied 2 paths",
+                ),
+                "copy-path-xclip" => (
+                    &["xclip"],
+                    Session {
+                        wayland: false,
+                        x11: true,
+                    },
+                    "Copied 2 paths",
+                ),
+                _ => (
+                    &[],
+                    Session {
+                        wayland: true,
+                        x11: true,
+                    },
+                    "Couldn't copy: install wl-clipboard or xclip",
+                ),
+            };
+            app::fake_clipboard(tools, session);
+            select_row(ui, photo);
+            let j = row_index(ui, "dune-sunset-0413.jpg")?;
+            ui.invoke_row_pointer(j, 0, 0, false, true, false);
+            ui.invoke_row_pointer(j, 2, 0, false, true, false);
+            ui.invoke_row_menu(j, 330.0, 150.0);
+            ui.invoke_file_menu_pick(menu_line(ui, "Copy path")?);
+            check("toast", ui.get_toast_text().to_string(), want)?;
         }
         "properties" | "properties-multi" => {
             select_row(ui, photo);

@@ -106,6 +106,9 @@ fn scripted_views_render_through_the_real_app() {
         ("properties", 800),
         ("properties-multi", 800),
         ("properties", 480),
+        ("copy-path", 800),
+        ("copy-path-xclip", 800),
+        ("copy-path-no-tool", 800),
         // The 480px floor: the info panel floats, the filmstrip is cut
         // to the window, and the statistics cards stack.
         ("view-info", 480),

@@ -141,6 +141,9 @@ pub enum Action {
     /// Not done, and why: a `warning` toast (a phone's top folder takes no
     /// files, its storages can't be deleted).
     Refuse(String),
+    /// A rename left the item under this hidden name: a danger toast
+    /// that stays, naming it, then a reread.
+    Stranded(OsString),
     /// Reread the open folder off the UI thread.
     Reread,
     /// Make a "New folder" in this folder on a worker: on a phone even
@@ -2470,6 +2473,14 @@ impl Controller {
                 *self.reveal.borrow_mut() = Some(to.clone());
                 Action::Reread
             }
+            // The item now only exists under the hidden name: the edit's
+            // row is gone, so say where it is in a toast that stays.
+            Err(crate::rename::Failure::Stranded { hidden }) => {
+                if ours {
+                    self.rename = None;
+                }
+                Action::Stranded(hidden)
+            }
             Err(f) => {
                 if !ours {
                     return Action::None;
@@ -2501,6 +2512,7 @@ impl Controller {
                 _ => "You don't have permission to rename it".into(),
             },
             Failure::Io(e) => format!("Couldn't rename: {}", std::io::Error::from(*e)),
+            Failure::Stranded { hidden } => stranded_text(hidden),
         }
     }
 
@@ -7268,13 +7280,58 @@ fn blur_rename(ui: &AppWindow, st: &Shared) {
     apply(ui, st, action);
 }
 
-/// The toast after Copy path.
-pub fn copied_paths_text(n: usize) -> String {
-    if n == 1 {
-        "Copied the path".into()
-    } else {
-        format!("Copied {n} paths")
+/// The toast headline when a half-done case-only rename left the item
+/// under a hidden name; the name itself is the toast's pinned line.
+pub const STRANDED_HEAD: &str = "Couldn't finish renaming. It's now this hidden file:";
+
+/// The same in one line, for the inline field.
+pub fn stranded_text(hidden: &std::ffi::OsStr) -> String {
+    format!("{STRANDED_HEAD} {}", hidden.to_string_lossy())
+}
+
+thread_local! {
+    /// The clipboard helpers scripted renders and tests pretend are
+    /// installed, and the session they pretend to run in.
+    static CLIP_FAKE: RefCell<(Vec<&'static str>, crate::clipboard::Session)> =
+        RefCell::new((vec!["wl-copy"], crate::clipboard::Session { wayland: true, x11: false }));
+}
+
+/// For the render harness and tests: which clipboard helpers exist.
+pub fn fake_clipboard(installed: &[&'static str], session: crate::clipboard::Session) {
+    CLIP_FAKE.with(|c| *c.borrow_mut() = (installed.to_vec(), session));
+}
+
+/// Copy path: hand the paths, one per line, to a clipboard helper on a
+/// worker, and only say they were copied once a helper took them.
+fn copy_paths(ui: &AppWindow, st: &Shared, paths: Vec<PathBuf>) {
+    use crate::clipboard;
+    let n = paths.len();
+    let text = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let land = move |ui: &AppWindow, st: &Shared, out: clipboard::Outcome| {
+        let (tone, text) = clipboard::paths_toast(&out, n);
+        show_toast(ui, st, tone, text, Vec::new(), false, "");
+    };
+    if SCRIPTED.with(|s| s.get()) {
+        let (installed, session) = CLIP_FAKE.with(|c| c.borrow().clone());
+        let fake = clipboard::Fake {
+            installed,
+            ..clipboard::Fake::default()
+        };
+        let out = clipboard::copy_with(&fake, session, text.as_bytes());
+        for (argv, _) in fake.calls.into_inner() {
+            LAUNCHED.with(|l| {
+                l.borrow_mut()
+                    .push(argv.into_iter().map(Into::into).collect())
+            });
+        }
+        land(ui, st, out);
+        return;
     }
+    run_device(ui, st, move || clipboard::copy(text.as_bytes()), land);
 }
 
 /// Start a navigation read: drop targets follow it, and a slow one shows
@@ -7349,6 +7406,24 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
         }
         Action::ClearThumbs(cache) => clear_thumbs(ui, st, cache),
         Action::Refuse(why) => show_toast(ui, st, "warning", why, Vec::new(), false, ""),
+        Action::Stranded(hidden) => {
+            redraw(ui, &st.borrow());
+            // The hidden name is long: it gets the toast's pinned line,
+            // which wraps, instead of being cut off in the headline.
+            show_toast_sticky(
+                ui,
+                st,
+                "danger",
+                STRANDED_HEAD.into(),
+                vec![hidden.to_string_lossy().into_owned()],
+                true,
+                "",
+            );
+            st.borrow_mut().toast_open = true;
+            ui.set_toast_open(true);
+            let ticket = st.borrow_mut().ctl.begin_refresh();
+            start_read(ticket);
+        }
         Action::Reread => {
             let ticket = st.borrow_mut().ctl.begin_refresh();
             start_read(ticket);
@@ -7356,23 +7431,7 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
         Action::MakeFolder(dir) => make_folder_async(ui, st, dir),
         Action::Rename { dir, from, to } => rename_async(ui, st, dir, from, to),
         Action::RenameUi => sync_rename(ui, &st.borrow()),
-        Action::CopyPaths(paths) => {
-            let text = paths
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("\n");
-            launch(ui, st, vec!["wl-copy".into(), "--".into(), text.into()]);
-            show_toast(
-                ui,
-                st,
-                "",
-                copied_paths_text(paths.len()),
-                Vec::new(),
-                false,
-                "",
-            );
-        }
+        Action::CopyPaths(paths) => copy_paths(ui, st, paths),
         Action::Answer(choice) => {
             if let Some(tx) = st.borrow_mut().reply.take() {
                 let _ = tx.send(choice);
@@ -11345,6 +11404,31 @@ mod tests {
             c.begin_rename(),
             Action::Refuse("Pixel 8's storages can't be renamed".into())
         );
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn a_stranded_case_only_rename_names_the_hidden_file() {
+        let mut c = setup("rename-stranded");
+        c.listing.select_only("a.jpg".into());
+        c.begin_rename();
+        c.rename_edited("A.jpg");
+        let Action::Rename { dir, from, to } = c.rename_commit() else {
+            panic!("no rename");
+        };
+        let hidden = OsString::from(".robin-rename-1-0-a.jpg");
+        let got = Err(crate::rename::Failure::Stranded {
+            hidden: hidden.clone(),
+        });
+        assert_eq!(
+            c.rename_landed(&dir, &from, &to, got),
+            Action::Stranded(hidden.clone())
+        );
+        assert_eq!(
+            stranded_text(&hidden),
+            "Couldn't finish renaming. It's now this hidden file: .robin-rename-1-0-a.jpg"
+        );
+        assert!(c.rename.is_none(), "the edit's row is gone");
         let _ = fs::remove_dir_all(c.env.home.unwrap());
     }
 
