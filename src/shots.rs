@@ -1407,6 +1407,9 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
         "phone-safe-unplug" => {
             device_toast(ui, "", "Pixel 8 can be unplugged", "", "");
         }
+        "confirm-trash-no-trash" => {
+            ui.set_trash_no_note("Files deleted on SANDISK can't be recovered".into());
+        }
         "phone-no-trash" => {
             ui.set_trash_no_title("This phone has no trash".into());
             ui.set_trash_no_note("Files deleted on Pixel 8 can't be recovered".into());

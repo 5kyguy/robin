@@ -6270,11 +6270,11 @@ fn make_folder_async(ui: &AppWindow, st: &Shared, dir: PathBuf) {
     );
 }
 
-/// The no-trash confirm's note. On a phone or camera it names the device
-/// and says what deleting there means; a drive keeps #41's note.
+/// The no-trash confirm's note. It names the volume and says deleted
+/// files can't be recovered.
 pub fn trash_no_note(ctl: &Controller) -> String {
     match crate::devices::device_of(&ctl.devices, &ctl.dir) {
-        Some(d) if d.media() => format!("Files deleted on {} can't be recovered", d.name()),
+        Some(d) => format!("Files deleted on {} can't be recovered", d.name()),
         _ if crate::devices::gvfs_media_root(&ctl.dir).is_some() => {
             "Files deleted on this phone can't be recovered".into()
         }
@@ -6282,8 +6282,8 @@ pub fn trash_no_note(ctl: &Controller) -> String {
     }
 }
 
-/// The no-trash confirm's note on a drive.
-pub const TRASH_NO_NOTE: &str = "Robin will not copy these files home.";
+/// The no-trash confirm's note when the volume isn't in the device list.
+pub const TRASH_NO_NOTE: &str = "Files deleted on this drive can't be recovered";
 
 /// The no-trash confirm's title: a phone's, a camera's, or a drive's.
 pub fn trash_no_title(ctl: &Controller) -> &'static str {
@@ -10197,6 +10197,30 @@ mod tests {
         go(&mut c, pics);
         assert_eq!(trash_no_title(&c), "This drive has no trash");
         assert_eq!(trash_no_note(&c), TRASH_NO_NOTE);
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn deleting_on_a_drive_says_files_cant_be_recovered() {
+        let mut c = setup("drive-trash");
+        let root = c.env.home.clone().unwrap();
+        let fake = crate::devices::FakeDevices::new();
+        fake.plug(crate::devices::FakeDrive::stick(
+            "sdb1",
+            "SANDISK",
+            29_800_000_000,
+            &root.join("SANDISK"),
+        ));
+        let at = crate::devices::DeviceBackend::mount(fake.as_ref(), "sdb1").unwrap();
+        fs::write(at.join("a.jpg"), b"a").unwrap();
+        c.devices = crate::devices::DeviceBackend::drives(fake.as_ref()).unwrap();
+        go(&mut c, at);
+        c.listing.select_only("a.jpg".into());
+        assert_eq!(trash_no_title(&c), "This drive has no trash");
+        assert_eq!(
+            trash_no_note(&c),
+            "Files deleted on SANDISK can't be recovered"
+        );
         let _ = fs::remove_dir_all(c.env.home.unwrap());
     }
 
