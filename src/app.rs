@@ -49,6 +49,17 @@ pub enum Dialog {
         ask: ConflictAsk,
         apply_all: bool,
     },
+    /// The file menu's Properties: one [Close] button.
+    Properties(Props),
+}
+
+/// The Properties dialog's contents: a title with its glyph, then
+/// key/value lines (Kind, Size, Location, Modified, Permissions).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Props {
+    pub title: String,
+    pub glyph: String,
+    pub facts: Vec<(String, String)>,
 }
 
 /// One name clash the job thread is waiting on.
@@ -70,6 +81,7 @@ impl Dialog {
             Dialog::Delete(_) | Dialog::EmptyTrash(_) | Dialog::ClearThumbs(_) => "delete",
             Dialog::Refused { .. } => "move-refused",
             Dialog::Conflict { .. } => "conflict-live",
+            Dialog::Properties(_) => "properties",
         }
     }
 
@@ -79,6 +91,7 @@ impl Dialog {
                 can_copy: false, ..
             } => 1,
             Dialog::Conflict { .. } => 5,
+            Dialog::Properties(_) => 1,
             // Cancel, Move to Trash, and the "Don't ask again" box.
             Dialog::Trash(_) => 3,
             _ => 2,
@@ -92,7 +105,8 @@ impl Dialog {
             Dialog::Delete(_)
             | Dialog::EmptyTrash(_)
             | Dialog::ClearThumbs(_)
-            | Dialog::TrashNo(_) => 0,
+            | Dialog::TrashNo(_)
+            | Dialog::Properties(_) => 0,
             Dialog::Trash(_) => 1,
             Dialog::Refused { can_copy, .. } => i32::from(*can_copy),
             Dialog::Conflict { .. } => 1,
@@ -132,6 +146,42 @@ pub enum Action {
     /// Make a "New folder" in this folder on a worker: on a phone even
     /// the name probe is a round trip over USB.
     MakeFolder(PathBuf),
+    /// Rename `from` to `to` in `dir` on a worker (a phone answers over
+    /// USB); the inline field waits for the answer.
+    Rename {
+        dir: PathBuf,
+        from: OsString,
+        to: OsString,
+    },
+    /// Only the inline rename field changed: its text, error or state.
+    RenameUi,
+    /// Put these paths on the clipboard, one per line.
+    CopyPaths(Vec<PathBuf>),
+}
+
+/// The file right-click menu while it is open.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileMenu {
+    /// Where it was opened, in window coordinates.
+    pub at: (f32, f32),
+    /// The right-clicked item.
+    pub target: OsString,
+    pub items: Vec<crate::MenuItem>,
+    pub acts: Vec<Option<crate::menus::FileAct>>,
+}
+
+/// The inline rename field (DESIGN §4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenameEdit {
+    /// The item's name when editing began.
+    pub name: OsString,
+    pub dir: bool,
+    /// What is typed.
+    pub text: String,
+    /// Shown in `danger` under the field.
+    pub error: Option<String>,
+    /// Sent to the worker; waiting for its answer.
+    pub busy: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -317,6 +367,12 @@ pub struct Controller {
     /// A folder just made off the UI thread: selected when the reread
     /// that lists it lands.
     pub select_on_land: Option<std::ffi::OsString>,
+    /// The file right-click menu, while open.
+    pub file_menu: Option<FileMenu>,
+    /// The inline rename field, while editing.
+    pub rename: Option<RenameEdit>,
+    /// An item to scroll into view on the next redraw (a renamed one).
+    pub reveal: RefCell<Option<OsString>>,
 }
 
 /// The open folder's drive, gone from under it (DESIGN §3).
@@ -614,6 +670,7 @@ pub mod keys {
     pub const RIGHT: &str = "\u{F703}";
     pub const HOME: &str = "\u{F729}";
     pub const END: &str = "\u{F72B}";
+    pub const F2: &str = "\u{F705}";
     pub const F11: &str = "\u{F70E}";
 }
 
@@ -863,6 +920,9 @@ impl Controller {
             devices: Vec::new(),
             pacer: None,
             select_on_land: None,
+            file_menu: None,
+            rename: None,
+            reveal: RefCell::new(None),
         }
     }
 
@@ -1207,6 +1267,8 @@ impl Controller {
                 self.apply_snapshot(snap);
                 // The viewer browses one folder; leaving it closes it.
                 self.viewer = None;
+                self.rename = None;
+                self.file_menu = None;
                 Landed::Shown { moved: true }
             }
             Ok((_, snap)) => {
@@ -1221,8 +1283,15 @@ impl Controller {
                 self.prune_viewer();
                 if let Some(name) = self.select_on_land.take() {
                     if self.listing.entries().iter().any(|e| e.name == name) {
-                        self.listing.select_only(name);
+                        self.listing.select_only(name.clone());
+                        *self.reveal.borrow_mut() = Some(name);
                     }
+                }
+                // The item being renamed went away under the field.
+                if self.rename.as_ref().is_some_and(|r| {
+                    !r.busy && !self.listing.entries().iter().any(|e| e.name == r.name)
+                }) {
+                    self.rename = None;
                 }
                 Landed::Shown { moved: false }
             }
@@ -1506,6 +1575,27 @@ impl Controller {
     }
 
     pub fn key(&mut self, text: &str, ctrl: bool, shift: bool) -> Action {
+        self.key_mods(text, ctrl, shift, false)
+    }
+
+    /// A key with its modifiers, Alt included: Alt+Left and Alt+Right
+    /// step back and forward through the folder history.
+    pub fn key_mods(&mut self, text: &str, ctrl: bool, shift: bool, alt: bool) -> Action {
+        if self.file_menu.is_some() {
+            if text == keys::ESCAPE {
+                self.file_menu = None;
+                return Action::Redraw;
+            }
+            return Action::None;
+        }
+        if self.rename.is_some() {
+            // The field has the keys; these arrive only if it lost focus.
+            return match text {
+                keys::ESCAPE => self.rename_cancel(),
+                keys::RETURN => self.rename_commit(),
+                _ => Action::None,
+            };
+        }
         if self.device_menu.is_some() {
             if text == keys::ESCAPE {
                 self.device_menu = None;
@@ -1541,6 +1631,16 @@ impl Controller {
                 }
                 _ => Action::Redraw,
             };
+        }
+        if alt && !ctrl && !shift {
+            return match text {
+                keys::LEFT => self.side_button(false),
+                keys::RIGHT => self.side_button(true),
+                _ => Action::None,
+            };
+        }
+        if text == keys::F2 && !ctrl && !alt {
+            return self.begin_rename();
         }
         if let Some(action) = self.search_key(text, ctrl) {
             return action;
@@ -1793,7 +1893,9 @@ impl Controller {
                 can_copy,
                 ..
             } if can_copy => Action::Run(Job::new(JobKind::Copy, &job.src, copy, &job.dest)),
-            Dialog::Refused { .. } | Dialog::Conflict { .. } => Action::Redraw,
+            Dialog::Refused { .. } | Dialog::Conflict { .. } | Dialog::Properties(_) => {
+                Action::Redraw
+            }
         }
     }
 
@@ -2038,6 +2140,470 @@ impl Controller {
     }
 }
 
+/// The file menu, inline rename, Properties, and the mouse's side
+/// buttons.
+impl Controller {
+    /// The mouse's back (`forward` false) or forward side button, and
+    /// Alt+Left / Alt+Right: the toolbar's history buttons. Nothing
+    /// while a dialog, menu, rename or the viewer is up.
+    pub fn side_button(&mut self, forward: bool) -> Action {
+        if self.dialog.is_some()
+            || self.viewer.is_some()
+            || self.file_menu.is_some()
+            || self.device_menu.is_some()
+            || self.rename.is_some()
+        {
+            return Action::None;
+        }
+        let can = if forward {
+            self.can_forward()
+        } else {
+            self.can_back()
+        };
+        if !can {
+            return Action::None;
+        }
+        Action::Travel(if forward { Step::Forward } else { Step::Back })
+    }
+
+    /// Why nothing in the open folder can change, if so: a read-only
+    /// drive, or a local folder without write permission.
+    fn read_only_why(&self, limits: &crate::devices::Limits) -> Option<String> {
+        if let Some(why) = &limits.read_only {
+            return Some(why.clone());
+        }
+        if limits.slow || self.in_trash() {
+            return None;
+        }
+        rustix::fs::access(&self.dir, rustix::fs::Access::WRITE_OK)
+            .err()
+            .map(|_| format!("You don't have permission to change {}", self.dir_name()))
+    }
+
+    /// What the file menu greys out for the selection here, and why.
+    pub fn file_ctx(&self) -> crate::menus::FileCtx {
+        let names = self.names();
+        let limits = self.limits();
+        let in_trash = self.in_trash();
+        let dir = self
+            .file_menu
+            .as_ref()
+            .map(|m| m.target.clone())
+            .or_else(|| names.first().cloned())
+            .is_some_and(|n| self.entry(&n).is_some_and(|e| e.is_dir));
+        let no_trash = !in_trash
+            && (limits.no_trash || ops::trash_choice(&self.dir, &self.env) == TrashChoice::Ask);
+        crate::menus::FileCtx {
+            count: names.len(),
+            dir,
+            can_paste: self.clip.clip().is_some(),
+            no_trash,
+            in_trash,
+            read_only: self.read_only_why(&limits),
+            write: limits.write,
+            remove: limits.remove,
+            rename: limits.rename,
+        }
+    }
+
+    fn entry(&self, name: &OsString) -> Option<&crate::model::Entry> {
+        self.listing.entries().iter().find(|e| &e.name == name)
+    }
+
+    /// A right-click on view row `index` at (`x`, `y`): an item not
+    /// already selected is selected alone first, then the menu opens.
+    pub fn open_file_menu(&mut self, index: usize, x: f32, y: f32) -> Action {
+        if self.dialog.is_some()
+            || self.viewer.is_some()
+            || self.rename.as_ref().is_some_and(|r| r.busy)
+        {
+            return Action::None;
+        }
+        if self.rename.is_some() {
+            self.rename = None;
+        }
+        self.device_menu = None;
+        let Some((name, _)) = self.row_name(index) else {
+            return Action::None;
+        };
+        if !self.listing.selection().contains(&name) {
+            self.listing.select_only(name.clone());
+        }
+        self.file_menu = Some(FileMenu {
+            at: (x, y),
+            target: name,
+            items: Vec::new(),
+            acts: Vec::new(),
+        });
+        let lines = crate::menus::file_menu_for(&self.file_ctx(), self.compact);
+        if let Some(m) = self.file_menu.as_mut() {
+            (m.items, m.acts) = lines.into_iter().unzip();
+        }
+        Action::Redraw
+    }
+
+    pub fn close_file_menu(&mut self) -> Action {
+        match self.file_menu.take() {
+            Some(_) => Action::Redraw,
+            None => Action::None,
+        }
+    }
+
+    /// A click on file-menu line `line`. A greyed line does nothing and
+    /// the menu stays open, so its tooltip can be read.
+    pub fn file_menu_pick(&mut self, line: usize) -> Action {
+        use crate::menus::FileAct;
+        let Some(menu) = self.file_menu.as_ref() else {
+            return Action::None;
+        };
+        let (Some(Some(act)), Some(item)) = (menu.acts.get(line), menu.items.get(line)) else {
+            return Action::None;
+        };
+        if item.off {
+            return Action::None;
+        }
+        let (act, target) = (*act, menu.target.clone());
+        self.file_menu = None;
+        match act {
+            FileAct::Open => self.open_item(&target),
+            FileAct::OpenWith => Action::Launch(crate::delegate::argv(
+                crate::delegate::Handoff::Default,
+                &self.dir.join(&target),
+            )),
+            FileAct::Cut => {
+                self.clip.cut(&self.dir, self.names());
+                Action::Redraw
+            }
+            FileAct::Copy => {
+                self.clip.copy(&self.dir, self.names());
+                Action::Redraw
+            }
+            FileAct::Paste => match self.clip.paste(&self.dir) {
+                Some(job) if !self.nav_pending() => Action::Run(job),
+                _ => Action::Redraw,
+            },
+            FileAct::Rename => self.begin_rename(),
+            FileAct::Remove => match self.remove(false) {
+                Action::None => Action::Redraw,
+                a => a,
+            },
+            FileAct::CopyPath => {
+                Action::CopyPaths(self.names().iter().map(|n| self.dir.join(n)).collect())
+            }
+            FileAct::Properties => Action::Open(Dialog::Properties(self.properties())),
+        }
+    }
+
+    /// Open one item: a folder in Robin, media in the viewer, anything
+    /// else in the desktop's default app (as Open with… does).
+    pub fn open_item(&mut self, name: &OsString) -> Action {
+        let path = self.dir.join(name);
+        if self.entry(name).is_some_and(|e| e.is_dir) {
+            return Action::Navigate(path);
+        }
+        match self.open_viewer(name) {
+            Action::None => Action::Launch(crate::delegate::argv(
+                crate::delegate::Handoff::Default,
+                &path,
+            )),
+            a => a,
+        }
+    }
+
+    /// Why the selection can't be renamed here, if it can't.
+    fn rename_refusal(&self, names: &[OsString]) -> Option<String> {
+        if names.len() > 1 {
+            return Some("Select one item to rename".into());
+        }
+        if self.in_trash() {
+            return Some("Restore it from the Trash first".into());
+        }
+        let limits = self.limits();
+        limits
+            .rename
+            .clone()
+            .or_else(|| self.read_only_why(&limits))
+    }
+
+    /// F2 or the menu's Rename: the name cell becomes a field with the
+    /// name selected, extension excluded. From the keyboard a refusal
+    /// is a toast; in the menu the line is greyed instead.
+    pub fn begin_rename(&mut self) -> Action {
+        if self.nav_pending() || self.dialog.is_some() || self.viewer.is_some() {
+            return Action::None;
+        }
+        let names = self.names();
+        let Some(name) = names.first().cloned() else {
+            return Action::None;
+        };
+        if let Some(why) = self.rename_refusal(&names) {
+            return Action::Refuse(why);
+        }
+        let dir = self.entry(&name).is_some_and(|e| e.is_dir);
+        self.rename = Some(RenameEdit {
+            text: name.to_string_lossy().into_owned(),
+            name: name.clone(),
+            dir,
+            error: None,
+            busy: false,
+        });
+        *self.reveal.borrow_mut() = Some(name);
+        Action::Redraw
+    }
+
+    /// Byte length of the part of the name pre-selected in the field.
+    pub fn rename_stem(&self) -> usize {
+        self.rename
+            .as_ref()
+            .map_or(0, |r| crate::rename::stem_len(&r.text, r.dir))
+    }
+
+    fn rename_problem(&self, r: &RenameEdit) -> Option<String> {
+        crate::rename::check(&r.text, &r.name, |n| {
+            self.listing
+                .entries()
+                .iter()
+                .find(|e| e.name == n)
+                .map(|e| e.is_dir)
+        })
+        .err()
+        .map(|p| p.text())
+    }
+
+    /// The field's text changed: checked as it is typed, so a clash or a
+    /// bad character shows before Enter.
+    pub fn rename_edited(&mut self, text: &str) -> Action {
+        let Some(mut r) = self.rename.clone() else {
+            return Action::None;
+        };
+        if r.busy {
+            return Action::None;
+        }
+        r.text = text.into();
+        r.error = self.rename_problem(&r);
+        self.rename = Some(r);
+        Action::RenameUi
+    }
+
+    /// Enter: rename, unless the name is invalid or taken (then the
+    /// field stays with the reason under it) or unchanged (then the
+    /// field just closes).
+    pub fn rename_commit(&mut self) -> Action {
+        let Some(mut r) = self.rename.clone() else {
+            return Action::None;
+        };
+        if r.busy {
+            return Action::None;
+        }
+        if r.text.as_str() == r.name.to_string_lossy() {
+            self.rename = None;
+            return Action::Redraw;
+        }
+        r.error = self.rename_problem(&r);
+        if r.error.is_some() {
+            self.rename = Some(r);
+            return Action::RenameUi;
+        }
+        r.busy = true;
+        let action = Action::Rename {
+            dir: self.dir.clone(),
+            from: r.name.clone(),
+            to: r.text.clone().into(),
+        };
+        self.rename = Some(r);
+        action
+    }
+
+    /// Esc: the field closes and the name stays.
+    pub fn rename_cancel(&mut self) -> Action {
+        match &self.rename {
+            Some(r) if !r.busy => {
+                self.rename = None;
+                Action::Redraw
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// A click elsewhere took the focus: a valid, changed name is saved,
+    /// anything else is dropped as Esc would.
+    pub fn rename_blur(&mut self) -> Action {
+        let Some(r) = self.rename.clone() else {
+            return Action::None;
+        };
+        if r.busy {
+            return Action::None;
+        }
+        if self.rename_problem(&r).is_none() && r.text.as_str() != r.name.to_string_lossy() {
+            return self.rename_commit();
+        }
+        self.rename_cancel()
+    }
+
+    /// The worker's answer. Done: the item takes its new name in place,
+    /// stays selected and in view, and a reread confirms it. Refused or
+    /// taken: the field stays open with the reason under it.
+    pub fn rename_landed(
+        &mut self,
+        dir: &Path,
+        from: &OsString,
+        to: &OsString,
+        got: std::result::Result<crate::rename::How, crate::rename::Failure>,
+    ) -> Action {
+        let ours = self.dir == dir && self.rename.as_ref().is_some_and(|r| &r.name == from);
+        match got {
+            Ok(_) => {
+                if !ours {
+                    return Action::Reread;
+                }
+                self.rename = None;
+                let mut entries = self.listing.entries().to_vec();
+                if let Some(e) = entries.iter_mut().find(|e| &e.name == from) {
+                    e.name = to.clone();
+                }
+                self.listing.set_entries(entries);
+                if let Some(n) = self.counts.remove(from) {
+                    self.counts.insert(to.clone(), n);
+                }
+                self.listing.select_only(to.clone());
+                self.select_on_land = Some(to.clone());
+                *self.reveal.borrow_mut() = Some(to.clone());
+                Action::Reread
+            }
+            Err(f) => {
+                if !ours {
+                    return Action::None;
+                }
+                let text = self.rename_failure_text(to, &f);
+                if let Some(r) = self.rename.as_mut() {
+                    r.busy = false;
+                    r.error = Some(text);
+                }
+                Action::RenameUi
+            }
+        }
+    }
+
+    /// The inline reason a rename didn't happen.
+    pub fn rename_failure_text(&self, to: &OsString, f: &crate::rename::Failure) -> String {
+        use crate::rename::Failure;
+        let name = to.to_string_lossy();
+        match f {
+            Failure::Taken { dir } => crate::rename::taken_text(&name, *dir),
+            Failure::Invalid => "That name can't be used".into(),
+            Failure::Gone => "It is no longer here".into(),
+            Failure::Refused(_) => match crate::devices::device_of(&self.devices, &self.dir) {
+                Some(d) if d.media() => format!("{} doesn't allow renaming here", d.name()),
+                Some(d) if d.read_only => format!("{} is read-only", d.name()),
+                _ if crate::devices::gvfs_media_root(&self.dir).is_some() => {
+                    "The phone doesn't allow renaming here".into()
+                }
+                _ => "You don't have permission to rename it".into(),
+            },
+            Failure::Io(e) => format!("Couldn't rename: {}", std::io::Error::from(*e)),
+        }
+    }
+
+    /// The Properties dialog for the selection.
+    pub fn properties(&self) -> Props {
+        let names = self.names();
+        let home = self.env.home.as_deref();
+        let offset = |t| {
+            self.clock
+                .map_or_else(|| crate::model::local_offset(t), |c| c.1)
+        };
+        let entries: Vec<&crate::model::Entry> =
+            names.iter().filter_map(|n| self.entry(n)).collect();
+        let location = ("Location".to_string(), tilde(&self.dir, home));
+        if let [e] = entries.as_slice() {
+            let ext = e.extension();
+            let kind = if e.is_symlink {
+                "Link".to_string()
+            } else if e.is_dir {
+                "Folder".to_string()
+            } else {
+                kind_name(&ext)
+            };
+            let size = if e.is_dir {
+                match self.counts.get(&e.name) {
+                    Some(n) => format!("{} item{}", group(*n), if *n == 1 { "" } else { "s" }),
+                    None => "—".into(),
+                }
+            } else {
+                format!("{} ({} bytes)", human(e.len), group(e.len as usize))
+            };
+            return Props {
+                title: e.name.to_string_lossy().into_owned(),
+                glyph: file_icon(e.is_dir, &ext).0.into(),
+                facts: vec![
+                    ("Kind".into(), kind),
+                    ("Size".into(), size),
+                    location,
+                    (
+                        "Modified".into(),
+                        crate::model::format_date(secs(e.mtime), offset),
+                    ),
+                    ("Permissions".into(), mode_text(e.mode)),
+                ],
+            };
+        }
+        let folders = entries.iter().filter(|e| e.is_dir).count();
+        let files = entries.len() - folders;
+        let bytes: u64 = entries.iter().filter(|e| !e.is_dir).map(|e| e.len).sum();
+        let plural = |n: usize, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+        let kind = match (files, folders) {
+            (_, 0) => plural(files, "file"),
+            (0, _) => plural(folders, "folder"),
+            _ => format!("{}, {}", plural(files, "file"), plural(folders, "folder")),
+        };
+        let newest = entries.iter().map(|e| secs(e.mtime)).max().unwrap_or(0);
+        let modes: std::collections::BTreeSet<String> =
+            entries.iter().map(|e| mode_text(e.mode)).collect();
+        Props {
+            title: ops::count(entries.len()),
+            glyph: "󰈔".into(),
+            facts: vec![
+                ("Kind".into(), kind),
+                (
+                    "Size".into(),
+                    if folders > 0 {
+                        format!("{} in files; folders not counted", human(bytes))
+                    } else {
+                        human(bytes)
+                    },
+                ),
+                location,
+                (
+                    "Modified".into(),
+                    format!("newest {}", crate::model::format_date(newest, offset)),
+                ),
+                (
+                    "Permissions".into(),
+                    if modes.len() == 1 {
+                        modes.into_iter().next().unwrap_or_default()
+                    } else {
+                        "Mixed".into()
+                    },
+                ),
+            ],
+        }
+    }
+}
+
+/// The list or grid scroll offset (`viewport-y`, 0 or negative) that
+/// shows an item whose top is `top` and height `h` in a view `view_h`
+/// tall, moving as little as possible.
+pub fn scroll_to_show(scroll: f32, view_h: f32, top: f32, h: f32) -> f32 {
+    let shown_top = -scroll;
+    if top < shown_top {
+        -top
+    } else if top + h > shown_top + view_h && view_h > 0.0 {
+        -(top + h - view_h)
+    } else {
+        scroll
+    }
+}
+
 /// The move-refused dialog's contents for every refused item. One item
 /// reads as before; several get a "Can't move N items" title with each
 /// item's reason as a heading over its blocking paths.
@@ -2228,6 +2794,9 @@ struct State {
     /// (or reads from) the drive.
     running: Option<Job>,
     dev: Devices,
+    /// The item whose name the rename field was last filled with, so
+    /// a redraw doesn't overwrite what is being typed.
+    rename_shown: RefCell<Option<OsString>>,
 }
 
 /// Removable drives as the window knows them (DESIGN §2 DEVICES).
@@ -3628,9 +4197,7 @@ fn open_device_menu(ui: &AppWindow, st: &Shared, index: usize, x: f32, y: f32) {
         glyph: glyph.into(),
         label: label.into(),
         shortcut: SharedString::new(),
-        danger: false,
-        sub: false,
-        sep: false,
+        ..crate::MenuItem::default()
     };
     let sep = crate::MenuItem {
         sep: true,
@@ -4065,6 +4632,7 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
             backend: launch.devices,
             ..Default::default()
         },
+        rename_shown: RefCell::new(None),
     }));
     {
         let mut s = state.borrow_mut();
@@ -4079,11 +4647,30 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         // Inbound drops from other apps. winit reports one DroppedFile per
         // path (X11 only in winit 0.30) and no pointer position, so they
         // land in the open folder.
-        use slint::winit_030::{winit::event::WindowEvent, EventResult, WinitWindowAccessor};
+        use slint::winit_030::{
+            winit::event::{ElementState, MouseButton, WindowEvent},
+            EventResult, WinitWindowAccessor,
+        };
+        // The mouse's side buttons (X11 buttons 8 and 9) step through
+        // the folder history like the toolbar's back and forward.
+        let (side_ui, side_st) = (ui.as_weak(), state.clone());
         let dropped = state.borrow().dropped.clone();
         let dest = state.borrow().drop_dest.clone();
         ui.window()
             .on_winit_window_event(move |_, event| match event {
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: button @ (MouseButton::Back | MouseButton::Forward),
+                    ..
+                } => {
+                    let forward = *button == MouseButton::Forward;
+                    if let (Some(ui), Ok(mut s)) = (side_ui.upgrade(), side_st.try_borrow_mut()) {
+                        let action = s.ctl.side_button(forward);
+                        drop(s);
+                        apply(&ui, &side_st, action);
+                    }
+                    EventResult::PreventDefault
+                }
                 WindowEvent::DroppedFile(path) => {
                     // Freeze the destination now: a navigation before the
                     // batch is flushed must not redirect it. During one,
@@ -4267,8 +4854,8 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
             apply(&ui, &st_ve, action);
         }
     });
-    ui.on_key(move |text, ctrl, shift, _alt| {
-        let action = st.borrow_mut().ctl.key(&text, ctrl, shift);
+    ui.on_key(move |text, ctrl, shift, alt| {
+        let action = st.borrow_mut().ctl.key_mods(&text, ctrl, shift, alt);
         let handled = action != Action::None;
         if let Some(ui) = w.upgrade() {
             apply(&ui, &st, action);
@@ -4278,6 +4865,11 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     let w = ui.as_weak();
     let st = state.clone();
     ui.on_tile_pointer(move |first, col, kind, dx, dy, far, ctrl, shift| {
+        if kind == 0 {
+            if let Some(ui) = w.upgrade() {
+                blur_rename(&ui, &st);
+            }
+        }
         let action = {
             let mut s = st.borrow_mut();
             let columns = s.ctl.columns.get();
@@ -4293,6 +4885,11 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     let w = ui.as_weak();
     let st = state.clone();
     ui.on_row_pointer(move |index, kind, dy, far, ctrl, shift| {
+        if kind == 0 {
+            if let Some(ui) = w.upgrade() {
+                blur_rename(&ui, &st);
+            }
+        }
         let action =
             st.borrow_mut()
                 .ctl
@@ -4444,6 +5041,64 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         st2.borrow_mut().ctl.device_menu = None;
         if let Some(ui) = w2.upgrade() {
             redraw(&ui, &st2.borrow());
+        }
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_row_menu(move |index, x, y| {
+        let Some(ui) = w2.upgrade() else { return };
+        blur_rename(&ui, &st2);
+        let action = st2
+            .borrow_mut()
+            .ctl
+            .open_file_menu(index.max(0) as usize, x, y);
+        apply(&ui, &st2, action);
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_file_menu_pick(move |line| {
+        let Some(ui) = w2.upgrade() else { return };
+        let action = st2.borrow_mut().ctl.file_menu_pick(line.max(0) as usize);
+        if action != Action::None {
+            redraw(&ui, &st2.borrow());
+        }
+        apply(&ui, &st2, action);
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_file_menu_dismiss(move || {
+        let action = st2.borrow_mut().ctl.close_file_menu();
+        if let Some(ui) = w2.upgrade() {
+            apply(&ui, &st2, action);
+        }
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_rename_edited(move |text| {
+        let action = st2.borrow_mut().ctl.rename_edited(&text);
+        if let Some(ui) = w2.upgrade() {
+            apply(&ui, &st2, action);
+        }
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_rename_commit(move || {
+        // The field's own text, in case an edit hasn't been reported.
+        let Some(ui) = w2.upgrade() else { return };
+        let text = ui.get_rename_text();
+        let action = {
+            let mut s = st2.borrow_mut();
+            s.ctl.rename_edited(&text);
+            s.ctl.rename_commit()
+        };
+        apply(&ui, &st2, action);
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_rename_cancel(move || {
+        let action = st2.borrow_mut().ctl.rename_cancel();
+        if let Some(ui) = w2.upgrade() {
+            apply(&ui, &st2, action);
+        }
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_rename_blur(move || {
+        if let Some(ui) = w2.upgrade() {
+            blur_rename(&ui, &st2);
         }
     });
     let (w2, st2) = (ui.as_weak(), state.clone());
@@ -6480,11 +7135,145 @@ fn redraw(ui: &AppWindow, s: &State) {
                 }
                 Dialog::Refused { .. } => {}
                 Dialog::Conflict { ask, apply_all } => conflict_props(ui, ask, *apply_all),
+                Dialog::Properties(p) => {
+                    ui.set_props_title(p.title.as_str().into());
+                    ui.set_props_glyph(p.glyph.as_str().into());
+                    let facts: Vec<crate::Fact> = p
+                        .facts
+                        .iter()
+                        .map(|(k, v)| crate::Fact {
+                            key: k.as_str().into(),
+                            value: v.as_str().into(),
+                        })
+                        .collect();
+                    ui.set_props_facts(ModelRc::new(Rc::new(VecModel::from(facts))));
+                }
             }
+        }
+        None if ctl.file_menu.is_some() => {
+            if let Some(m) = &ctl.file_menu {
+                ui.set_file_menu_items(ModelRc::new(Rc::new(VecModel::from(m.items.clone()))));
+                ui.set_menu_at_x(m.at.0);
+                ui.set_menu_at_y(m.at.1);
+            }
+            ui.set_overlay("menu-file".into());
         }
         None if ctl.device_menu.is_some() => ui.set_overlay("menu-device".into()),
         None if ctl.searching => ui.set_overlay("search".into()),
         None => ui.set_overlay(SharedString::new()),
+    }
+    sync_rename(ui, s);
+    reveal(ui, s);
+}
+
+/// The inline rename field's row, text, pre-selection, reason and
+/// state. The text is set only when a new edit starts, so a redraw
+/// never fights the typing.
+fn sync_rename(ui: &AppWindow, s: &State) {
+    let ctl = &s.ctl;
+    let Some(r) = &ctl.rename else {
+        ui.set_rename_at(-1);
+        if s.rename_shown.borrow_mut().take().is_some() {
+            ui.invoke_focus_keys();
+        }
+        return;
+    };
+    let at = ctl
+        .listing
+        .view()
+        .iter()
+        .position(|e| e.name == r.name)
+        .map_or(-1, |i| i as i32);
+    if s.rename_shown.borrow().as_ref() != Some(&r.name) {
+        ui.set_rename_text(r.text.as_str().into());
+        ui.set_rename_stem(ctl.rename_stem() as i32);
+        *s.rename_shown.borrow_mut() = Some(r.name.clone());
+    }
+    ui.set_rename_error(r.error.clone().unwrap_or_default().into());
+    ui.set_rename_busy(r.busy);
+    ui.set_rename_at(at);
+}
+
+/// Scroll the list or grid just enough to show `ctl.reveal` (an item
+/// being renamed, or just renamed).
+fn reveal(ui: &AppWindow, s: &State) {
+    let Some(name) = s.ctl.reveal.borrow_mut().take() else {
+        return;
+    };
+    let ctl = &s.ctl;
+    let Some(i) = ctl.listing.view().iter().position(|e| e.name == name) else {
+        return;
+    };
+    if ctl.grid {
+        let columns = ctl.columns.get().max(1);
+        let line_h = ctl.tile() + 60.0;
+        let top = (i / columns) as f32 * line_h;
+        let to = scroll_to_show(ui.get_grid_scroll(), ui.get_grid_view_h(), top, line_h);
+        ui.set_grid_scroll(to);
+    } else {
+        let row_h = if ctl.compact { 24.0 } else { 30.0 };
+        let to = scroll_to_show(
+            ui.get_list_scroll(),
+            ui.get_list_view_h(),
+            i as f32 * row_h,
+            row_h,
+        );
+        ui.set_list_scroll(to);
+    }
+}
+
+thread_local! {
+    /// Set by the render harness: renames fail as a phone folder that
+    /// refuses them would (EOPNOTSUPP), without touching the file.
+    static REFUSE_RENAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// For the render harness: make renames refuse, as some MTP folders do.
+pub fn refuse_renames(on: bool) {
+    REFUSE_RENAMES.with(|r| r.set(on));
+}
+
+/// Rename on a worker: a phone answers each call over USB, so the field
+/// waits (dimmed) instead of the window freezing.
+fn rename_async(ui: &AppWindow, st: &Shared, dir: PathBuf, from: OsString, to: OsString) {
+    redraw(ui, &st.borrow());
+    let (d, f, t) = (dir.clone(), from.clone(), to.clone());
+    let refuse = REFUSE_RENAMES.with(|r| r.get());
+    run_device(
+        ui,
+        st,
+        move || {
+            if refuse {
+                return Err(crate::rename::Failure::Refused(
+                    rustix::io::Errno::OPNOTSUPP,
+                ));
+            }
+            crate::rename::rename(&d, &f, &t)
+        },
+        move |ui, st, got| {
+            let action = st.borrow_mut().ctl.rename_landed(&dir, &from, &to, got);
+            redraw(ui, &st.borrow());
+            apply(ui, st, action);
+        },
+    );
+}
+
+/// A click away from the rename field: save a valid new name, drop
+/// anything else.
+fn blur_rename(ui: &AppWindow, st: &Shared) {
+    let action = match st.try_borrow_mut() {
+        Ok(mut s) if s.ctl.rename.is_some() => s.ctl.rename_blur(),
+        _ => return,
+    };
+    apply(ui, st, action);
+}
+
+/// The toast after Copy path.
+pub fn copied_paths_text(n: usize) -> String {
+    if n == 1 {
+        "Copied the path".into()
+    } else {
+        format!("Copied {n} paths")
     }
 }
 
@@ -6565,6 +7354,25 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
             start_read(ticket);
         }
         Action::MakeFolder(dir) => make_folder_async(ui, st, dir),
+        Action::Rename { dir, from, to } => rename_async(ui, st, dir, from, to),
+        Action::RenameUi => sync_rename(ui, &st.borrow()),
+        Action::CopyPaths(paths) => {
+            let text = paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            launch(ui, st, vec!["wl-copy".into(), "--".into(), text.into()]);
+            show_toast(
+                ui,
+                st,
+                "",
+                copied_paths_text(paths.len()),
+                Vec::new(),
+                false,
+                "",
+            );
+        }
         Action::Answer(choice) => {
             if let Some(tx) = st.borrow_mut().reply.take() {
                 let _ = tx.send(choice);
@@ -10275,5 +11083,356 @@ mod tests {
         go(&mut c, pics);
         assert_eq!(c.new_folder(), Action::Redraw);
         let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+    fn view_index(c: &Controller, name: &str) -> usize {
+        c.listing
+            .view()
+            .iter()
+            .position(|e| e.name == name)
+            .unwrap()
+    }
+
+    fn menu_line(c: &Controller, act: crate::menus::FileAct) -> (usize, crate::MenuItem) {
+        let m = c.file_menu.as_ref().unwrap();
+        let i = m.acts.iter().position(|a| *a == Some(act)).unwrap();
+        (i, m.items[i].clone())
+    }
+
+    #[test]
+    fn a_right_click_selects_an_unselected_item_first() {
+        let mut c = setup("menu-select");
+        select(&mut c, "a.jpg");
+        let b = view_index(&c, "b.jpg");
+        assert_eq!(c.open_file_menu(b, 300.0, 200.0), Action::Redraw);
+        assert_eq!(c.names(), ["b.jpg"]);
+        let m = c.file_menu.as_ref().unwrap();
+        assert_eq!((m.at, m.target.to_str()), ((300.0, 200.0), Some("b.jpg")));
+        // On an item already in a multi-selection, the selection stays.
+        c.close_file_menu();
+        c.listing.select_only("a.jpg".into());
+        c.listing.toggle("b.jpg".into());
+        c.open_file_menu(b, 10.0, 10.0);
+        assert_eq!(c.names().len(), 2);
+        let (_, rename) = menu_line(&c, crate::menus::FileAct::Rename);
+        assert!(rename.off);
+        assert_eq!(rename.tip, "Select one item to rename");
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn a_greyed_line_does_nothing_and_esc_closes_the_menu() {
+        let mut c = setup("menu-grey");
+        c.listing.select_only("a.jpg".into());
+        c.listing.toggle("b.jpg".into());
+        c.open_file_menu(view_index(&c, "a.jpg"), 0.0, 0.0);
+        let (rename, _) = menu_line(&c, crate::menus::FileAct::Rename);
+        assert_eq!(c.file_menu_pick(rename), Action::None);
+        assert!(c.file_menu.is_some(), "stays open to read the tooltip");
+        assert_eq!(c.key(keys::DELETE, false, false), Action::None, "keys wait");
+        assert_eq!(c.key(keys::ESCAPE, false, false), Action::Redraw);
+        assert!(c.file_menu.is_none());
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn menu_lines_do_what_their_shortcuts_do() {
+        use crate::menus::FileAct;
+        let mut c = setup("menu-acts");
+        let a = view_index(&c, "a.jpg");
+        c.open_file_menu(a, 0.0, 0.0);
+        let (paste, item) = menu_line(&c, FileAct::Paste);
+        assert!(item.off, "nothing to paste yet");
+        let (copy, _) = menu_line(&c, FileAct::Copy);
+        assert_eq!(c.file_menu_pick(copy), Action::Redraw);
+        assert!(c.clip.clip().is_some());
+        c.open_file_menu(a, 0.0, 0.0);
+        assert!(!menu_line(&c, FileAct::Paste).1.off);
+        assert!(matches!(c.file_menu_pick(paste), Action::Run(_)));
+        c.open_file_menu(a, 0.0, 0.0);
+        let (path, _) = menu_line(&c, FileAct::CopyPath);
+        assert_eq!(
+            c.file_menu_pick(path),
+            Action::CopyPaths(vec![c.dir.join("a.jpg")])
+        );
+        c.open_file_menu(a, 0.0, 0.0);
+        let (with, _) = menu_line(&c, FileAct::OpenWith);
+        assert_eq!(
+            c.file_menu_pick(with),
+            Action::Launch(vec!["xdg-open".into(), c.dir.join("a.jpg").into()])
+        );
+        c.open_file_menu(view_index(&c, "raw-exports"), 0.0, 0.0);
+        assert!(
+            menu_line(&c, FileAct::OpenWith).1.off,
+            "folders open in Robin"
+        );
+        let (open, _) = menu_line(&c, FileAct::Open);
+        assert_eq!(
+            c.file_menu_pick(open),
+            Action::Navigate(c.dir.join("raw-exports"))
+        );
+        c.open_file_menu(a, 0.0, 0.0);
+        let (props, _) = menu_line(&c, FileAct::Properties);
+        assert!(matches!(
+            c.file_menu_pick(props),
+            Action::Open(Dialog::Properties(_))
+        ));
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    /// Run a committed rename the way the window does, on this thread.
+    fn finish_rename(c: &mut Controller, action: Action) -> Action {
+        let Action::Rename { dir, from, to } = action else {
+            panic!("not a rename: {action:?}");
+        };
+        let got = crate::rename::rename(&dir, &from, &to);
+        c.rename_landed(&dir, &from, &to, got)
+    }
+
+    #[test]
+    fn f2_edits_the_name_in_place_with_the_extension_left_out() {
+        let mut c = setup("rename-f2");
+        select(&mut c, "a.jpg");
+        assert_eq!(c.key(keys::F2, false, false), Action::Redraw);
+        let r = c.rename.clone().unwrap();
+        assert_eq!((r.text.as_str(), c.rename_stem()), ("a.jpg", 1));
+        assert_eq!(c.rename_edited("c.jpg"), Action::RenameUi);
+        assert_eq!(c.rename.as_ref().unwrap().error, None);
+        let action = c.rename_commit();
+        assert!(c.rename.as_ref().unwrap().busy);
+        assert_eq!(c.rename_cancel(), Action::None, "Esc waits for the worker");
+        assert_eq!(finish_rename(&mut c, action), Action::Reread);
+        assert!(c.rename.is_none());
+        assert!(c.dir.join("c.jpg").exists() && !c.dir.join("a.jpg").exists());
+        assert_eq!(c.names(), ["c.jpg"], "kept selected under its new name");
+        assert_eq!(
+            c.reveal.borrow().as_deref(),
+            Some(std::ffi::OsStr::new("c.jpg"))
+        );
+        // The reread lands and keeps it selected.
+        c.refresh().unwrap();
+        assert_eq!(c.names(), ["c.jpg"]);
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn clashes_and_bad_names_show_under_the_field_and_change_nothing() {
+        let mut c = setup("rename-bad");
+        select(&mut c, "a.jpg");
+        c.begin_rename();
+        for (typed, why) in [
+            ("b.jpg", "A file named b.jpg already exists"),
+            ("raw-exports", "A folder named raw-exports already exists"),
+            ("", "Enter a name"),
+            (".", "\".\" and \"..\" can't be used as names"),
+            ("..", "\".\" and \"..\" can't be used as names"),
+            ("x/y", "Names can't contain \"/\""),
+            ("x\0y", "Names can't contain a null character"),
+        ] {
+            c.rename_edited(typed);
+            assert_eq!(
+                c.rename.as_ref().unwrap().error.as_deref(),
+                Some(why),
+                "{typed:?}"
+            );
+            assert_eq!(c.rename_commit(), Action::RenameUi, "Enter keeps the field");
+            assert!(!c.rename.as_ref().unwrap().busy);
+        }
+        // A click away with a bad name drops the edit, as Esc would.
+        assert_eq!(c.rename_blur(), Action::Redraw);
+        assert!(c.rename.is_none());
+        let mut names: Vec<_> = fs::read_dir(&c.dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.jpg", "b.jpg", "raw-exports"]);
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn esc_cancels_and_a_click_away_saves_a_good_name() {
+        let mut c = setup("rename-blur");
+        select(&mut c, "a.jpg");
+        c.begin_rename();
+        c.rename_edited("zz.jpg");
+        assert_eq!(c.key(keys::ESCAPE, false, false), Action::Redraw);
+        assert!(c.rename.is_none() && c.dir.join("a.jpg").exists());
+        c.begin_rename();
+        c.rename_edited("zz.jpg");
+        let action = c.rename_blur();
+        assert_eq!(finish_rename(&mut c, action), Action::Reread);
+        assert!(c.dir.join("zz.jpg").exists());
+        // Unchanged: Enter just closes the field.
+        c.begin_rename();
+        assert_eq!(c.rename_commit(), Action::Redraw);
+        assert!(c.rename.is_none());
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn a_name_taken_after_the_check_is_reported_inline_and_nothing_is_replaced() {
+        let mut c = setup("rename-race");
+        select(&mut c, "a.jpg");
+        c.begin_rename();
+        c.rename_edited("late.jpg");
+        assert_eq!(c.rename.as_ref().unwrap().error, None);
+        let action = c.rename_commit();
+        // Another program makes late.jpg before the worker runs.
+        fs::write(c.dir.join("late.jpg"), b"theirs").unwrap();
+        assert_eq!(finish_rename(&mut c, action), Action::RenameUi);
+        let r = c.rename.clone().unwrap();
+        assert!(!r.busy);
+        assert_eq!(
+            r.error.as_deref(),
+            Some("A file named late.jpg already exists")
+        );
+        assert_eq!(fs::read(c.dir.join("late.jpg")).unwrap(), b"theirs");
+        assert_eq!(fs::read(c.dir.join("a.jpg")).unwrap(), b"a");
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn a_case_only_rename_goes_through() {
+        let mut c = setup("rename-case");
+        select(&mut c, "a.jpg");
+        c.begin_rename();
+        c.rename_edited("A.JPG");
+        assert_eq!(c.rename.as_ref().unwrap().error, None);
+        let action = c.rename_commit();
+        assert_eq!(finish_rename(&mut c, action), Action::Reread);
+        assert!(c.dir.join("A.JPG").exists());
+        assert_eq!(c.names(), ["A.JPG"]);
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn a_phone_folder_that_refuses_renames_greys_the_line_and_says_why() {
+        let (mut c, at) = on_phone("phone-rename", None);
+        let dcim = at.join("Internal shared storage/DCIM");
+        let why = "Pixel 8 doesn't allow renaming in DCIM";
+        c.devices[0].no_rename = vec![(dcim.clone(), why.into())];
+        go(&mut c, dcim.clone());
+        c.open_file_menu(view_index(&c, "a.jpg"), 0.0, 0.0);
+        let (line, item) = menu_line(&c, crate::menus::FileAct::Rename);
+        assert!(item.off);
+        assert_eq!(item.tip, why);
+        assert_eq!(c.file_menu_pick(line), Action::None);
+        c.close_file_menu();
+        // F2 has no greyed line to show: it says why in a toast.
+        assert_eq!(c.key(keys::F2, false, false), Action::Refuse(why.into()));
+        assert!(c.rename.is_none());
+        // A folder that refuses only when asked: the reason shows under
+        // the field and the photo keeps its name.
+        c.devices[0].no_rename.clear();
+        c.begin_rename();
+        c.rename_edited("beach.jpg");
+        let Action::Rename { dir, from, to } = c.rename_commit() else {
+            panic!("no rename");
+        };
+        let refused = Err(crate::rename::Failure::Refused(
+            rustix::io::Errno::OPNOTSUPP,
+        ));
+        assert_eq!(c.rename_landed(&dir, &from, &to, refused), Action::RenameUi);
+        assert_eq!(
+            c.rename.as_ref().unwrap().error.as_deref(),
+            Some("Pixel 8 doesn't allow renaming here")
+        );
+        assert!(dcim.join("a.jpg").exists());
+        // The storages themselves can't be renamed.
+        go(&mut c, at.clone());
+        c.listing.select_only("Internal shared storage".into());
+        assert_eq!(
+            c.begin_rename(),
+            Action::Refuse("Pixel 8's storages can't be renamed".into())
+        );
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn a_read_only_drive_greys_every_change() {
+        let mut c = setup("menu-ro");
+        let mount = c.dir.clone();
+        let fake = crate::devices::FakeDevices::new();
+        let mut d = crate::devices::FakeDrive::stick("sdb1", "SANDISK", 1_000, &mount);
+        d.read_only = true;
+        fake.plug(d);
+        crate::devices::DeviceBackend::mount(fake.as_ref(), "sdb1").unwrap();
+        c.devices = crate::devices::DeviceBackend::drives(fake.as_ref()).unwrap();
+        c.devices[0].mount_points = vec![mount];
+        c.open_file_menu(view_index(&c, "a.jpg"), 0.0, 0.0);
+        use crate::menus::FileAct::*;
+        for act in [Cut, Paste, Rename, Remove] {
+            let (_, item) = menu_line(&c, act);
+            assert!(item.off, "{act:?}");
+            assert_eq!(item.tip, "SANDISK is read-only");
+        }
+        assert!(!menu_line(&c, Copy).1.off);
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn alt_arrows_and_the_mouse_side_buttons_walk_the_history() {
+        let mut c = setup("side-buttons");
+        let pics = c.dir.clone();
+        assert_eq!(
+            c.key_mods(keys::LEFT, false, false, true),
+            Action::None,
+            "no history yet"
+        );
+        go(&mut c, pics.join("raw-exports"));
+        assert_eq!(
+            c.key_mods(keys::LEFT, false, false, true),
+            Action::Travel(Step::Back)
+        );
+        assert_eq!(c.side_button(false), Action::Travel(Step::Back));
+        assert_eq!(c.side_button(true), Action::None, "nothing forward");
+        travel(&mut c, Step::Back);
+        assert_eq!(c.dir, pics);
+        assert_eq!(
+            c.key_mods(keys::RIGHT, false, false, true),
+            Action::Travel(Step::Forward)
+        );
+        assert_eq!(c.side_button(true), Action::Travel(Step::Forward));
+        // Plain arrows still move the selection; a dialog or rename eats them.
+        assert_eq!(c.key_mods(keys::RIGHT, false, false, false), Action::None);
+        select(&mut c, "a.jpg");
+        c.begin_rename();
+        assert_eq!(c.side_button(true), Action::None);
+        assert_eq!(c.key_mods(keys::RIGHT, false, false, true), Action::None);
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn properties_list_kind_size_location_modified_and_permissions() {
+        let mut c = setup("props");
+        c.clock = Some((0, 19_800));
+        select(&mut c, "a.jpg");
+        let p = c.properties();
+        assert_eq!(p.title, "a.jpg");
+        let keys: Vec<_> = p.facts.iter().map(|f| f.0.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["Kind", "Size", "Location", "Modified", "Permissions"]
+        );
+        assert_eq!(p.facts[0].1, "JPEG image");
+        assert_eq!(p.facts[1].1, "1 B (1 bytes)");
+        assert_eq!(p.facts[2].1, "~/Pictures");
+        assert!(p.facts[4].1.starts_with("-rw"));
+        c.listing.toggle("raw-exports".into());
+        let p = c.properties();
+        assert_eq!(p.title, "2 items");
+        assert_eq!(p.facts[0].1, "1 file, 1 folder");
+        assert_eq!(p.facts[1].1, "1 B in files; folders not counted");
+        assert_eq!(p.facts[4].1, "Mixed");
+        let _ = fs::remove_dir_all(c.env.home.unwrap());
+    }
+
+    #[test]
+    fn scrolling_to_an_item_moves_as_little_as_possible() {
+        // 300 tall, rows 30: row 2 is in view, row 20 is below, row 1
+        // above a view scrolled to 100.
+        assert_eq!(scroll_to_show(0.0, 300.0, 60.0, 30.0), 0.0);
+        assert_eq!(scroll_to_show(0.0, 300.0, 600.0, 30.0), -330.0);
+        assert_eq!(scroll_to_show(-100.0, 300.0, 30.0, 30.0), -30.0);
     }
 }

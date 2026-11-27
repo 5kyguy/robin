@@ -50,6 +50,9 @@ pub struct Drive {
     /// gives (a fake's scripted refusals; real phones use [`limits`]'s
     /// rules).
     pub no_write: Vec<(PathBuf, String)>,
+    /// Folders on it whose items can't be renamed, each with the reason
+    /// (a fake's scripted refusals, as some MTP folders refuse).
+    pub no_rename: Vec<(PathBuf, String)>,
 }
 
 /// What a device row stands for.
@@ -209,6 +212,11 @@ pub struct Limits {
     /// thumbnails, and copy moves instead of renaming them (MTP may have
     /// no move).
     pub slow: bool,
+    /// What is here can't be renamed: a phone's storages, a folder the
+    /// phone refuses renames in, or anything that takes no writes.
+    pub rename: Option<String>,
+    /// The drive is mounted read-only: nothing here can change.
+    pub read_only: Option<String>,
 }
 
 /// The device `dir` is on (the deepest mount that holds it), if any.
@@ -232,9 +240,19 @@ pub fn limits(drives: &[Drive], dir: &Path) -> Limits {
                 .iter()
                 .find(|(p, _)| p == dir)
                 .map(|(_, why)| why.clone());
+            let no_rename = d
+                .no_rename
+                .iter()
+                .find(|(p, _)| p == dir)
+                .map(|(_, why)| why.clone());
             if !d.media() {
+                let read_only = d.read_only.then(|| format!("{} is read-only", d.name()));
                 return Limits {
+                    rename: no_rename
+                        .or_else(|| scripted.clone())
+                        .or_else(|| read_only.clone()),
                     write: scripted,
+                    read_only,
                     ..Limits::default()
                 };
             }
@@ -242,6 +260,9 @@ pub fn limits(drives: &[Drive], dir: &Path) -> Limits {
             let mut l = media_limits(&d.name(), root);
             if l.write.is_none() {
                 l.write = scripted;
+            }
+            if l.rename.is_none() {
+                l.rename = no_rename.or_else(|| l.write.clone());
             }
             return l;
         }
@@ -264,6 +285,8 @@ fn media_limits(name: &str, root: bool) -> Limits {
         remove: root.then(|| format!("{name}'s storages can't be deleted")),
         no_trash: true,
         slow: true,
+        rename: root.then(|| format!("{name}'s storages can't be renamed")),
+        read_only: None,
     }
 }
 
@@ -704,6 +727,7 @@ pub fn drives_from_managed(objects: &Managed) -> Vec<Drive> {
             kind: Kind::Drive,
             waiting: false,
             no_write: Vec::new(),
+            no_rename: Vec::new(),
         });
     }
     out.sort_by(|a, b| a.device.cmp(&b.device));
@@ -861,6 +885,7 @@ impl FakeDrive {
                 kind: Kind::Drive,
                 waiting: false,
                 no_write: Vec::new(),
+                no_rename: Vec::new(),
             },
             mount_at: mount_at.to_path_buf(),
             mount_error: None,

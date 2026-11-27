@@ -88,6 +88,14 @@ pub fn known(view: &str) -> bool {
             | "move-refused-unreadable"
             | "move-refused-unreadable-two"
             | "menu-file"
+            | "menu-file-edge"
+            | "menu-file-greyed"
+            | "menu-file-phone"
+            | "rename-inline"
+            | "rename-collision"
+            | "rename-invalid"
+            | "rename-grid"
+            | "properties"
             | "menu-bg"
             | "shortcuts-browser"
             | "reduce-motion"
@@ -150,6 +158,7 @@ pub fn paint(view: &str, theme: &Theme, size: (u32, u32), out: &Path) -> Result<
         if view == "device-power-off" {
             crate::render::hover_at(&ui, 209.0, 336.0);
         }
+        file_menu_scene(&ui, view, size);
     }
     crate::render::snapshot(&ui, size, out)
 }
@@ -320,7 +329,6 @@ fn apply_scene(ui: &AppWindow, view: &str) {
         ))));
     }
     match view {
-        "menu-file" => set_menu(ui, crate::menus::file_menu()),
         "menu-bg" => set_menu(ui, crate::menus::background_menu()),
         "shortcuts-browser" | "shortcuts-viewer" => {
             ui.set_key_sections(ModelRc::new(Rc::new(VecModel::from(
@@ -412,7 +420,6 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             | "move-refused-unreadable"
             | "move-refused-unreadable-two"
             | "move-refused-many" => "move-refused",
-            "menu-file" => "menu-file",
             "menu-bg" => "menu-bg",
             "device-menu" => "menu-device",
             "device-unlock" | "device-unlock-wrong" => "unlock",
@@ -1214,6 +1221,114 @@ pub(crate) fn set_cell(
     }
 }
 
+/// The file menu, inline rename and Properties frames. Runs once the
+/// window has its size, so the edge frame can open the menu in the corner.
+fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
+    use crate::menus::{file_menu_for, FileCtx};
+    use slint::Model;
+    let menu = |ctx: FileCtx, at: (f32, f32), tip: Option<&str>| {
+        let lines = file_menu_for(&ctx, false);
+        let tip_line = tip
+            .and_then(|t| lines.iter().position(|l| l.0.label == t))
+            .map_or(-1, |i| i as i32);
+        let items: Vec<_> = lines.into_iter().map(|l| l.0).collect();
+        ui.set_file_menu_items(ModelRc::new(Rc::new(VecModel::from(items))));
+        ui.set_menu_at_x(at.0);
+        ui.set_menu_at_y(at.1);
+        ui.set_menu_tip_line(tip_line);
+        ui.set_overlay("menu-file".into());
+    };
+    let select = |names: &[&str]| {
+        let rows = ui.get_files();
+        for i in 0..rows.row_count() {
+            if let Some(mut r) = rows.row_data(i) {
+                r.selected = names.contains(&r.name.as_str());
+                r.hovered = false;
+                rows.set_row_data(i, r);
+            }
+        }
+    };
+    let index = |name: &str| {
+        let rows = ui.get_files();
+        (0..rows.row_count())
+            .find(|&i| rows.row_data(i).is_some_and(|r| r.name == name))
+            .map_or(-1, |i| i as i32)
+    };
+    let one = FileCtx {
+        count: 1,
+        can_paste: true,
+        ..FileCtx::default()
+    };
+    let photo = "dune-sunset-0412.jpg";
+    match view {
+        "menu-file" => {
+            select(&[photo]);
+            menu(one, (280.0, 150.0), None);
+        }
+        // Opened in the bottom-right corner: it flips up and left.
+        "menu-file-edge" => {
+            select(&["r2-portrait-001.png"]);
+            menu(one, (size.0 as f32 - 24.0, size.1 as f32 - 40.0), None);
+        }
+        "menu-file-greyed" => {
+            select(&[photo, "dune-sunset-0413.jpg"]);
+            let ctx = FileCtx { count: 2, ..one };
+            menu(ctx, (280.0, 150.0), Some("Rename"));
+        }
+        "menu-file-phone" => {
+            select(&[photo]);
+            let ctx = FileCtx {
+                no_trash: true,
+                rename: Some("Pixel 8 doesn't allow renaming in DCIM".into()),
+                ..one
+            };
+            menu(ctx, (280.0, 150.0), Some("Rename"));
+        }
+        "rename-inline" | "rename-collision" | "rename-invalid" | "rename-grid" => {
+            select(&[photo]);
+            ui.set_overlay("".into());
+            if view == "rename-grid" {
+                ui.set_grid(true);
+            }
+            let (text, error) = match view {
+                "rename-collision" | "rename-grid" => (
+                    "dune-sunset-0413.jpg",
+                    crate::rename::Problem::Taken {
+                        name: "dune-sunset-0413.jpg".into(),
+                        dir: false,
+                    }
+                    .text(),
+                ),
+                "rename-invalid" => ("dune/sunset.jpg", crate::rename::Problem::Slash.text()),
+                _ => (photo, String::new()),
+            };
+            ui.set_rename_text(text.into());
+            ui.set_rename_stem(crate::rename::stem_len(text, false) as i32);
+            ui.set_rename_error(error.into());
+            ui.set_rename_at(index(photo));
+        }
+        "properties" => {
+            select(&[photo]);
+            ui.set_props_title(photo.into());
+            ui.set_props_glyph("󰈟".into());
+            let facts = [
+                ("Kind", "JPEG image"),
+                ("Size", "6.2 MB (6 204 811 bytes)"),
+                ("Location", "~/Pictures"),
+                ("Modified", "2026-10-31 15:30"),
+                ("Permissions", "-rw-r--r--"),
+            ]
+            .map(|(k, v)| crate::Fact {
+                key: k.into(),
+                value: v.into(),
+            });
+            ui.set_props_facts(ModelRc::new(Rc::new(VecModel::from(facts.to_vec()))));
+            ui.set_overlay("properties".into());
+        }
+        _ => {}
+    }
+}
+
 fn set_menu(ui: &AppWindow, items: Vec<crate::MenuItem>) {
     ui.set_menu_items(ModelRc::new(Rc::new(VecModel::from(items))));
 }
@@ -1453,6 +1568,7 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
                 danger: false,
                 sub: false,
                 sep,
+                ..crate::MenuItem::default()
             };
             ui.set_device_menu_items(ModelRc::new(Rc::new(VecModel::from(vec![
                 item("󰉋", "Open", false),

@@ -96,6 +96,19 @@ pub fn scripted(view: &str) -> bool {
             | "devices-fat-too-big"
             | "devices-stats"
             | "devices-menu"
+            | "phones-rename-refused"
+            | "phones-rename-refused-reached"
+            | "context-menu"
+            | "context-menu-edge"
+            | "context-menu-multi"
+            | "devices-menu-read-only"
+            | "rename-editing"
+            | "rename-clash"
+            | "rename-invalid"
+            | "rename-grid"
+            | "rename-done"
+            | "properties"
+            | "properties-multi"
     )
 }
 
@@ -108,7 +121,7 @@ fn sandisk(root: &Path, view: &str) -> crate::devices::FakeDrive {
         29_800_000_000,
         &root.join("media/sky/SANDISK"),
     );
-    d.read_only = view == "devices-read-only";
+    d.read_only = matches!(view, "devices-read-only" | "devices-menu-read-only");
     if view == "devices-fat-too-big" {
         d.drive.fs_type = "vfat".into();
     }
@@ -141,6 +154,10 @@ fn pixel(root: &Path, view: &str) -> crate::devices::FakeDrive {
     }
     let data = pixel_mount(root).join("Internal shared storage/Android/data");
     p.drive.no_write = vec![(data, "Pixel 8 doesn't allow changes in Android/data".into())];
+    if view == "phones-rename-refused" {
+        let dcim = pixel_mount(root).join("Internal shared storage/DCIM");
+        p.drive.no_rename = vec![(dcim, "Pixel 8 doesn't allow renaming in DCIM".into())];
+    }
     p
 }
 
@@ -324,6 +341,45 @@ fn phone_scene(
                 ui.get_state_title().to_string(),
                 "Nothing can be added here",
             )?;
+        }
+        // A folder that refuses renames: the menu's Rename is greyed with
+        // the reason in its tooltip.
+        "phones-rename-refused" => {
+            app::go(dcim.clone());
+            app::land_reads();
+            let i = row_index(ui, "PXL_20261118_101204.jpg")?;
+            ui.invoke_row_menu(i, 330.0, 170.0);
+            let line = menu_line(ui, "Rename")?;
+            let item = slint::Model::row_data(&ui.get_file_menu_items(), line as usize)
+                .ok_or_else(|| Error::Message("no Rename line".into()))?;
+            check("rename greyed", item.off.to_string(), "true")?;
+            check(
+                "rename tooltip",
+                item.tip.to_string(),
+                "Pixel 8 doesn't allow renaming in DCIM",
+            )?;
+            ui.set_menu_tip_line(line);
+        }
+        // A folder that refuses only when asked: the phone's answer shows
+        // under the field, and the photo keeps its name.
+        "phones-rename-refused-reached" => {
+            app::go(dcim.clone());
+            app::land_reads();
+            select_row(ui, "PXL_20261118_101204.jpg");
+            ui.invoke_key(app::keys::F2.into(), false, false, false);
+            ui.show().map_err(|e| Error::Message(e.to_string()))?;
+            app::refuse_renames(true);
+            type_field(ui, "beach");
+            type_field(ui, "\n");
+            app::refuse_renames(false);
+            check(
+                "refused inline",
+                ui.get_rename_error().to_string(),
+                "Pixel 8 doesn't allow renaming here",
+            )?;
+            if !dcim.join("PXL_20261118_101204.jpg").exists() {
+                return Err(Error::Message("the photo lost its name".into()));
+            }
         }
         "phones-no-trash" => {
             app::go(dcim.clone());
@@ -523,6 +579,10 @@ fn device_scene(
         app::land_reads();
         Ok(())
     };
+    if view == "devices-menu-read-only" {
+        std::fs::write(stick.join("trip-notes.txt"), b"notes\n")
+            .map_err(|e| Error::Message(e.to_string()))?;
+    }
     mount(ui)?;
     let back_home = |ui: &AppWindow| {
         use slint::Model;
@@ -642,6 +702,12 @@ fn device_scene(
             fake.unmount_elsewhere("sda1");
             app::devices_poll();
             app::land_reads();
+        }
+        // A read-only stick: everything that would change it is greyed.
+        "devices-menu-read-only" => {
+            let i = row_index(ui, "trip-notes.txt")?;
+            ui.invoke_row_menu(i, 330.0, 150.0);
+            ui.set_menu_tip_line(menu_line(ui, "Rename")?);
         }
         "devices-menu" => {
             back_home(ui);
@@ -1071,6 +1137,12 @@ fn paint_in(
             ui.invoke_trash_restore();
             app::land_reads();
         }
+        v if v.starts_with("context-menu")
+            || v.starts_with("rename-")
+            || v.starts_with("properties") =>
+        {
+            file_scene(&ui, v, size)?
+        }
         v if v.starts_with("devices-") => device_scene(&ui, v, root, home, &fake)?,
         v if v.starts_with("phones-") => phone_scene(&ui, v, root, home, &fake)?,
         _ => {}
@@ -1230,6 +1302,144 @@ pub fn snapshot(ui: &AppWindow, size: (u32, u32), out: &Path) -> Result<()> {
     )
     .map_err(|e| Error::Message(format!("write {}: {e}", out.display())))?;
     Ok(())
+}
+
+/// The file menu, inline rename and Properties in Pictures.
+fn file_scene(ui: &AppWindow, view: &str, size: (u32, u32)) -> Result<()> {
+    let check = |what: &str, got: String, want: &str| {
+        if got == want {
+            Ok(())
+        } else {
+            Err(Error::Message(format!("{what}: {got:?}, want {want:?}")))
+        }
+    };
+    let photo = "dune-sunset-0412.jpg";
+    match view {
+        "context-menu" => {
+            let i = row_index(ui, photo)?;
+            ui.invoke_row_menu(i, 330.0, 150.0);
+            check("overlay", ui.get_overlay().to_string(), "menu-file")?;
+        }
+        // Near the bottom-right corner the menu opens up and to the left
+        // of the pointer instead of running off the window.
+        "context-menu-edge" => {
+            let i = row_index(ui, "r2-portrait-001.png")?;
+            let (w, h) = (size.0 as f32, size.1 as f32);
+            ui.invoke_row_menu(i, w - 24.0, h - 40.0);
+        }
+        // Two items: Open with… and Rename are greyed, Rename's tooltip
+        // pinned as a hover would show it.
+        "context-menu-multi" => {
+            select_row(ui, photo);
+            let j = row_index(ui, "dune-sunset-0413.jpg")?;
+            ui.invoke_row_pointer(j, 0, 0, false, true, false);
+            ui.invoke_row_pointer(j, 2, 0, false, true, false);
+            ui.invoke_row_menu(j, 330.0, 150.0);
+            let line = menu_line(ui, "Rename")?;
+            ui.set_menu_tip_line(line);
+        }
+        "rename-editing" | "rename-clash" | "rename-invalid" | "rename-done" => {
+            select_row(ui, photo);
+            ui.invoke_key(app::keys::F2.into(), false, false, false);
+            check("field", ui.get_rename_text().to_string(), photo)?;
+            check("stem", ui.get_rename_stem().to_string(), "16")?;
+            // The field has the keyboard: type over the selected stem.
+            ui.show().map_err(|e| Error::Message(e.to_string()))?;
+            match view {
+                "rename-clash" => {
+                    type_field(ui, "dune-sunset-0413");
+                    check(
+                        "clash",
+                        ui.get_rename_error().to_string(),
+                        "A file named dune-sunset-0413.jpg already exists",
+                    )?;
+                    type_field(ui, "\n");
+                    check(
+                        "still editing",
+                        (ui.get_rename_at() >= 0).to_string(),
+                        "true",
+                    )?;
+                }
+                "rename-invalid" => {
+                    type_field(ui, "dune/sunset");
+                    check(
+                        "invalid",
+                        ui.get_rename_error().to_string(),
+                        "Names can't contain \"/\"",
+                    )?;
+                }
+                "rename-done" => {
+                    type_field(ui, "anchorhead-dusk");
+                    type_field(ui, "\n");
+                    app::land_reads();
+                    check("closed", ui.get_rename_at().to_string(), "-1")?;
+                    use slint::Model;
+                    let picked: Vec<String> = ui
+                        .get_files()
+                        .iter()
+                        .filter(|r| r.selected)
+                        .map(|r| r.name.to_string())
+                        .collect();
+                    check("selected", picked.join(","), "anchorhead-dusk.jpg")?;
+                }
+                _ => {}
+            }
+        }
+        "rename-grid" => {
+            ui.invoke_set_grid(true);
+            select_row(ui, photo);
+            ui.invoke_key(app::keys::F2.into(), false, false, false);
+            ui.show().map_err(|e| Error::Message(e.to_string()))?;
+            type_field(ui, "dune-sunset-0413");
+        }
+        "properties" | "properties-multi" => {
+            select_row(ui, photo);
+            let mut i = row_index(ui, photo)?;
+            if view == "properties-multi" {
+                i = row_index(ui, "raw-exports")?;
+                ui.invoke_row_pointer(i, 0, 0, false, true, false);
+                ui.invoke_row_pointer(i, 2, 0, false, true, false);
+            }
+            ui.invoke_row_menu(i, 330.0, 150.0);
+            ui.invoke_file_menu_pick(menu_line(ui, "Properties")?);
+            check("overlay", ui.get_overlay().to_string(), "properties")?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A list row's index by name.
+fn row_index(ui: &AppWindow, name: &str) -> Result<i32> {
+    use slint::Model;
+    let rows = ui.get_files();
+    (0..rows.row_count())
+        .find(|&i| rows.row_data(i).is_some_and(|r| r.name == name))
+        .map(|i| i as i32)
+        .ok_or_else(|| Error::Message(format!("no row {name}")))
+}
+
+/// The open file menu's line with this label.
+fn menu_line(ui: &AppWindow, label: &str) -> Result<i32> {
+    use slint::Model;
+    let items = ui.get_file_menu_items();
+    (0..items.row_count())
+        .find(|&i| items.row_data(i).is_some_and(|m| m.label == label))
+        .map(|i| i as i32)
+        .ok_or_else(|| Error::Message(format!("no menu line {label}")))
+}
+
+/// Type into whatever has the keyboard (the rename field), as key
+/// presses through the window.
+fn type_field(ui: &AppWindow, text: &str) {
+    use slint::platform::WindowEvent;
+    for ch in text.chars() {
+        let text: slint::SharedString = ch.to_string().into();
+        ui.window()
+            .dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+        ui.window()
+            .dispatch_event(WindowEvent::KeyReleased { text });
+    }
 }
 
 /// Sends each character as a key press, as the window would.

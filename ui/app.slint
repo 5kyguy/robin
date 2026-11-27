@@ -145,6 +145,11 @@ export struct MenuItem {
     danger: bool,
     sub: bool,
     sep: bool,
+    // Greyed out at 0.42 (the location can't do it); `tip` says why.
+    off: bool,
+    tip: string,
+    // The line's top inside the menu's padding, for the tooltip.
+    top: length,
 }
 
 // One shortcut-overlay line: its key caps, then what it does.
@@ -380,6 +385,20 @@ component Tile inherits Rectangle {
     // pressed tile, past the drag threshold, ctrl, shift.
     callback pointer(int, int, int, bool, bool, bool);
     callback open();
+    // A right click, at the pointer in window coordinates.
+    callback menu(length, length);
+    // The inline rename field over the name (DESIGN §4).
+    in property <bool> editing;
+    in-out property <string> edit-text;
+    in property <int> edit-stem;
+    in property <string> edit-error;
+    in property <bool> edit-busy;
+    in property <color> ring;
+    in property <color> field-bg;
+    callback edit-changed(string);
+    callback edit-accept();
+    callback edit-cancel();
+    callback edit-blur();
     property <bool> still: name == "dune-sunset-0412.jpg" || name == "dune-sunset-0413.jpg" || name == "speeder-run.mp4" || name == "cantina-band.heic" || name == "droid-manual.pdf" || name == "lars homestead family portrait final.jpg";
     property <string> label: name == "dune-sunset-0412.jpg" ? "dune-sunset-\n0412.jpg" : name == "dune-sunset-0413.jpg" ? "dune-sunset-\n0413.jpg" : name == "speeder-run.mp4" ? "speeder-\nrun.mp4" : name == "cantina-band.heic" ? "cantina-\nband.heic" : name == "droid-manual.pdf" ? "droid-\nmanual.pdf" : name == "holo-backup.tar.zst" ? "holo-backup.\ntar.zst" : name == "binary-sunset.flac" ? "binary-\nsunset.flac" : name == "lars homestead family portrait final.jpg" ? "lars homestead\nfamily portrait final.jpg" : name;
     width: tile;
@@ -389,7 +408,9 @@ component Tile inherits Rectangle {
     background: picked ? selected-bg : hot || tile-touch.has-hover ? hover-bg : transparent;
     tile-touch := TouchArea {
         pointer-event(e) => {
-            if e.button == PointerEventButton.left || e.kind == PointerEventKind.move {
+            if e.button == PointerEventButton.right && e.kind == PointerEventKind.down {
+                root.menu(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+            } else if e.button == PointerEventButton.left || e.kind == PointerEventKind.move {
                 root.pointer(
                     e.kind == PointerEventKind.down ? 0 : e.kind == PointerEventKind.up ? 2 : 1,
                     floor(self.mouse-x / (tile + 8px)),
@@ -444,7 +465,66 @@ component Tile inherits Rectangle {
             overflow: elide;
             wrap: word-wrap;
             height: 32px;
+            opacity: editing ? 0 : 1;
         }
+    }
+    // Over the name: a one-line field with a 1px ring, `danger` while
+    // the name can't be used, and the reason in a box under it (wrapped).
+    if editing: Rectangle {
+        x: 4px;
+        y: tile - 6px + 4px;
+        width: parent.width - 8px;
+        height: 24px;
+        border-radius: 4px;
+        background: field-bg;
+        border-width: 1px;
+        border-color: edit-error != "" ? danger : ring;
+        opacity: edit-busy ? 0.6 : 1;
+        edit-scope := FocusScope {
+            capture-key-pressed(e) => {
+                if e.text == Key.Escape {
+                    root.edit-cancel();
+                    return accept;
+                }
+                return reject;
+            }
+            tile-input := TextInput {
+                x: 6px;
+                width: parent.width - 12px;
+                height: parent.height;
+                text <=> root.edit-text;
+                font-size: 12px;
+                color: ink;
+                selection-background-color: accent.with-alpha(0.45);
+                selection-foreground-color: ink;
+                vertical-alignment: center;
+                single-line: true;
+                read-only: edit-busy;
+                init => {
+                    self.focus();
+                    self.set-selection-offsets(0, root.edit-stem);
+                }
+                edited => { root.edit-changed(self.text); }
+                accepted => { root.edit-accept(); }
+                changed has-focus => {
+                    if !self.has-focus {
+                        root.edit-blur();
+                    }
+                }
+            }
+        }
+    }
+    if editing && edit-error != "": Rectangle {
+        x: 0px;
+        y: tile - 6px + 4px + 26px;
+        width: parent.width;
+        // Tiles are narrow: the reason wraps instead of being cut.
+        height: max(22px, tile-error.preferred-height + 8px);
+        border-radius: 4px;
+        background: field-bg;
+        border-width: 1px;
+        border-color: danger;
+        tile-error := Text { x: 6px; width: parent.width - 12px; height: parent.height; text: edit-error; font-size: 11px; color: danger; vertical-alignment: center; wrap: word-wrap; }
     }
 }
 
@@ -1052,6 +1132,38 @@ export component AppWindow inherits Window {
     // A grid tile's press/drag: line start, column, kind, dx, dy, far, ctrl, shift.
     callback tile-pointer(int, int, int, int, int, bool, bool, bool);
     callback row-open(int);
+    // The file right-click menu (DESIGN §7): a right click on view row
+    // or tile `index`, at the pointer; a line picked; a click elsewhere.
+    callback row-menu(int, length, length);
+    callback file-menu-pick(int);
+    callback file-menu-dismiss();
+    in property <[MenuItem]> file-menu-items;
+    // Renders pin a greyed line's tooltip; live, it follows the hover.
+    in property <int> menu-tip-line: -1;
+    property <int> menu-hover: -1;
+    // Inline rename (DESIGN §4): the view row being edited (-1 for
+    // none), the field's text, how many bytes of it start selected, the
+    // reason it can't be saved, and whether the worker has it.
+    in property <int> rename-at: -1;
+    in-out property <string> rename-text;
+    in property <int> rename-stem;
+    in property <string> rename-error;
+    in property <bool> rename-busy;
+    callback rename-edited(string);
+    callback rename-commit();
+    callback rename-cancel();
+    callback rename-blur();
+    // The Properties dialog: title, its glyph, and the facts.
+    in property <string> props-title;
+    in property <string> props-glyph;
+    in property <[Fact]> props-facts;
+    // How tall the list and grid show, for keeping an item in view.
+    out property <length> list-view-h;
+    out property <length> grid-view-h;
+    // Give the keys back to the window after an edit.
+    public function focus-keys() {
+        keys.focus();
+    }
     /// A sidebar row: section 0 pinned, 1 devices, 2 trash.
     callback place-open(int, int);
     // DEVICES: a row's eject button, and its right-click menu.
@@ -1552,9 +1664,14 @@ export component AppWindow inherits Window {
                         }
                     }
                     Rectangle { height: 1px; background: divider; }
-                    ListView {
-                        vertical-stretch: 1;
+                    Rectangle {
+                    vertical-stretch: 1;
+                    list-view := ListView {
+                        width: parent.width;
+                        height: parent.height;
                         viewport-y <=> root.list-scroll;
+                        init => { root.list-view-h = self.visible-height; }
+                        changed visible-height => { root.list-view-h = self.visible-height; }
                         for row[i] in files: Rectangle {
                             width: parent.width;
                             height: row-h;
@@ -1570,7 +1687,9 @@ export component AppWindow inherits Window {
                             TouchArea {
                                 mouse-cursor: row.drop-refused ? MouseCursor.not-allowed : MouseCursor.default;
                                 pointer-event(e) => {
-                                    if e.button == PointerEventButton.left || e.kind == PointerEventKind.move {
+                                    if e.button == PointerEventButton.right && e.kind == PointerEventKind.down {
+                                        root.row-menu(i, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                    } else if e.button == PointerEventButton.left || e.kind == PointerEventKind.move {
                                         root.row-pointer(
                                             i,
                                             e.kind == PointerEventKind.down ? 0 : e.kind == PointerEventKind.up ? 2 : 1,
@@ -1593,7 +1712,7 @@ export component AppWindow inherits Window {
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
-                            if marks[i].runs.length > 0: HorizontalLayout {
+                            if marks[i].runs.length > 0 && i != root.rename-at: HorizontalLayout {
                                 x: Columns.name-x;
                                 width: Columns.name-w(parent.width);
                                 height: parent.height;
@@ -1607,7 +1726,51 @@ export component AppWindow inherits Window {
                                 }
                                 Rectangle { horizontal-stretch: 1; }
                             }
-                            if marks[i].runs.length == 0: Text {
+                            if i == root.rename-at: Rectangle {
+                                x: Columns.name-x - 6px;
+                                y: 2px;
+                                width: Columns.name-w(parent.width) + 12px;
+                                height: parent.height - 4px;
+                                border-radius: 4px;
+                                background: root.bg;
+                                border-width: 1px;
+                                border-color: root.rename-error != "" ? danger : accent;
+                                opacity: root.rename-busy ? 0.6 : 1;
+                                FocusScope {
+                                    capture-key-pressed(e) => {
+                                        if e.text == Key.Escape {
+                                            root.rename-cancel();
+                                            return accept;
+                                        }
+                                        return reject;
+                                    }
+                                    TextInput {
+                                        x: 6px;
+                                        width: parent.width - 12px;
+                                        height: parent.height;
+                                        text <=> root.rename-text;
+                                        font-size: 12px;
+                                        color: text;
+                                        selection-background-color: accent.with-alpha(0.45);
+                                        selection-foreground-color: text;
+                                        vertical-alignment: center;
+                                        single-line: true;
+                                        read-only: root.rename-busy;
+                                        init => {
+                                            self.focus();
+                                            self.set-selection-offsets(0, root.rename-stem);
+                                        }
+                                        edited => { root.rename-edited(self.text); }
+                                        accepted => { root.rename-commit(); }
+                                        changed has-focus => {
+                                            if !self.has-focus {
+                                                root.rename-blur();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if marks[i].runs.length == 0 && i != root.rename-at: Text {
                                 text: labels[i] != "" ? labels[i] : row.name;
                                 x: Columns.name-x;
                                 y: 0px;
@@ -1660,11 +1823,29 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                    // The reason a typed name can't be used: a 22px box in
+                    // `danger` under the field, or over it on the last
+                    // rows, drawn above the rows (DESIGN §4).
+                    if root.rename-at >= 0 && root.rename-error != "": Rectangle {
+                        property <length> below: (root.rename-at + 1) * row-h + root.list-scroll;
+                        x: Columns.name-x - 6px;
+                        y: below + 24px <= parent.height ? below : below - row-h - 24px;
+                        width: min(max(Columns.name-w(parent.width) + 12px, list-err.preferred-width + 16px), parent.width - self.x - 8px);
+                        height: 22px;
+                        border-radius: 4px;
+                        background: root.bg;
+                        border-width: 1px;
+                        border-color: danger;
+                        list-err := Text { x: 8px; width: parent.width - 16px; text: root.rename-error; font-size: 11px; color: danger; vertical-alignment: center; overflow: elide; }
+                    }
+                    }
                 }
                 if state == "files" && grid: ListView {
                     opacity: nav-busy ? 0.6 : 1;
                     vertical-stretch: 1;
                     viewport-y <=> root.grid-scroll;
+                    init => { root.grid-view-h = self.visible-height; }
+                    changed visible-height => { root.grid-view-h = self.visible-height; }
                     for line in grid-rows: HorizontalLayout {
                         // Centre the columns so the spare width splits evenly.
                         padding-left: max(16px, (root.content-w - root.grid-columns * root.tile - (root.grid-columns - 1) * 8px) / 2);
@@ -1678,36 +1859,108 @@ export component AppWindow inherits Window {
                             glyph: line.g0; name: line.n0; role: line.r0; badge: line.b0; picked: line.s0; hot: line.h0; faded: line.f0;
                             pointer(kind, dx, dy, far, ctrl, shift) => { root.tile-pointer(line.first, 0, kind, dx, dy, far, ctrl, shift); }
                             open => { root.row-open(line.first + 0); }
+                            menu(x, y) => { root.row-menu(line.first + 0, x, y); }
+                            editing: root.rename-at == line.first + 0;
+                            edit-text <=> root.rename-text;
+                            edit-stem: root.rename-stem;
+                            edit-error: root.rename-error;
+                            edit-busy: root.rename-busy;
+                            ring: root.accent;
+                            field-bg: root.bg;
+                            edit-changed(t) => { root.rename-edited(t); }
+                            edit-accept => { root.rename-commit(); }
+                            edit-cancel => { root.rename-cancel(); }
+                            edit-blur => { root.rename-blur(); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 1: Tile {
                             glyph: line.g1; name: line.n1; role: line.r1; badge: line.b1; picked: line.s1; hot: line.h1; faded: line.f1;
                             pointer(kind, dx, dy, far, ctrl, shift) => { root.tile-pointer(line.first, 1, kind, dx, dy, far, ctrl, shift); }
                             open => { root.row-open(line.first + 1); }
+                            menu(x, y) => { root.row-menu(line.first + 1, x, y); }
+                            editing: root.rename-at == line.first + 1;
+                            edit-text <=> root.rename-text;
+                            edit-stem: root.rename-stem;
+                            edit-error: root.rename-error;
+                            edit-busy: root.rename-busy;
+                            ring: root.accent;
+                            field-bg: root.bg;
+                            edit-changed(t) => { root.rename-edited(t); }
+                            edit-accept => { root.rename-commit(); }
+                            edit-cancel => { root.rename-cancel(); }
+                            edit-blur => { root.rename-blur(); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 2: Tile {
                             glyph: line.g2; name: line.n2; role: line.r2; badge: line.b2; picked: line.s2; hot: line.h2; faded: line.f2;
                             pointer(kind, dx, dy, far, ctrl, shift) => { root.tile-pointer(line.first, 2, kind, dx, dy, far, ctrl, shift); }
                             open => { root.row-open(line.first + 2); }
+                            menu(x, y) => { root.row-menu(line.first + 2, x, y); }
+                            editing: root.rename-at == line.first + 2;
+                            edit-text <=> root.rename-text;
+                            edit-stem: root.rename-stem;
+                            edit-error: root.rename-error;
+                            edit-busy: root.rename-busy;
+                            ring: root.accent;
+                            field-bg: root.bg;
+                            edit-changed(t) => { root.rename-edited(t); }
+                            edit-accept => { root.rename-commit(); }
+                            edit-cancel => { root.rename-cancel(); }
+                            edit-blur => { root.rename-blur(); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 3: Tile {
                             glyph: line.g3; name: line.n3; role: line.r3; badge: line.b3; picked: line.s3; hot: line.h3; faded: line.f3;
                             pointer(kind, dx, dy, far, ctrl, shift) => { root.tile-pointer(line.first, 3, kind, dx, dy, far, ctrl, shift); }
                             open => { root.row-open(line.first + 3); }
+                            menu(x, y) => { root.row-menu(line.first + 3, x, y); }
+                            editing: root.rename-at == line.first + 3;
+                            edit-text <=> root.rename-text;
+                            edit-stem: root.rename-stem;
+                            edit-error: root.rename-error;
+                            edit-busy: root.rename-busy;
+                            ring: root.accent;
+                            field-bg: root.bg;
+                            edit-changed(t) => { root.rename-edited(t); }
+                            edit-accept => { root.rename-commit(); }
+                            edit-cancel => { root.rename-cancel(); }
+                            edit-blur => { root.rename-blur(); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 4: Tile {
                             glyph: line.g4; name: line.n4; role: line.r4; badge: line.b4; picked: line.s4; hot: line.h4; faded: line.f4;
                             pointer(kind, dx, dy, far, ctrl, shift) => { root.tile-pointer(line.first, 4, kind, dx, dy, far, ctrl, shift); }
                             open => { root.row-open(line.first + 4); }
+                            menu(x, y) => { root.row-menu(line.first + 4, x, y); }
+                            editing: root.rename-at == line.first + 4;
+                            edit-text <=> root.rename-text;
+                            edit-stem: root.rename-stem;
+                            edit-error: root.rename-error;
+                            edit-busy: root.rename-busy;
+                            ring: root.accent;
+                            field-bg: root.bg;
+                            edit-changed(t) => { root.rename-edited(t); }
+                            edit-accept => { root.rename-commit(); }
+                            edit-cancel => { root.rename-cancel(); }
+                            edit-blur => { root.rename-blur(); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                         if line.n > 5: Tile {
                             glyph: line.g5; name: line.n5; role: line.r5; badge: line.b5; picked: line.s5; hot: line.h5; faded: line.f5;
                             pointer(kind, dx, dy, far, ctrl, shift) => { root.tile-pointer(line.first, 5, kind, dx, dy, far, ctrl, shift); }
                             open => { root.row-open(line.first + 5); }
+                            menu(x, y) => { root.row-menu(line.first + 5, x, y); }
+                            editing: root.rename-at == line.first + 5;
+                            edit-text <=> root.rename-text;
+                            edit-stem: root.rename-stem;
+                            edit-error: root.rename-error;
+                            edit-busy: root.rename-busy;
+                            ring: root.accent;
+                            field-bg: root.bg;
+                            edit-changed(t) => { root.rename-edited(t); }
+                            edit-accept => { root.rename-commit(); }
+                            edit-cancel => { root.rename-cancel(); }
+                            edit-blur => { root.rename-blur(); }
                             tile: root.tile; ink: root.text; accent: root.accent; danger: root.danger; warning: root.warning; muted: root.muted; surface: root.surface; selected-bg: root.selected; hover-bg: root.hover;
                         }
                     }
@@ -2054,9 +2307,9 @@ export component AppWindow inherits Window {
         }
     }
 
-    if !harness && (overlay == "trash" || overlay == "trash-no" || overlay == "delete" || overlay == "move-refused" || overlay == "menu-file" || overlay == "menu-bg"): Rectangle {
+    if !harness && (overlay == "trash" || overlay == "trash-no" || overlay == "delete" || overlay == "move-refused" || overlay == "menu-bg"): Rectangle {
         // Menus open over the window as it is; dialogs get the scrim.
-        background: overlay == "menu-file" || overlay == "menu-bg" ? transparent : #000000.with-alpha(0.6);
+        background: overlay == "menu-bg" ? transparent : #000000.with-alpha(0.6);
         if overlay == "delete" || overlay == "trash" || overlay == "trash-no": Rectangle {
             // 440 wide, or 16 clear of each window edge when that is less.
             width: min(440px, parent.width - 32px);
@@ -2221,13 +2474,13 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        if overlay == "menu-file" || overlay == "menu-bg": Rectangle {
-            // From the pointer: a file row, or empty space in the list.
+        if overlay == "menu-bg": Rectangle {
+            // From the pointer: empty space in the list (mock only).
             // Kept 8 inside the window: a menu that would run off the right
             // or bottom edge opens up or left of the pointer instead, and
             // one taller than the window scrolls.
-            property <length> at-x: overlay == "menu-file" ? 280px : 620px;
-            property <length> at-y: overlay == "menu-file" ? 150px : 300px;
+            property <length> at-x: 620px;
+            property <length> at-y: 300px;
             width: min(248px, parent.width - 16px);
             height: min(menu-list.preferred-height, parent.height - 16px);
             x: at-x + self.width + 8px <= parent.width ? at-x : max(8px, min(at-x, parent.width - 8px) - self.width);
@@ -2268,6 +2521,140 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+            }
+        }
+    }
+
+    // The file menu (DESIGN §7), at the pointer; a click anywhere else
+    // closes it. Kept 8 inside the window: one that would run off the
+    // right or bottom edge opens left of or above the pointer instead,
+    // and one taller than the window scrolls. Lines the location can't
+    // do sit at 0.42 with no hover, and a tooltip gives the reason.
+    if !harness && overlay == "menu-file": Rectangle {
+        TouchArea {
+            clicked => { root.file-menu-dismiss(); }
+            pointer-event(e) => {
+                if e.button == PointerEventButton.right && e.kind == PointerEventKind.down {
+                    root.file-menu-dismiss();
+                }
+            }
+        }
+        file-menu := Rectangle {
+            width: min(248px, parent.width - 16px);
+            height: min(file-menu-list.preferred-height, parent.height - 16px);
+            x: menu-at-x + self.width + 8px <= parent.width ? menu-at-x : max(8px, min(menu-at-x, parent.width - 8px) - self.width);
+            y: menu-at-y + self.height + 8px <= parent.height ? menu-at-y : max(8px, min(menu-at-y, parent.height - 8px) - self.height);
+            clip: true;
+            background: surface;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #000000.with-alpha(0.35);
+            file-menu-flick := Flickable {
+                viewport-height: file-menu-list.preferred-height;
+                file-menu-list := VerticalLayout {
+                    width: parent.width;
+                    padding: 4px;
+                    spacing: 0px;
+                    for item[i] in file-menu-items: Rectangle {
+                        height: item.sep ? 9px : (compact ? 24px : 28px);
+                        if item.sep: Rectangle { x: 4px; y: 4px; width: parent.width - 8px; height: 1px; background: divider; }
+                        if !item.sep: Rectangle {
+                            border-radius: 6px;
+                            opacity: item.off ? 0.42 : 1;
+                            background: !item.off && file-item-touch.has-hover ? selected : transparent;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 8px;
+                                Text { text: item.glyph; width: 16px; font-size: 14px; color: item.danger ? danger : muted; vertical-alignment: center; horizontal-alignment: center; }
+                                Text { text: item.label; font-size: 12px; color: item.danger ? danger : text; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                if item.shortcut != "": Text { text: item.shortcut; font-size: 11px; color: item.danger ? danger : muted; vertical-alignment: center; }
+                            }
+                            file-item-touch := TouchArea {
+                                mouse-cursor: item.off ? MouseCursor.default : MouseCursor.pointer;
+                                clicked => { root.file-menu-pick(i); }
+                                changed has-hover => {
+                                    if self.has-hover {
+                                        root.menu-hover = i;
+                                    } else if root.menu-hover == i {
+                                        root.menu-hover = -1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        property <int> tip-line: menu-tip-line >= 0 ? menu-tip-line : menu-hover;
+        property <length> line-h: compact ? 24px : 28px;
+        if tip-line >= 0 && tip-line < file-menu-items.length && file-menu-items[tip-line].off: Rectangle {
+            width: min(file-tip-text.preferred-width + 16px, 360px);
+            height: 22px;
+            x: file-menu.x + file-menu.width + 4px + self.width <= parent.width - 8px ? file-menu.x + file-menu.width + 4px : max(8px, file-menu.x - 4px - self.width);
+            y: file-menu.y + 4px + file-menu-items[tip-line].top + file-menu-flick.viewport-y + (line-h - self.height) / 2;
+            border-radius: 4px;
+            background: bg;
+            border-width: 1px;
+            border-color: hairline;
+            file-tip-text := Text { x: 8px; width: parent.width - 16px; text: file-menu-items[tip-line].tip; font-size: 11px; color: text; vertical-alignment: center; overflow: elide; }
+        }
+    }
+
+    // Properties (DESIGN §4): 440 wide or 16 clear of each window edge,
+    // a glyph and the name, key/value lines, [Close].
+    if !harness && overlay == "properties": Rectangle {
+        background: #000000.with-alpha(0.6);
+        TouchArea { }
+        Rectangle {
+            width: min(440px, parent.width - 32px);
+            height: min(20px + 22px + 12px + props-facts.length * 22px + 16px + 32px + 20px, parent.height - 32px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: surface;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: hairline;
+            clip: true;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 22px;
+                    Text { text: props-glyph; width: 20px; font-size: 16px; color: muted; vertical-alignment: center; horizontal-alignment: center; }
+                    Text { text: props-title; font-size: 13px; font-weight: 700; color: text; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
+                }
+                Flickable {
+                    vertical-stretch: 1;
+                    min-height: 0px;
+                    viewport-height: props-list.preferred-height;
+                    props-list := VerticalLayout {
+                        width: parent.width;
+                        spacing: 0px;
+                        for fact in props-facts: Rectangle {
+                            height: 22px;
+                            Text { text: fact.key; x: 0px; width: 96px; height: parent.height; font-size: 12px; color: muted; vertical-alignment: center; }
+                            Text { text: fact.value; x: 104px; width: parent.width - 104px; height: parent.height; font-size: 12px; color: text; vertical-alignment: center; overflow: elide; }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    height: 32px;
+                    Rectangle {
+                        width: 88px;
+                        height: 32px;
+                        border-radius: 6px;
+                        background: accent;
+                        border-width: dialog-focus == 0 ? 2px : 0px;
+                        border-color: text;
+                        Text { text: "Close"; font-size: 12px; color: on-accent; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.dialog-button(0); } }
+                    }
+                }
             }
         }
     }
