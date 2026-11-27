@@ -2855,6 +2855,12 @@ pub struct Unlocking {
     pub busy: bool,
     /// Bumped to select the whole field again after a failure.
     pub select: i32,
+    /// The eye: the field draws what was typed instead of dots. Only how
+    /// the field draws; the text itself never leaves it.
+    pub shown: bool,
+    /// LUKS, rather than BitLocker or TrueCrypt: only LUKS says for sure
+    /// that a refused key was the wrong passphrase.
+    pub luks: bool,
 }
 
 /// The buttons on a device toast, by drive id.
@@ -4044,6 +4050,7 @@ fn open_unlock(ui: &AppWindow, st: &Shared, d: &crate::devices::Drive) {
         s.dev.unlock = Some(Unlocking {
             id: d.id.clone(),
             name: drive_name(d),
+            luks: crate::devices::is_luks(&d.fs_type),
             ..Unlocking::default()
         });
     }
@@ -4138,7 +4145,7 @@ fn unlock_landed(
                 let mut s = st.borrow_mut();
                 if let Some(u) = s.dev.unlock.as_mut().filter(|u| u.id == id) {
                     u.busy = false;
-                    u.error = crate::devices::unlock_error_text(name, &e);
+                    u.error = crate::devices::unlock_error_text(name, &e, u.luks);
                     u.select += 1;
                 }
             }
@@ -4159,6 +4166,14 @@ fn unlock_cancel(ui: &AppWindow, st: &Shared) {
         s.dev.unlock = None;
     }
     ui.invoke_focus_keys();
+    redraw(ui, &st.borrow());
+}
+
+/// The eye in the passphrase field: show what was typed, or mask it again.
+fn unlock_toggle(ui: &AppWindow, st: &Shared) {
+    if let Some(u) = st.borrow_mut().dev.unlock.as_mut() {
+        u.shown = !u.shown;
+    }
     redraw(ui, &st.borrow());
 }
 
@@ -4377,14 +4392,15 @@ fn eject_landed(
             "",
         ),
         // Unmounted, but the encrypted partition stayed open: not safe.
-        Err(EjectError::Lock { part, error }) => show_toast(
+        // UDisks2's reason ("Failed to deactivate device") says nothing
+        // more to act on than this does.
+        Err(EjectError::Lock { part, .. }) => show_toast(
             ui,
             st,
             "danger",
             format!(
-                "Couldn't lock {}: {}",
-                drive_name(&part),
-                crate::devices::lock_error_reason(&error)
+                "Couldn't lock {}. Close anything using it and try again.",
+                drive_name(&part)
             ),
             Vec::new(),
             false,
@@ -5304,6 +5320,12 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     ui.on_unlock_cancel(move || {
         if let Some(ui) = w2.upgrade() {
             unlock_cancel(&ui, &st2);
+        }
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_unlock_toggle(move || {
+        if let Some(ui) = w2.upgrade() {
+            unlock_toggle(&ui, &st2);
         }
     });
     let (w2, st2) = (ui.as_weak(), state.clone());
@@ -7448,6 +7470,7 @@ fn redraw(ui: &AppWindow, s: &State) {
                 ui.set_unlock_error(u.error.as_str().into());
                 ui.set_unlock_busy(u.busy);
                 ui.set_unlock_select(u.select);
+                ui.set_unlock_shown(u.shown);
             }
             ui.set_overlay("unlock-live".into());
         }

@@ -126,6 +126,10 @@ pub fn scripted(view: &str) -> bool {
             | "devices-luks-eject"
             | "devices-luks-eject-unmounted"
             | "devices-luks-lock-failed"
+            | "devices-luks-masked"
+            | "devices-luks-shown"
+            | "devices-luks-unlocked-row"
+            | "devices-luks-truecrypt-wrong"
     )
 }
 
@@ -178,6 +182,9 @@ fn luks_sandisk(root: &Path, view: &str) -> crate::devices::FakeDrive {
         if view == "devices-luks-lock-failed" {
             l.lock_error =
                 Some("Error locking /dev/dm-0 (/dev/sda1): Failed to deactivate device".into());
+        }
+        if view == "devices-luks-truecrypt-wrong" {
+            l.id_type = "crypto_TCRYPT".into();
         }
     }
     d
@@ -240,6 +247,23 @@ fn luks_scene(ui: &AppWindow, view: &str, fake: &crate::devices::FakeDevices) ->
         ui.invoke_place_open(0, at as i32);
         app::land_reads();
     };
+    // A real click on the eye at the field's right edge: the dialog is
+    // min(400, w − 32) × 178, centred; the field 20 in, 74 down, 36 tall.
+    let click_eye = |ui: &AppWindow| {
+        use slint::platform::{PointerEventButton, WindowEvent};
+        let win = ui.window();
+        let size = win.size().to_logical(win.scale_factor());
+        let w = (size.width - 32.0).min(400.0);
+        let x = (size.width - w) / 2.0 + w - 20.0 - 16.0;
+        let y = ((size.height - 178.0) / 2.0).max(0.0) + 74.0 + 18.0;
+        let position = slint::LogicalPosition::new(x, y);
+        let button = PointerEventButton::Left;
+        win.dispatch_event(WindowEvent::PointerMoved { position });
+        win.dispatch_event(WindowEvent::PointerPressed { position, button });
+        win.dispatch_event(WindowEvent::PointerReleased { position, button });
+        app::land_reads();
+    };
+    let shown = || app::unlocking().is_some_and(|u| u.shown);
     match view {
         // The locked row: lock glyph, muted, no bar.
         "devices-luks-locked" => {
@@ -314,8 +338,8 @@ fn luks_scene(ui: &AppWindow, view: &str, fake: &crate::devices::FakeDevices) ->
                 return fail(format!("toast {:?}", ui.get_toast_text()));
             }
             let row = device_place(ui, "SANDISK")?;
-            if !(row.selected && !row.dim && row.glyph == "󰕓") {
-                return fail("the unlocked drive isn't open on a USB row".into());
+            if !(row.selected && !row.dim && row.glyph == crate::devices::UNLOCKED_GLYPH) {
+                return fail("the unlocked drive isn't open on an open-lock row".into());
             }
             clean(fake)?;
         }
@@ -338,7 +362,7 @@ fn luks_scene(ui: &AppWindow, view: &str, fake: &crate::devices::FakeDevices) ->
                 {
                     return fail(format!("toast {toast:?}, rows {:?}", device_names(ui)));
                 }
-            } else if toast != "Couldn't lock SANDISK: Failed to deactivate device" {
+            } else if toast != "Couldn't lock SANDISK. Close anything using it and try again." {
                 return fail(format!("toast {toast:?}"));
             }
             clean(fake)?;
@@ -361,6 +385,54 @@ fn luks_scene(ui: &AppWindow, view: &str, fake: &crate::devices::FakeDevices) ->
             if ui.get_toast_text() != "SANDISK can be unplugged" {
                 return fail(format!("toast {:?}", ui.get_toast_text()));
             }
+        }
+        // Typed and masked, the eye offering to show it; or shown, the
+        // eye offering to hide it. The field keeps focus through the
+        // clicks, and neither state puts the text anywhere new.
+        "devices-luks-masked" | "devices-luks-shown" => {
+            open_dialog(ui)?;
+            type_field(ui, "correct");
+            if shown() || ui.get_unlock_shown() {
+                return fail("the field opened shown".into());
+            }
+            if view == "devices-luks-shown" {
+                click_eye(ui);
+                if !(shown() && ui.get_unlock_shown()) {
+                    return fail("the eye didn't show the passphrase".into());
+                }
+                click_eye(ui);
+                if shown() {
+                    return fail("the eye didn't hide it again".into());
+                }
+                click_eye(ui);
+            }
+            type_field(ui, " horse");
+            clean(fake)?;
+            if !log(fake).is_empty() {
+                return fail(format!("calls {:?}", log(fake)));
+            }
+        }
+        // Back in Pictures with SANDISK unlocked: its row has the open lock.
+        "devices-luks-unlocked-row" => {
+            open_dialog(ui)?;
+            submit(ui, LUKS_PASSPHRASE);
+            back_home(ui);
+            let row = device_place(ui, "SANDISK")?;
+            if !(row.glyph == crate::devices::UNLOCKED_GLYPH && !row.selected && !row.dim) {
+                return fail("the unlocked row has no open lock".into());
+            }
+            clean(fake)?;
+        }
+        // TrueCrypt may want options the dialog can't give, so a refused
+        // key reads neutral, not "Wrong passphrase".
+        "devices-luks-truecrypt-wrong" => {
+            open_dialog(ui)?;
+            submit(ui, wrong);
+            let got = ui.get_unlock_error().to_string();
+            if got != "Couldn't unlock SANDISK with this passphrase" {
+                return fail(format!("error {got:?}"));
+            }
+            clean(fake)?;
         }
         _ => return fail("no such scene".into()),
     }

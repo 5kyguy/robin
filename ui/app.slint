@@ -1127,9 +1127,13 @@ export component AppWindow inherits Window {
     in property <bool> unlock-busy: false;
     // Bumped after a failure to select the whole field again.
     in property <int> unlock-select: 0;
+    // The eye in the field: the passphrase drawn as typed, not masked.
+    // Off whenever the dialog opens.
+    in property <bool> unlock-shown: false;
     // [Unlock] or Enter with what is typed; [Cancel] or Esc.
     callback unlock-submit(string);
     callback unlock-cancel();
+    callback unlock-toggle();
     in property <bool> toast-open: false;
     // "Copy 2 items to raw-exports" while a drag is over a folder.
     in property <string> drag-label: "";
@@ -2185,6 +2189,9 @@ export component AppWindow inherits Window {
         property <bool> open: overlay == "skipped-details" || overlay == "toast-details" || toast-open;
         property <color> tone: toast-tone == "warning" ? warning : toast-tone == "danger" ? danger : muted;
         property <length> line-h: 20px;
+        // The headline wraps to at most three lines rather than cutting a
+        // sentence off; one line keeps the 52px toast.
+        property <length> head-h: min(80px, max(52px, toast-line.preferred-height + 28px));
         // Fit the line, 520px to 800px, and never wider than the window.
         // The buttons' room on the right: 96 for one, both side by side
         // (16 apart) for a device toast's pair.
@@ -2196,9 +2203,9 @@ export component AppWindow inherits Window {
         property <length> rows-h: toast-details.length * line-h + (toast-more > 0 ? line-h : 0px);
         // Never taller than the space between the toolbar and the toast's
         // own spot above the status bar; the rest scrolls.
-        property <length> room: max(0px, parent.height - toolbar-h - toast-floor - 32px - 52px - 24px - pin-h);
+        property <length> room: max(0px, parent.height - toolbar-h - toast-floor - 32px - head-h - 24px - pin-h);
         property <length> list-h: min(toast-expanded ? min(240px, rows-h) : rows-h, room);
-        height: open ? 52px + 12px + pin-h + list-h + 12px : 52px;
+        height: open ? head-h + 12px + pin-h + list-h + 12px : head-h;
         x: side-w + (parent.width - side-w - self.width) / 2;
         y: parent.height - toast-floor - 16px - self.height;
         background: surface;
@@ -2221,7 +2228,7 @@ export component AppWindow inherits Window {
             x: 16px;
             y: 0px;
             width: 18px;
-            height: 52px;
+            height: head-h;
             font-size: 14px;
             color: tone;
             vertical-alignment: center;
@@ -2231,9 +2238,10 @@ export component AppWindow inherits Window {
             x: 42px;
             y: 0px;
             width: parent.width - 42px - parent.acts-w - 24px;
-            height: 52px;
+            height: head-h;
             font-size: 13px;
             color: text;
+            wrap: word-wrap;
             overflow: elide;
             vertical-alignment: center;
         }
@@ -2243,7 +2251,7 @@ export component AppWindow inherits Window {
             x: parent.width - 16px - self.preferred-width;
             y: 0px;
             width: self.preferred-width;
-            height: 52px;
+            height: head-h;
             font-size: 12px;
             color: toast-action2-danger ? danger : accent;
             vertical-alignment: center;
@@ -2257,7 +2265,7 @@ export component AppWindow inherits Window {
             x: toast-action2 == "" ? parent.width - 16px - self.width : parent.width - 16px - act2.preferred-width - 16px - self.width;
             y: 0px;
             width: toast-action2 == "" ? 96px : self.preferred-width;
-            height: 52px;
+            height: head-h;
             font-size: 12px;
             color: accent;
             horizontal-alignment: right;
@@ -2269,14 +2277,14 @@ export component AppWindow inherits Window {
         }
         if toast-divider: Rectangle {
             x: 16px;
-            y: 52px;
+            y: head-h;
             width: parent.width - 32px;
             height: 1px;
             background: hairline;
         }
         if open && toast-pin != "": Text {
             x: 42px;
-            y: 52px + 12px;
+            y: head-h + 12px;
             width: parent.width - 58px;
             height: line-h;
             text: toast-pin;
@@ -2287,7 +2295,7 @@ export component AppWindow inherits Window {
         }
         if open: Flickable {
             x: 42px;
-            y: 52px + 12px + pin-h;
+            y: head-h + 12px + pin-h;
             width: parent.width - 58px;
             height: list-h;
             viewport-height: rows-h;
@@ -2741,7 +2749,8 @@ export component AppWindow inherits Window {
                 opacity: unlock-busy ? 0.6 : 1;
                 unlock-keys := FocusScope {
                     x: 10px;
-                    width: parent.width - 20px;
+                    // The eye takes the field's right 32px.
+                    width: parent.width - 10px - 32px;
                     height: parent.height;
                     // A failure selects the whole field for a retype.
                     property <int> select: root.unlock-select;
@@ -2773,7 +2782,11 @@ export component AppWindow inherits Window {
                         // The mock's dots are masked text too, so both
                         // frames draw the same bullets.
                         text: root.unlock-text;
-                        input-type: password;
+                        input-type: root.unlock-shown ? InputType.text : InputType.password;
+                        // Screen readers get the field's name, never what
+                        // is in it, masked or shown.
+                        accessible-label: "Passphrase";
+                        accessible-value: "";
                         font-size: 12px;
                         color: text;
                         selection-background-color: accent.with-alpha(0.45);
@@ -2805,6 +2818,29 @@ export component AppWindow inherits Window {
                         font-size: 12px;
                         color: muted;
                         vertical-alignment: center;
+                    }
+                }
+                // Show / hide: md-eye while masked, md-eye-off while shown.
+                // The click hands focus back to the field.
+                Text {
+                    x: parent.width - 32px;
+                    width: 32px;
+                    height: parent.height;
+                    text: root.unlock-shown ? "󰈉" : "󰈈";
+                    font-size: 15px;
+                    color: unlock-eye.has-hover ? root.text : root.muted;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    accessible-role: button;
+                    accessible-label: root.unlock-shown ? "Hide passphrase" : "Show passphrase";
+                    unlock-eye := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            if live {
+                                root.unlock-toggle();
+                            }
+                            unlock-field.focus();
+                        }
                     }
                 }
             }

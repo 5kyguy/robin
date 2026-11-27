@@ -72,6 +72,15 @@ pub struct Drive {
 /// test: the glyph of a locked row and of the Unlock dialog.
 pub const LOCK_GLYPH: &str = "\u{f033e}";
 
+/// nf-md-lock-open U+F033F: the row of an encrypted partition that is
+/// unlocked, mounted or not.
+pub const UNLOCKED_GLYPH: &str = "\u{f033f}";
+
+/// nf-md-eye U+F0208 and nf-md-eye-off U+F0209: the Unlock field's
+/// show / hide toggle (drawn by ui/app.slint; a test ties the two).
+pub const EYE_GLYPH: &str = "\u{f0208}";
+pub const EYE_OFF_GLYPH: &str = "\u{f0209}";
+
 /// What a device row stands for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
@@ -251,8 +260,15 @@ impl std::fmt::Debug for Passphrase {
 /// in plain words rather than UDisks2's ("Error unlocking /dev/sdb1:
 /// Failed to activate device: …"). It never contains the passphrase:
 /// the error UDisks2 sends doesn't either.
-pub fn unlock_error_text(name: &str, e: &DeviceError) -> String {
+///
+/// Only LUKS (`luks`) gets "Wrong passphrase": a BitLocker or TrueCrypt
+/// volume that refuses the key may want a PIM, a hidden volume or a
+/// keyfile this dialog can't give, so it gets a neutral line instead.
+pub fn unlock_error_text(name: &str, e: &DeviceError, luks: bool) -> String {
     match e {
+        DeviceError::WrongPassphrase if !luks => {
+            format!("Couldn't unlock {name} with this passphrase")
+        }
         DeviceError::WrongPassphrase => "Wrong passphrase. Try again.".into(),
         DeviceError::NotAuthorized(m) if m.to_lowercase().contains("dismissed") => {
             "Authentication was cancelled".into()
@@ -284,24 +300,18 @@ pub fn unlock_error_text(name: &str, e: &DeviceError) -> String {
     }
 }
 
-/// Why a lock on eject failed, for "Couldn't lock SANDISK: …": UDisks2's
-/// message less its "Error locking /dev/dm-0 (/dev/sdb1): " prefix.
-pub fn lock_error_reason(e: &DeviceError) -> String {
-    match e {
-        DeviceError::Failed(m) => plain_reason(m),
-        other => other.to_string(),
-    }
+/// Whether a block's IdType is LUKS (1 or 2), not BitLocker
+/// ("BitLocker") or TrueCrypt / VeraCrypt ("crypto_TCRYPT").
+pub fn is_luks(id_type: &str) -> bool {
+    id_type == "crypto_LUKS"
 }
 
-/// UDisks2's message less its "Error unlocking /dev/sdb1: ", "Error
-/// locking …: " and "Failed to activate device: " prefixes, without a
-/// trailing dot.
+/// UDisks2's message less its "Error unlocking /dev/sdb1: " and
+/// "Failed to activate device: " prefixes, without a trailing dot.
 fn plain_reason(m: &str) -> String {
     let mut r = m.trim();
-    for verb in ["Error unlocking ", "Error locking "] {
-        if let Some(rest) = r.strip_prefix(verb) {
-            r = rest.split_once(": ").map_or(rest, |(_, t)| t);
-        }
+    if let Some(rest) = r.strip_prefix("Error unlocking ") {
+        r = rest.split_once(": ").map_or(rest, |(_, t)| t);
     }
     if let Some(rest) = r.strip_prefix("Failed to activate device: ") {
         r = rest;
@@ -1228,6 +1238,9 @@ pub struct FakeLuks {
     /// Lock refuses with this message.
     pub lock_error: Option<String>,
     pub unlocked: bool,
+    /// The locked block's IdType: "crypto_LUKS", "BitLocker" or
+    /// "crypto_TCRYPT".
+    pub id_type: String,
 }
 
 impl std::fmt::Debug for FakeLuks {
@@ -1239,6 +1252,7 @@ impl std::fmt::Debug for FakeLuks {
             .field("unlock_error", &self.unlock_error)
             .field("lock_error", &self.lock_error)
             .field("unlocked", &self.unlocked)
+            .field("id_type", &self.id_type)
             .finish()
     }
 }
@@ -1288,6 +1302,7 @@ impl FakeDrive {
             unlock_error: None,
             lock_error: None,
             unlocked: false,
+            id_type: "crypto_LUKS".into(),
         });
         d
     }
@@ -1303,7 +1318,7 @@ impl FakeDrive {
             Some(l) if !l.unlocked => Drive {
                 id: l.id.clone(),
                 label: l.label.clone(),
-                fs_type: "crypto_LUKS".into(),
+                fs_type: l.id_type.clone(),
                 mount_points: Vec::new(),
                 read_only: false,
                 locked: true,
@@ -2222,7 +2237,7 @@ mod tests {
         let e = fake.unlock("sdb1", &Passphrase::new(WRONG)).unwrap_err();
         assert_eq!(e, DeviceError::WrongPassphrase);
         assert_eq!(
-            unlock_error_text("SANDISK", &e),
+            unlock_error_text("SANDISK", &e, true),
             "Wrong passphrase. Try again."
         );
         assert!(fake.drives().unwrap()[0].locked);
@@ -2247,7 +2262,7 @@ mod tests {
         fake.plug(d);
         let e = fake.unlock("sdb1", &Passphrase::new(RIGHT)).unwrap_err();
         assert_eq!(
-            unlock_error_text("SANDISK", &e),
+            unlock_error_text("SANDISK", &e, true),
             "Not enough free memory to unlock SANDISK"
         );
         assert!(fake.drives().unwrap()[0].locked, "still locked");
@@ -2256,7 +2271,7 @@ mod tests {
 
     #[test]
     fn udisks_unlock_messages_map_to_plain_words() {
-        let t = |m: &str| unlock_error_text("SANDISK", &DeviceError::Failed(m.into()));
+        let t = |m: &str| unlock_error_text("SANDISK", &DeviceError::Failed(m.into()), true);
         assert!(wrong_passphrase(
             "Error unlocking /dev/sdb1: Failed to activate device: Incorrect passphrase."
         ));
@@ -2276,23 +2291,20 @@ mod tests {
         );
         assert_eq!(t("No such device"), "SANDISK was removed");
         assert_eq!(
-            lock_error_reason(&DeviceError::Failed(
-                "Error locking /dev/dm-0 (/dev/sdb1): Failed to deactivate device".into()
-            )),
-            "Failed to deactivate device"
-        );
-        assert_eq!(lock_error_reason(&DeviceError::Busy), "it is in use");
-        assert_eq!(
             t("Device /dev/sdb1 does not appear to be a LUKS, BITLK or TCRYPT device"),
             "SANDISK isn't an encrypted volume Robin can open"
         );
         assert_eq!(t(""), "Couldn't unlock SANDISK: UDisks2 gave no reason");
         assert_eq!(
-            unlock_error_text("SANDISK", &DeviceError::NotAuthorized("dismissed".into())),
+            unlock_error_text(
+                "SANDISK",
+                &DeviceError::NotAuthorized("dismissed".into()),
+                true
+            ),
             "Authentication was cancelled"
         );
         assert_eq!(
-            unlock_error_text("SANDISK", &DeviceError::NotAuthorized(String::new())),
+            unlock_error_text("SANDISK", &DeviceError::NotAuthorized(String::new()), true),
             "You aren't allowed to unlock SANDISK"
         );
     }
@@ -2452,6 +2464,75 @@ mod tests {
         assert_eq!(ch as u32, 0xF033E, "nf-md-lock");
         let id = face.glyph_index(ch).expect("the font has nf-md-lock");
         assert_eq!(face.glyph_name(id), Some("md-lock"));
+    }
+
+    #[test]
+    fn the_unlock_glyphs_are_in_every_bundled_face() {
+        let ui = include_str!("../ui/app.slint");
+        for face in ["Regular", "Medium", "Bold"] {
+            let font = std::fs::read(format!(
+                "{}/assets/fonts/JetBrainsMonoNerdFont-{face}.ttf",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            let f = ttf_parser::Face::parse(&font, 0).unwrap();
+            for (glyph, cp, name) in [
+                (LOCK_GLYPH, 0xF033E, "md-lock"),
+                (UNLOCKED_GLYPH, 0xF033F, "md-lock_open"),
+                (EYE_GLYPH, 0xF0208, "md-eye"),
+                (EYE_OFF_GLYPH, 0xF0209, "md-eye_off"),
+            ] {
+                let ch = glyph.chars().next().unwrap();
+                assert_eq!(ch as u32, cp, "{name}");
+                let id = f
+                    .glyph_index(ch)
+                    .unwrap_or_else(|| panic!("{face} lacks {name}"));
+                assert_eq!(f.glyph_name(id), Some(name), "{face}");
+            }
+        }
+        // The dialog draws the eye pair itself.
+        assert!(ui.contains(EYE_GLYPH) && ui.contains(EYE_OFF_GLYPH));
+    }
+
+    #[test]
+    fn only_luks_says_wrong_passphrase() {
+        let e = DeviceError::WrongPassphrase;
+        assert!(is_luks("crypto_LUKS"));
+        for id_type in ["BitLocker", "crypto_TCRYPT"] {
+            assert!(!is_luks(id_type));
+        }
+        assert_eq!(
+            unlock_error_text("SANDISK", &e, false),
+            "Couldn't unlock SANDISK with this passphrase"
+        );
+        assert_eq!(
+            unlock_error_text("SANDISK", &e, true),
+            "Wrong passphrase. Try again."
+        );
+        // Other failures read the same whatever the volume.
+        let oom = DeviceError::Failed("Failed to activate device: Cannot allocate memory".into());
+        assert_eq!(
+            unlock_error_text("SANDISK", &oom, false),
+            unlock_error_text("SANDISK", &oom, true)
+        );
+    }
+
+    #[test]
+    fn a_truecrypt_volume_lists_locked_with_its_own_type() {
+        let root = tmp("tcrypt-list");
+        let fake = FakeDevices::new();
+        let mut d = luks(&root);
+        if let Some(l) = d.luks.as_mut() {
+            l.id_type = "crypto_TCRYPT".into();
+        }
+        fake.plug(d);
+        let row = &fake.drives().unwrap()[0];
+        assert!(row.locked);
+        assert_eq!(row.fs_type, "crypto_TCRYPT");
+        let e = fake.unlock("sdb1", &Passphrase::new(WRONG)).unwrap_err();
+        assert_eq!(e, DeviceError::WrongPassphrase);
+        assert_clean("the error", &unlock_error_text("SANDISK", &e, false));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// UDisks2's tree for one stick with a LUKS partition, locked or
