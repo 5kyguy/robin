@@ -120,12 +120,33 @@ pub fn scripted(view: &str) -> bool {
             | "toast-stack-more"
             | "toast-stack-expanded"
             | "toast-stack-short"
+            | "toast-stack-wrap"
+            | "devices-luks-locked"
+            | "devices-luks-menu"
+            | "devices-luks-unlock"
+            | "devices-luks-cancel"
+            | "devices-luks-unlocking"
+            | "devices-luks-wrong"
+            | "devices-luks-error"
+            | "devices-luks-retry"
+            | "devices-luks-unlocked"
+            | "devices-luks-eject"
+            | "devices-luks-eject-unmounted"
+            | "devices-luks-lock-failed"
+            | "devices-luks-masked"
+            | "devices-luks-shown"
+            | "devices-luks-unlocked-row"
+            | "devices-luks-truecrypt-wrong"
+            | "devices-luks-bitlocker-wrong"
     )
 }
 
 /// The fake stick the `devices-*` scenes plug in: the fixture's SANDISK,
 /// unmounted until the scene mounts it.
 fn sandisk(root: &Path, view: &str) -> crate::devices::FakeDrive {
+    if view.starts_with("devices-luks") {
+        return luks_sandisk(root, view);
+    }
     let mut d = crate::devices::FakeDrive::stick(
         "sda1",
         "SANDISK",
@@ -143,6 +164,296 @@ fn sandisk(root: &Path, view: &str) -> crate::devices::FakeDrive {
         d.drive.mount_points = vec![root.join("media/sky/SANDISK")];
     }
     d
+}
+
+/// The passphrase the `devices-luks-*` scenes' SANDISK opens with.
+const LUKS_PASSPHRASE: &str = "correct horse";
+
+/// The `devices-luks-*` scenes' SANDISK: a locked LUKS partition `sda1`
+/// that unlocks to the fixture's exFAT filesystem `sda1-clear`. One scene
+/// scripts an unlock failure, one a lock that is refused.
+fn luks_sandisk(root: &Path, view: &str) -> crate::devices::FakeDrive {
+    let mut d = crate::devices::FakeDrive::encrypted(
+        "sda1",
+        "SANDISK",
+        29_800_000_000,
+        &root.join("media/sky/SANDISK"),
+        LUKS_PASSPHRASE,
+    );
+    if let Some(l) = d.luks.as_mut() {
+        if view == "devices-luks-error" {
+            l.unlock_error = Some(
+                "Error unlocking /dev/sda1: Failed to activate device: Cannot allocate memory"
+                    .into(),
+            );
+        }
+        if view == "devices-luks-lock-failed" {
+            l.lock_error =
+                Some("Error locking /dev/dm-0 (/dev/sda1): Failed to deactivate device".into());
+        }
+        if view == "devices-luks-truecrypt-wrong" {
+            l.id_type = "crypto_TCRYPT".into();
+        }
+        if view == "devices-luks-bitlocker-wrong" {
+            l.id_type = "BitLocker".into();
+        }
+    }
+    d
+}
+
+/// The DEVICES row named `name`, as drawn.
+fn device_place(ui: &AppWindow, name: &str) -> Result<crate::Place> {
+    use slint::Model;
+    let i = device_row(ui, name)?;
+    ui.get_device_places()
+        .row_data(i as usize)
+        .ok_or_else(|| Error::Message(format!("no DEVICES row named {name}")))
+}
+
+/// Play a `devices-luks-*` scene: the locked row, the Unlock dialog
+/// typed into through the window, and eject locking it again. Each scene
+/// checks what it shows, and that the passphrase is in nothing it can
+/// read back (the fake's call log, the dialog's state, its error).
+fn luks_scene(ui: &AppWindow, view: &str, fake: &crate::devices::FakeDevices) -> Result<()> {
+    let fail = |what: String| Err(Error::Message(format!("{view}: {what}")));
+    let wrong = "hunter2 hunter2";
+    let log = |fake: &crate::devices::FakeDevices| {
+        fake.log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    };
+    let clean = |fake: &crate::devices::FakeDevices| -> Result<()> {
+        let calls = log(fake).join("\n");
+        let state = format!("{:?}", app::unlocking());
+        let fakes = format!("{:?}", fake.get("sda1"));
+        let error = ui.get_unlock_error().to_string();
+        for (what, text) in [
+            ("call log", &calls),
+            ("dialog", &state),
+            ("fake", &fakes),
+            ("error", &error),
+        ] {
+            if text.contains(wrong) || text.contains(LUKS_PASSPHRASE) {
+                return Err(Error::Message(format!(
+                    "{view}: the passphrase is in the {what}"
+                )));
+            }
+        }
+        Ok(())
+    };
+    let open_dialog = |ui: &AppWindow| -> Result<()> {
+        ui.invoke_place_open(1, device_row(ui, "SANDISK")?);
+        app::land_reads();
+        Ok(())
+    };
+    let submit = |ui: &AppWindow, typed: &str| {
+        type_field(ui, typed);
+        type_field(ui, "\n");
+        app::land_reads();
+    };
+    let back_home = |ui: &AppWindow| {
+        use slint::Model;
+        let pinned = ui.get_pinned_places();
+        let at = (0..pinned.row_count())
+            .find(|&i| pinned.row_data(i).is_some_and(|p| p.name == "Pictures"))
+            .unwrap_or(0);
+        ui.invoke_place_open(0, at as i32);
+        app::land_reads();
+    };
+    // A real click on the eye at the field's right edge: the dialog is
+    // min(400, w − 32) × 178, centred; the field 20 in, 74 down, 36 tall.
+    let click_eye = |ui: &AppWindow| {
+        use slint::platform::{PointerEventButton, WindowEvent};
+        let win = ui.window();
+        let size = win.size().to_logical(win.scale_factor());
+        let w = (size.width - 32.0).min(400.0);
+        let x = (size.width - w) / 2.0 + w - 20.0 - 16.0;
+        let y = ((size.height - 178.0) / 2.0).max(0.0) + 74.0 + 18.0;
+        let position = slint::LogicalPosition::new(x, y);
+        let button = PointerEventButton::Left;
+        win.dispatch_event(WindowEvent::PointerMoved { position });
+        win.dispatch_event(WindowEvent::PointerPressed { position, button });
+        win.dispatch_event(WindowEvent::PointerReleased { position, button });
+        app::land_reads();
+    };
+    let shown = || app::unlocking().is_some_and(|u| u.shown);
+    match view {
+        // The locked row: lock glyph, muted, no bar.
+        "devices-luks-locked" => {
+            let row = device_place(ui, "SANDISK")?;
+            if !(row.dim && row.glyph == crate::devices::LOCK_GLYPH && row.usage < 0.0) {
+                return fail("the locked row isn't muted with the lock glyph".into());
+            }
+        }
+        "devices-luks-menu" => {
+            ui.invoke_place_menu(device_row(ui, "SANDISK")?, 150.0, 380.0);
+        }
+        "devices-luks-unlock" => {
+            open_dialog(ui)?;
+            if ui.get_overlay() != "unlock-live" {
+                return fail(format!("overlay {:?}", ui.get_overlay()));
+            }
+        }
+        "devices-luks-cancel" => {
+            open_dialog(ui)?;
+            type_field(ui, wrong);
+            type_field(ui, "\u{1b}");
+            app::land_reads();
+            if !ui.get_overlay().is_empty() || app::unlocking().is_some() {
+                return fail("Esc didn't close the dialog".into());
+            }
+            if log(fake).iter().any(|l| l.starts_with("unlock")) {
+                return fail("Esc unlocked".into());
+            }
+        }
+        "devices-luks-unlocking" => {
+            open_dialog(ui)?;
+            type_field(ui, wrong);
+            app::hold_unlock();
+            // Mid-call, Esc does nothing.
+            type_field(ui, "\u{1b}");
+            if ui.get_overlay() != "unlock-live" || !ui.get_unlock_busy() {
+                return fail("the dialog closed mid-unlock".into());
+            }
+        }
+        "devices-luks-wrong" | "devices-luks-error" => {
+            open_dialog(ui)?;
+            submit(ui, wrong);
+            let want = if view == "devices-luks-wrong" {
+                "Wrong passphrase. Try again."
+            } else {
+                "Not enough free memory to unlock SANDISK"
+            };
+            let got = ui.get_unlock_error().to_string();
+            if got != want || ui.get_overlay() != "unlock-live" {
+                return fail(format!("error {got:?}, overlay {:?}", ui.get_overlay()));
+            }
+            clean(fake)?;
+        }
+        // Wrong first, then right. The field kept the wrong one selected,
+        // so typing replaces it and the second try opens the drive.
+        "devices-luks-retry" => {
+            open_dialog(ui)?;
+            submit(ui, wrong);
+            submit(ui, LUKS_PASSPHRASE);
+            if app::unlocking().is_some() {
+                return fail(format!("still asking: {:?}", ui.get_unlock_error()));
+            }
+            clean(fake)?;
+        }
+        "devices-luks-unlocked" => {
+            open_dialog(ui)?;
+            submit(ui, LUKS_PASSPHRASE);
+            if app::unlocking().is_some() {
+                return fail(format!("still asking: {:?}", ui.get_unlock_error()));
+            }
+            if ui.get_toast_on() {
+                return fail(format!("toast {:?}", ui.get_toast_text()));
+            }
+            let row = device_place(ui, "SANDISK")?;
+            if !(row.selected && !row.dim && row.glyph == crate::devices::UNLOCKED_GLYPH) {
+                return fail("the unlocked drive isn't open on an open-lock row".into());
+            }
+            clean(fake)?;
+        }
+        "devices-luks-eject" | "devices-luks-lock-failed" => {
+            open_dialog(ui)?;
+            submit(ui, LUKS_PASSPHRASE);
+            back_home(ui);
+            ui.invoke_place_eject(device_row(ui, "SANDISK")?);
+            app::land_reads();
+            let calls = log(fake);
+            let toast = ui.get_toast_text().to_string();
+            if view == "devices-luks-eject" {
+                if calls[calls.len().saturating_sub(3)..]
+                    != ["unmount sda1-clear", "lock sda1", "power-off sda1"]
+                {
+                    return fail(format!("eject calls {calls:?}"));
+                }
+                if toast != "SANDISK can be unplugged"
+                    || device_names(ui).iter().any(|n| n == "SANDISK")
+                {
+                    return fail(format!("toast {toast:?}, rows {:?}", device_names(ui)));
+                }
+            } else if toast != "Couldn't lock SANDISK. Close anything using it and try again." {
+                return fail(format!("toast {toast:?}"));
+            }
+            clean(fake)?;
+        }
+        // Unlocked, never mounted (another tool opened it): eject locks
+        // it and powers the stick off, with nothing to unmount.
+        "devices-luks-eject-unmounted" => {
+            let p = crate::devices::Passphrase::new(LUKS_PASSPHRASE);
+            crate::devices::DeviceBackend::unlock(fake, "sda1", &p)
+                .map_err(|e| Error::Message(e.to_string()))?;
+            drop(p);
+            app::devices_poll();
+            app::land_reads();
+            ui.invoke_place_eject(device_row(ui, "SANDISK")?);
+            app::land_reads();
+            let calls = log(fake);
+            if calls != ["unlock sda1", "lock sda1", "power-off sda1"] {
+                return fail(format!("eject calls {calls:?}"));
+            }
+            if ui.get_toast_text() != "SANDISK can be unplugged" {
+                return fail(format!("toast {:?}", ui.get_toast_text()));
+            }
+        }
+        // Typed and masked, the eye offering to show it; or shown, the
+        // eye offering to hide it. The field keeps focus through the
+        // clicks, and neither state puts the text anywhere new.
+        "devices-luks-masked" | "devices-luks-shown" => {
+            open_dialog(ui)?;
+            type_field(ui, "correct");
+            if shown() || ui.get_unlock_shown() {
+                return fail("the field opened shown".into());
+            }
+            if view == "devices-luks-shown" {
+                click_eye(ui);
+                if !(shown() && ui.get_unlock_shown()) {
+                    return fail("the eye didn't show the passphrase".into());
+                }
+                click_eye(ui);
+                if shown() {
+                    return fail("the eye didn't hide it again".into());
+                }
+                click_eye(ui);
+            }
+            type_field(ui, " horse");
+            clean(fake)?;
+            if !log(fake).is_empty() {
+                return fail(format!("calls {:?}", log(fake)));
+            }
+        }
+        // Back in Pictures with SANDISK unlocked: its row has the open lock.
+        "devices-luks-unlocked-row" => {
+            open_dialog(ui)?;
+            submit(ui, LUKS_PASSPHRASE);
+            back_home(ui);
+            let row = device_place(ui, "SANDISK")?;
+            if !(row.glyph == crate::devices::UNLOCKED_GLYPH && !row.selected && !row.dim) {
+                return fail("the unlocked row has no open lock".into());
+            }
+            clean(fake)?;
+        }
+        // TrueCrypt may want options the dialog can't give, so a refused
+        // key says so (wrapped to two lines); BitLocker's reads neutral.
+        // Neither says "Wrong passphrase".
+        "devices-luks-truecrypt-wrong" | "devices-luks-bitlocker-wrong" => {
+            open_dialog(ui)?;
+            submit(ui, wrong);
+            let got = ui.get_unlock_error().to_string();
+            let want = if view == "devices-luks-truecrypt-wrong" {
+                "Couldn't unlock SANDISK. This TrueCrypt volume may need options Robin doesn't support."
+            } else {
+                "Couldn't unlock SANDISK with this passphrase"
+            };
+            if got != want {
+                return fail(format!("error {got:?}"));
+            }
+            clean(fake)?;
+        }
+        _ => return fail("no such scene".into()),
+    }
+    Ok(())
 }
 
 /// Where the `phones-*` scenes' Pixel 8 shows up, as gvfsd-fuse would put it.
@@ -570,6 +881,9 @@ fn device_scene(
     fake: &crate::devices::FakeDevices,
 ) -> Result<()> {
     use crate::ops::{Job, JobKind};
+    if view.starts_with("devices-luks") {
+        return luks_scene(ui, view, fake);
+    }
     let stick = root.join("media/sky/SANDISK");
     // Every scene but the arrival starts with the stick already in, so
     // it gets no toast (it was there at startup), then mounts it with a
@@ -1481,6 +1795,9 @@ fn stranded_scene(ui: &AppWindow, view: &str) -> Result<()> {
             Err(Error::Message(format!("{what}: {got:?}, want {want:?}")))
         }
     };
+    if view == "toast-stack-wrap" {
+        return wrap_stack_scene(ui, check);
+    }
     if matches!(
         view,
         "toast-stack-more" | "toast-stack-expanded" | "toast-stack-short"
@@ -1643,6 +1960,51 @@ fn hidden_pin(n: u32) -> String {
     format!(".robin-rename-4127-0-dune-sunset-041{n}.jpg")
 }
 
+/// A parked lock-failed toast under a newer timed one: the message
+/// wraps to two lines, and the stack cap uses that real height.
+fn wrap_stack_scene(
+    ui: &AppWindow,
+    check: impl Fn(&str, String, &str) -> Result<()>,
+) -> Result<()> {
+    use slint::Model;
+    app::seed_toast_stack(
+        vec![
+            crate::toast::Toast {
+                tone: "danger".into(),
+                text: crate::toast::WRAP_SAMPLE.into(),
+                action: app::TOAST_DISMISS.into(),
+                sticky: true,
+                ..crate::toast::Toast::default()
+            },
+            crate::toast::timed("Copied 1 path"),
+        ],
+        false,
+    );
+    check("front", ui.get_toast_text().to_string(), "Copied 1 path")?;
+    check(
+        "parked",
+        ui.get_parked_toasts().row_count().to_string(),
+        "1",
+    )?;
+    check("under", parked_text(ui, 0)?, crate::toast::WRAP_SAMPLE)?;
+    check("under action", parked_action(ui, 0)?, app::TOAST_DISMISS)?;
+    ui.show().map_err(|e| Error::Message(e.to_string()))?;
+    let parked = ui.get_parked_stack_h();
+    if parked <= 52.0 || parked > 80.0 {
+        return Err(Error::Message(format!(
+            "wrapped parked height {parked}, want between 52 and 80"
+        )));
+    }
+    let room = ui.get_toast_stack_room();
+    let current = 52.0;
+    if parked + 8.0 + current > room + 1.0 {
+        return Err(Error::Message(format!(
+            "stack cap: parked {parked} + current {current} + 8 > room {room}"
+        )));
+    }
+    Ok(())
+}
+
 /// Sticky hidden-file toasts under a timed one: three shown and
 /// "+N more" at full height, the full list after expand (eight toasts,
 /// capped and scrolling, with "Show fewer"), or one shown and "+4 more"
@@ -1706,6 +2068,7 @@ fn many_sticky_scene(
             ui.get_toast_text().to_string(),
             "Copied 1 path",
         )?;
+        ui.show().map_err(|e| Error::Message(e.to_string()))?;
         let room = ui.get_toast_stack_room();
         let parked = ui.get_parked_stack_h();
         let current = 52.0;

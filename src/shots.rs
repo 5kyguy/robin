@@ -56,6 +56,9 @@ pub fn known(view: &str) -> bool {
             | "device-partitions-removed-elsewhere"
             | "device-unlock"
             | "device-unlock-wrong"
+            | "device-locked"
+            | "device-unlocking"
+            | "device-unlock-error"
             | "phone-waiting"
             | "phone-row"
             | "phone-plugged"
@@ -105,6 +108,7 @@ pub fn known(view: &str) -> bool {
             | "toast-stack-more"
             | "toast-stack-expanded"
             | "toast-stack-short"
+            | "toast-stack-wrap"
             | "menu-bg"
             | "shortcuts-browser"
             | "reduce-motion"
@@ -431,7 +435,10 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             | "move-refused-many" => "move-refused",
             "menu-bg" => "menu-bg",
             "device-menu" => "menu-device",
-            "device-unlock" | "device-unlock-wrong" => "unlock",
+            "device-unlock"
+            | "device-unlock-wrong"
+            | "device-unlocking"
+            | "device-unlock-error" => "unlock",
             "shortcuts-browser" | "shortcuts-viewer" => "shortcuts",
             _ => "",
         }
@@ -737,11 +744,27 @@ fn places(view: &str) -> Vec<Place> {
             | "device-unlock"
             | "device-unlock-wrong"
             | "device-power-off"
+            | "device-locked"
+            | "device-unlocking"
+            | "device-unlock-error"
     ) {
         if let Some(disk) = rows.iter_mut().find(|row| row.name == "SANDISK") {
             disk.count = "".into();
             disk.usage = -1.0;
             disk.dim = true;
+        }
+    }
+    // Encrypted and locked: the lock glyph in place of the USB one.
+    if matches!(
+        view,
+        "device-unlock"
+            | "device-unlock-wrong"
+            | "device-locked"
+            | "device-unlocking"
+            | "device-unlock-error"
+    ) {
+        if let Some(disk) = rows.iter_mut().find(|row| row.name == "SANDISK") {
+            disk.glyph = crate::devices::LOCK_GLYPH.into();
         }
     }
     if matches!(view, "device-read-only" | "device-read-only-empty") {
@@ -1324,7 +1347,8 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
         | "toast-stack-two"
         | "toast-stack-more"
         | "toast-stack-expanded"
-        | "toast-stack-short" => {
+        | "toast-stack-short"
+        | "toast-stack-wrap" => {
             use crate::clipboard::{paths_toast, Outcome};
             if view == "copy-path-done" || view == "copy-path-no-tool" {
                 // Two paths copied: two rows selected, and the status bar
@@ -1344,7 +1368,8 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
                 | "toast-stack-two"
                 | "toast-stack-more"
                 | "toast-stack-expanded"
-                | "toast-stack-short" => paths_toast(&Outcome::Copied, 1),
+                | "toast-stack-short"
+                | "toast-stack-wrap" => paths_toast(&Outcome::Copied, 1),
                 _ => stranded.clone(),
             };
             ui.set_overlay("".into());
@@ -1373,6 +1398,7 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
                 || view == "toast-stack-more"
                 || view == "toast-stack-expanded"
                 || view == "toast-stack-short"
+                || view == "toast-stack-wrap"
             {
                 // Parked sticky toasts stay fully visible under the newer
                 // one, 8px apart, with the hidden name in `text` and
@@ -1400,6 +1426,16 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
                         crate::toast::SHOW_FEWER,
                     ),
                     "toast-stack-short" => (vec![card(&pin(6))], 4, "+4 more"),
+                    "toast-stack-wrap" => {
+                        let wrap = crate::app::parked_card(&crate::toast::Toast {
+                            tone: "danger".into(),
+                            text: crate::toast::WRAP_SAMPLE.into(),
+                            action: crate::app::TOAST_DISMISS.into(),
+                            sticky: true,
+                            ..crate::toast::Toast::default()
+                        });
+                        (vec![wrap], 0, "")
+                    }
                     _ => (vec![card(hidden)], 0, ""),
                 };
                 ui.set_parked_toasts(ModelRc::new(Rc::new(VecModel::from(parked))));
@@ -1678,12 +1714,17 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
             ui.set_menu_at_x(150.0);
             ui.set_menu_at_y(312.0);
         }
-        "device-unlock" | "device-unlock-wrong" => {
+        "device-unlock" | "device-unlock-wrong" | "device-unlocking" | "device-unlock-error" => {
             ui.set_unlock_name("SANDISK".into());
+            // Masked by the field: ten bullets, as typed.
             ui.set_unlock_text("••••••••••".into());
             if view == "device-unlock-wrong" {
                 ui.set_unlock_error("Wrong passphrase. Try again.".into());
             }
+            if view == "device-unlock-error" {
+                ui.set_unlock_error("Not enough free memory to unlock SANDISK".into());
+            }
+            ui.set_unlock_busy(view == "device-unlocking");
         }
         // The removed screen says it all; the toast is for a drive pulled
         // while another folder is open (DESIGN §2).

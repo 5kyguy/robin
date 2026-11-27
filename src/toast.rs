@@ -54,6 +54,10 @@ pub const STACK_CLEARANCE: i32 = 16;
 /// The muted line under an expanded sticky list.
 pub const SHOW_FEWER: &str = "Show fewer";
 
+/// A two-line lock-failed toast, used to check wrapping in the stack.
+pub const WRAP_SAMPLE: &str =
+    "Couldn't unlock SANDISK. This TrueCrypt volume may need options Robin doesn't support.";
+
 /// The toast showing now, and any number of sticky toasts parked under
 /// it, oldest first. Closing the current toast brings back the newest
 /// parked one.

@@ -71,6 +71,28 @@ fn scripted_views_render_through_the_real_app() {
         ("devices-fat-too-big", 800),
         ("devices-stats", 1100),
         ("devices-menu", 800),
+        // Encrypted drives: each scene checks itself and that the
+        // passphrase is in nothing it can read back.
+        ("devices-luks-locked", 800),
+        ("devices-luks-menu", 800),
+        ("devices-luks-unlock", 800),
+        ("devices-luks-cancel", 800),
+        ("devices-luks-unlocking", 800),
+        ("devices-luks-wrong", 800),
+        ("devices-luks-error", 800),
+        ("devices-luks-retry", 800),
+        ("devices-luks-unlocked", 800),
+        ("devices-luks-eject", 800),
+        ("devices-luks-eject-unmounted", 800),
+        ("devices-luks-lock-failed", 800),
+        ("devices-luks-wrong", 480),
+        ("devices-luks-masked", 800),
+        ("devices-luks-shown", 800),
+        ("devices-luks-shown", 480),
+        ("devices-luks-unlocked-row", 800),
+        ("devices-luks-truecrypt-wrong", 800),
+        ("devices-luks-truecrypt-wrong", 480),
+        ("devices-luks-bitlocker-wrong", 800),
         ("phones-plugged", 800),
         ("phones-row", 800),
         ("phones-waiting", 800),
@@ -117,6 +139,7 @@ fn scripted_views_render_through_the_real_app() {
         ("toast-stack-more", 800),
         ("toast-stack-expanded", 800),
         ("toast-stack-short", 800),
+        ("toast-stack-wrap", 800),
         // The 480px floor: the info panel floats, the filmstrip is cut
         // to the window, and the statistics cards stack.
         ("view-info", 480),
@@ -132,7 +155,8 @@ fn scripted_views_render_through_the_real_app() {
             | "toast-stack-restored"
             | "toast-stack-two"
             | "toast-stack-more"
-            | "toast-stack-expanded" => 800,
+            | "toast-stack-expanded"
+            | "toast-stack-wrap" => 800,
             _ => 500,
         };
         let out = dir.join(format!("{view}-{width}.png"));

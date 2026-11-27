@@ -1127,11 +1127,24 @@ export component AppWindow inherits Window {
     in property <[MenuItem]> device-menu-items;
     in property <length> menu-at-x: 0px;
     in property <length> menu-at-y: 0px;
-    // The LUKS unlock dialog (mock only): the typed passphrase as dots,
-    // and the inline error after a wrong one.
+    // The LUKS unlock dialog. `unlock-text` is the mock's stand-in
+    // passphrase (masked like the live field, which never binds to it);
+    // the error shows inline after a wrong one or another failure.
     in property <string> unlock-name: "";
     in property <string> unlock-text: "";
     in property <string> unlock-error: "";
+    // An unlock is with UDisks2: [Unlock] reads "Unlocking…", the field
+    // is read-only and [Cancel], Esc and the scrim do nothing.
+    in property <bool> unlock-busy: false;
+    // Bumped after a failure to select the whole field again.
+    in property <int> unlock-select: 0;
+    // The eye in the field: the passphrase drawn as typed, not masked.
+    // Off whenever the dialog opens.
+    in property <bool> unlock-shown: false;
+    // [Unlock] or Enter with what is typed; [Cancel] or Esc.
+    callback unlock-submit(string);
+    callback unlock-cancel();
+    callback unlock-toggle();
     in property <bool> toast-open: false;
     // Sticky toasts parked under the one showing now, newest first.
     // At most three are drawn in full (one when the window is under
@@ -2233,7 +2246,10 @@ export component AppWindow inherits Window {
             property <length> line-h: 20px;
             property <length> acts-w: 96px;
             property <length> pin-h: card.pin != "" ? line-h : 0px;
-            height: card.open ? 52px + 12px + pin-h + 12px : 52px;
+            // The headline wraps to at most three lines, same as the
+            // current toast; the cap uses this real height.
+            property <length> head-h: min(80px, max(52px, parked-line.preferred-height + 28px));
+            height: card.open ? head-h + 12px + pin-h + 12px : head-h;
             body := Rectangle {
                 width: min(max(520px, min(800px, parked-line.preferred-width + 42px + acts-w + 24px)), parent.width - 32px);
                 x: (parent.width - self.width) / 2;
@@ -2258,7 +2274,7 @@ export component AppWindow inherits Window {
                     x: 16px;
                     y: 0px;
                     width: 18px;
-                    height: 52px;
+                    height: head-h;
                     font-size: 14px;
                     color: tone;
                     vertical-alignment: center;
@@ -2268,9 +2284,10 @@ export component AppWindow inherits Window {
                     x: 42px;
                     y: 0px;
                     width: parent.width - 42px - acts-w - 24px;
-                    height: 52px;
+                    height: head-h;
                     font-size: 13px;
                     color: text;
+                    wrap: word-wrap;
                     overflow: elide;
                     vertical-alignment: center;
                 }
@@ -2279,7 +2296,7 @@ export component AppWindow inherits Window {
                     x: parent.width - 16px - self.width;
                     y: 0px;
                     width: 96px;
-                    height: 52px;
+                    height: head-h;
                     font-size: 12px;
                     color: accent;
                     horizontal-alignment: right;
@@ -2291,14 +2308,14 @@ export component AppWindow inherits Window {
                 }
                 if card.open && card.has-details: Rectangle {
                     x: 16px;
-                    y: 52px;
+                    y: head-h;
                     width: parent.width - 32px;
                     height: 1px;
                     background: hairline;
                 }
                 if card.open && card.pin != "": Text {
                     x: 42px;
-                    y: 52px + 12px;
+                    y: head-h + 12px;
                     width: parent.width - 58px;
                     height: line-h;
                     font-size: 11px;
@@ -2343,6 +2360,9 @@ export component AppWindow inherits Window {
         property <bool> open: overlay == "skipped-details" || overlay == "toast-details" || toast-open;
         property <color> tone: toast-tone == "warning" ? warning : toast-tone == "danger" ? danger : muted;
         property <length> line-h: 20px;
+        // The headline wraps to at most three lines rather than cutting a
+        // sentence off; one line keeps the 52px toast.
+        property <length> head-h: min(80px, max(52px, toast-line.preferred-height + 28px));
         // Fit the line, 520px to 800px, and never wider than the window.
         // The buttons' room on the right: 96 for one, both side by side
         // (16 apart) for a device toast's pair.
@@ -2354,9 +2374,9 @@ export component AppWindow inherits Window {
         property <length> rows-h: toast-details.length * line-h + (toast-more > 0 ? line-h : 0px);
         // Never taller than the space between the toolbar and the toast's
         // own spot above the status bar; the rest scrolls.
-        property <length> room: max(0px, parent.height - toolbar-h - toast-floor - 32px - 52px - 24px - pin-h);
+        property <length> room: max(0px, parent.height - toolbar-h - toast-floor - 32px - head-h - 24px - pin-h);
         property <length> list-h: min(toast-expanded ? min(240px, rows-h) : rows-h, room);
-        height: open ? 52px + 12px + pin-h + list-h + 12px : 52px;
+        height: open ? head-h + 12px + pin-h + list-h + 12px : head-h;
         x: side-w + (parent.width - side-w - self.width) / 2;
         y: parent.height - toast-floor - 16px - self.height - under-toast-stack;
         background: surface;
@@ -2379,7 +2399,7 @@ export component AppWindow inherits Window {
             x: 16px;
             y: 0px;
             width: 18px;
-            height: 52px;
+            height: head-h;
             font-size: 14px;
             color: tone;
             vertical-alignment: center;
@@ -2389,9 +2409,10 @@ export component AppWindow inherits Window {
             x: 42px;
             y: 0px;
             width: parent.width - 42px - parent.acts-w - 24px;
-            height: 52px;
+            height: head-h;
             font-size: 13px;
             color: text;
+            wrap: word-wrap;
             overflow: elide;
             vertical-alignment: center;
         }
@@ -2401,7 +2422,7 @@ export component AppWindow inherits Window {
             x: parent.width - 16px - self.preferred-width;
             y: 0px;
             width: self.preferred-width;
-            height: 52px;
+            height: head-h;
             font-size: 12px;
             color: toast-action2-danger ? danger : accent;
             vertical-alignment: center;
@@ -2415,7 +2436,7 @@ export component AppWindow inherits Window {
             x: toast-action2 == "" ? parent.width - 16px - self.width : parent.width - 16px - act2.preferred-width - 16px - self.width;
             y: 0px;
             width: toast-action2 == "" ? 96px : self.preferred-width;
-            height: 52px;
+            height: head-h;
             font-size: 12px;
             color: accent;
             horizontal-alignment: right;
@@ -2427,14 +2448,14 @@ export component AppWindow inherits Window {
         }
         if toast-divider: Rectangle {
             x: 16px;
-            y: 52px;
+            y: head-h;
             width: parent.width - 32px;
             height: 1px;
             background: hairline;
         }
         if open && toast-pin != "": Text {
             x: 42px;
-            y: 52px + 12px;
+            y: head-h + 12px;
             width: parent.width - 58px;
             height: line-h;
             text: toast-pin;
@@ -2445,7 +2466,7 @@ export component AppWindow inherits Window {
         }
         if open: Flickable {
             x: 42px;
-            y: 52px + 12px + pin-h;
+            y: head-h + 12px + pin-h;
             width: parent.width - 58px;
             height: list-h;
             viewport-height: rows-h;
@@ -2864,15 +2885,21 @@ export component AppWindow inherits Window {
         }
     }
 
-    // Unlock an encrypted drive (DESIGN §4): 400 wide, a passphrase
-    // field, [Cancel] [Unlock]; a wrong passphrase shows inline in
-    // `danger`. Drawn by --render-mock only in this release.
-    if !harness && overlay == "unlock": Rectangle {
+    // Unlock an encrypted drive (DESIGN §4): min(400, window − 32) wide,
+    // a masked passphrase field, [Cancel] [Unlock]; a failure shows
+    // inline in `danger` under the field, which keeps what was typed,
+    // selected. `unlock` is the --render-mock frame, `unlock-live` the
+    // real dialog. The field is the only place the passphrase lives
+    // until [Unlock] hands it over; it goes when the dialog closes.
+    if !harness && (overlay == "unlock" || overlay == "unlock-live"): Rectangle {
+        property <bool> live: overlay == "unlock-live";
         background: #000000.with-alpha(0.6);
         TouchArea { }
         Rectangle {
             width: min(400px, parent.width - 32px);
-            height: unlock-error != "" ? 196px : 172px;
+            // An error line under the field grows the dialog: 24 for one
+            // line, more when a long one wraps.
+            height: unlock-error != "" ? 184px + unlock-err.height : 178px;
             x: (parent.width - self.width) / 2;
             y: max(0px, (parent.height - self.height) / 2);
             background: surface;
@@ -2886,22 +2913,122 @@ export component AppWindow inherits Window {
                 x: 20px;
                 y: 74px;
                 width: parent.width - 40px;
-                height: 30px;
+                // DESIGN §4: a 36px field.
+                height: 36px;
                 border-radius: 6px;
                 background: bg;
                 border-width: unlock-error != "" ? 1px : 2px;
                 border-color: unlock-error != "" ? danger : accent;
-                Text {
+                opacity: unlock-busy ? 0.6 : 1;
+                unlock-keys := FocusScope {
                     x: 10px;
-                    width: parent.width - 20px;
+                    // The eye takes the field's right 32px.
+                    width: parent.width - 10px - 32px;
                     height: parent.height;
-                    text: unlock-text == "" ? "Passphrase" : unlock-text;
-                    font-size: 12px;
-                    color: unlock-text == "" ? muted : text;
+                    // A failure selects the whole field for a retype.
+                    property <int> select: root.unlock-select;
+                    changed select => {
+                        unlock-field.select-all();
+                        unlock-field.focus();
+                    }
+                    capture-key-pressed(e) => {
+                        if e.text == Key.Escape {
+                            root.unlock-cancel();
+                            return accept;
+                        }
+                        // Tab would hand the keys to the window behind.
+                        if e.text == Key.Tab || e.text == Key.Backtab {
+                            return accept;
+                        }
+                        // Nothing copies a passphrase out, masked or not.
+                        if e.modifiers.control && (e.text == "c" || e.text == "C" || e.text == "x" || e.text == "X" || e.text == Key.Insert) {
+                            return accept;
+                        }
+                        if e.modifiers.shift && e.text == Key.Delete {
+                            return accept;
+                        }
+                        return reject;
+                    }
+                    unlock-field := TextInput {
+                        width: parent.width;
+                        height: parent.height;
+                        // The mock's dots are masked text too, so both
+                        // frames draw the same bullets.
+                        text: root.unlock-text;
+                        input-type: root.unlock-shown ? InputType.text : InputType.password;
+                        // Screen readers get the field's name, never what
+                        // is in it, masked or shown.
+                        accessible-label: "Passphrase";
+                        accessible-value: "";
+                        font-size: 12px;
+                        color: text;
+                        selection-background-color: accent.with-alpha(0.45);
+                        selection-foreground-color: text;
+                        vertical-alignment: center;
+                        single-line: true;
+                        read-only: !live || root.unlock-busy;
+                        init => {
+                            if live {
+                                self.focus();
+                            }
+                        }
+                        accepted => {
+                            root.unlock-submit(self.text);
+                        }
+                    }
+                    // A click only focuses the field: a drag-select would
+                    // put the passphrase on the primary selection.
+                    TouchArea {
+                        mouse-cursor: MouseCursor.text;
+                        clicked => {
+                            unlock-field.focus();
+                        }
+                    }
+                    if unlock-field.text == "": Text {
+                        text: "Passphrase";
+                        width: parent.width;
+                        height: parent.height;
+                        font-size: 12px;
+                        color: muted;
+                        vertical-alignment: center;
+                    }
+                }
+                // Show / hide: md-eye while masked, md-eye-off while shown.
+                // The click hands focus back to the field.
+                Text {
+                    x: parent.width - 32px;
+                    width: 32px;
+                    height: parent.height;
+                    text: root.unlock-shown ? "󰈉" : "󰈈";
+                    font-size: 15px;
+                    color: unlock-eye.has-hover ? root.text : root.muted;
+                    horizontal-alignment: center;
                     vertical-alignment: center;
+                    accessible-role: button;
+                    accessible-label: root.unlock-shown ? "Hide passphrase" : "Show passphrase";
+                    unlock-eye := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            if live {
+                                root.unlock-toggle();
+                            }
+                            unlock-field.focus();
+                        }
+                    }
                 }
             }
-            if unlock-error != "": Text { text: unlock-error; x: 20px; y: 110px; width: parent.width - 40px; height: 18px; font-size: 11px; color: danger; overflow: elide; vertical-alignment: center; }
+            unlock-err := Text {
+                visible: unlock-error != "";
+                text: unlock-error;
+                x: 20px;
+                y: 116px;
+                width: parent.width - 40px;
+                height: max(18px, self.preferred-height);
+                font-size: 11px;
+                color: danger;
+                wrap: word-wrap;
+                vertical-alignment: center;
+            }
             HorizontalLayout {
                 x: 20px;
                 y: parent.height - 16px - 32px;
@@ -2909,8 +3036,22 @@ export component AppWindow inherits Window {
                 height: 32px;
                 alignment: end;
                 spacing: 8px;
-                StateButton { label: "Cancel"; ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover; }
-                StateButton { label: "Unlock"; primary: true; ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover; }
+                StateButton {
+                    label: "Cancel";
+                    opacity: root.unlock-busy ? 0.42 : 1;
+                    ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover;
+                    clicked => { root.unlock-cancel(); }
+                }
+                StateButton {
+                    label: root.unlock-busy ? "Unlocking…" : "Unlock";
+                    primary: true;
+                    ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover;
+                    clicked => {
+                        if live && !root.unlock-busy {
+                            root.unlock-submit(unlock-field.text);
+                        }
+                    }
+                }
             }
         }
     }

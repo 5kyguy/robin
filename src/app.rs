@@ -2832,6 +2832,32 @@ struct Devices {
     toast: Option<DeviceToast>,
     /// What each line of the open device menu does.
     menu: Vec<MenuAct>,
+    /// The Unlock dialog, while it is open.
+    unlock: Option<Unlocking>,
+}
+
+/// The Unlock dialog (DESIGN §4): which encrypted partition, what shows
+/// under the field, and whether an unlock is on a worker. Never the
+/// passphrase: it stays in the field until [Unlock] hands it to the
+/// worker as a [`crate::devices::Passphrase`], which is zeroed after the
+/// one call.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Unlocking {
+    pub id: String,
+    pub name: String,
+    /// "Wrong passphrase. Try again." or another reason, in `danger`.
+    pub error: String,
+    /// Unlocking: [Unlock] reads "Unlocking…", and neither Esc, [Cancel]
+    /// nor the scrim closes the dialog until UDisks2 answers.
+    pub busy: bool,
+    /// Bumped to select the whole field again after a failure.
+    pub select: i32,
+    /// The eye: the field draws what was typed instead of dots. Only how
+    /// the field draws; the text itself never leaves it.
+    pub shown: bool,
+    /// LUKS, TrueCrypt or BitLocker: only LUKS says for sure that a
+    /// refused key was the wrong passphrase.
+    pub crypto: crate::devices::Crypto,
 }
 
 /// The buttons on a device toast, by drive id.
@@ -3680,15 +3706,30 @@ fn drives_landed(
     got: std::result::Result<Vec<crate::devices::Drive>, crate::devices::DeviceError>,
 ) {
     // UDisks2 stopped answering: keep what the sidebar has.
-    let Ok(now) = got else { return };
+    let Ok(mut now) = got else { return };
     let (arrived, lost) = {
         let mut s = st.borrow_mut();
         let prev = s.dev.drives.take();
+        let locking = mid_eject(
+            prev.as_deref().unwrap_or_default(),
+            &mut now,
+            &s.dev.ejecting,
+        );
+        // The partition the Unlock dialog asks about was pulled out, or
+        // unlocked by something else: the dialog has nothing to do.
+        let stale = s
+            .dev
+            .unlock
+            .as_ref()
+            .is_some_and(|u| !u.busy && !now.iter().any(|d| d.id == u.id && d.locked));
+        if stale {
+            s.dev.unlock = None;
+        }
         // An ejected reader shows again once it's pulled out and back, or
         // something else mounts it.
-        s.dev
-            .hidden
-            .retain(|id| now.iter().any(|d| d.id == *id && d.mounted().is_none()));
+        s.dev.hidden.retain(|id| {
+            locking.contains(id) || now.iter().any(|d| d.id == *id && d.mounted().is_none())
+        });
         let arrived: Vec<_> = crate::devices::arrivals(prev.as_deref(), &now)
             .into_iter()
             .cloned()
@@ -3730,6 +3771,33 @@ fn drives_landed(
             4,
         );
     }
+}
+
+/// A listing that lands mid-eject. A filesystem locked away leaves the
+/// list before the drive powers off: its row is kept, unmounted, until
+/// the eject lands, so the drive's rows still go together. Returns the
+/// encrypted partitions under the ejecting filesystems, which stay
+/// hidden though they aren't listed until they lock.
+pub fn mid_eject(
+    prev: &[crate::devices::Drive],
+    now: &mut Vec<crate::devices::Drive>,
+    ejecting: &[String],
+) -> Vec<String> {
+    let mut locking = Vec::new();
+    for id in ejecting {
+        let Some(p) = prev.iter().find(|d| d.id == *id) else {
+            continue;
+        };
+        if !p.crypto.is_empty() {
+            locking.push(p.crypto.clone());
+        }
+        if !now.iter().any(|d| d.id == *id) {
+            let mut p = p.clone();
+            p.mount_points.clear();
+            now.push(p);
+        }
+    }
+    locking
 }
 
 /// The toast for drives pulled out without eject while another folder
@@ -3909,6 +3977,10 @@ fn open_drive(ui: &AppWindow, st: &Shared, id: &str, open: Option<PathBuf>) {
         (s.dev.backend.clone(), drive_by_id(&s.dev, id).cloned())
     };
     let Some(drive) = drive else { return };
+    if drive.locked {
+        open_unlock(ui, st, &drive);
+        return;
+    }
     if let Some(m) = drive.mounted() {
         let target = open
             .filter(|o| o.starts_with(m))
@@ -3975,6 +4047,166 @@ fn mount_landed(
     }
 }
 
+/// A click on a locked partition: ask for its passphrase.
+fn open_unlock(ui: &AppWindow, st: &Shared, d: &crate::devices::Drive) {
+    {
+        let mut s = st.borrow_mut();
+        if s.dev.busy.contains(&d.id) {
+            return;
+        }
+        s.dev.unlock = Some(Unlocking {
+            id: d.id.clone(),
+            name: drive_name(d),
+            crypto: crate::devices::Crypto::of(&d.fs_type),
+            ..Unlocking::default()
+        });
+    }
+    redraw(ui, &st.borrow());
+}
+
+/// [Unlock] or Enter in the passphrase field. The typed text becomes a
+/// [`crate::devices::Passphrase`] that moves to the worker, is used for
+/// the one `Encrypted.Unlock` call and is zeroed right after; the
+/// cleartext filesystem is then mounted and opened as a click on an
+/// unmounted row would.
+fn unlock_submit(ui: &AppWindow, st: &Shared, typed: &str) {
+    let (backend, id, name) = {
+        let mut s = st.borrow_mut();
+        let backend = s.dev.backend.clone();
+        let Some(u) = s.dev.unlock.as_mut() else {
+            return;
+        };
+        if u.busy {
+            return;
+        }
+        if typed.is_empty() {
+            u.error = "Enter the passphrase".into();
+            u.select += 1;
+            drop(s);
+            redraw(ui, &st.borrow());
+            return;
+        }
+        let Some(backend) = backend else { return };
+        u.busy = true;
+        u.error.clear();
+        let (id, name) = (u.id.clone(), u.name.clone());
+        s.dev.busy.insert(id.clone());
+        (backend, id, name)
+    };
+    let pass = crate::devices::Passphrase::new(typed);
+    redraw(ui, &st.borrow());
+    let call = id.clone();
+    run_device(
+        ui,
+        st,
+        move || {
+            let got = backend.unlock(&call, &pass);
+            drop(pass);
+            got.map(|clear| {
+                let mounted = backend.mount(&clear);
+                (clear, mounted)
+            })
+        },
+        move |ui, st, got| unlock_landed(ui, st, &id, &name, got),
+    );
+}
+
+type Unlocked = (
+    String,
+    std::result::Result<PathBuf, crate::devices::DeviceError>,
+);
+
+fn unlock_landed(
+    ui: &AppWindow,
+    st: &Shared,
+    id: &str,
+    name: &str,
+    got: std::result::Result<Unlocked, crate::devices::DeviceError>,
+) {
+    st.borrow_mut().dev.busy.remove(id);
+    match got {
+        Ok((clear, mounted)) => {
+            {
+                let mut s = st.borrow_mut();
+                s.dev.unlock = None;
+                // Until the next listing lands, the locked row stands for
+                // the filesystem it opened to, so the mount has a row.
+                if let Some(all) = s.dev.drives.as_mut() {
+                    if !all.iter().any(|d| d.id == clear) {
+                        if let Some(d) = all.iter_mut().find(|d| d.id == id) {
+                            d.id = clear.clone();
+                            d.crypto = id.to_string();
+                            d.locked = false;
+                        }
+                    }
+                }
+                s.ctl.devices = s.dev.drives.clone().unwrap_or_default();
+                start_side(&mut s);
+            }
+            ui.invoke_focus_keys();
+            relist(ui, st);
+            mount_landed(ui, st, &clear, name, None, mounted);
+        }
+        Err(e) => {
+            {
+                let mut s = st.borrow_mut();
+                if let Some(u) = s.dev.unlock.as_mut().filter(|u| u.id == id) {
+                    u.busy = false;
+                    u.error = crate::devices::unlock_error_text(name, &e, u.crypto);
+                    u.select += 1;
+                }
+            }
+            redraw(ui, &st.borrow());
+        }
+    }
+}
+
+/// [Cancel], Esc or a click on the scrim: close the dialog, unless an
+/// unlock is already with UDisks2 (it can't be called back, and polkit
+/// may be asking).
+fn unlock_cancel(ui: &AppWindow, st: &Shared) {
+    {
+        let mut s = st.borrow_mut();
+        if s.dev.unlock.as_ref().is_none_or(|u| u.busy) {
+            return;
+        }
+        s.dev.unlock = None;
+    }
+    ui.invoke_focus_keys();
+    redraw(ui, &st.borrow());
+}
+
+/// The eye in the passphrase field: show what was typed, or mask it again.
+fn unlock_toggle(ui: &AppWindow, st: &Shared) {
+    if let Some(u) = st.borrow_mut().dev.unlock.as_mut() {
+        u.shown = !u.shown;
+    }
+    redraw(ui, &st.borrow());
+}
+
+/// Renders: the dialog mid-unlock, as if UDisks2 hadn't answered yet.
+pub fn hold_unlock() {
+    with_state(|ui, st| {
+        if let Some(u) = st.borrow_mut().dev.unlock.as_mut() {
+            u.busy = true;
+            u.error.clear();
+        }
+        redraw(&ui, &st.borrow());
+    });
+}
+
+/// Renders: [Unlock] pressed with `typed` in the field.
+pub fn press_unlock(typed: &str) {
+    with_state(|ui, st| unlock_submit(&ui, st, typed));
+}
+
+/// Renders and tests: the open Unlock dialog's state.
+pub fn unlocking() -> Option<Unlocking> {
+    let mut out = None;
+    with_state(|_, st| out = st.borrow().dev.unlock.clone());
+    out
+}
+
 /// Eject: unmount, then power the drive off. Refused with a busy toast
 /// while Robin's own job reads or writes it; `force` (the busy toast's
 /// [Force], only offered when another program holds it) unmounts anyway.
@@ -4008,6 +4240,10 @@ fn eject_drive(ui: &AppWindow, st: &Shared, id: &str, force: bool) {
         }
         s.dev.busy.extend(parts.iter().map(|p| p.id.clone()));
         s.dev.ejecting = parts.iter().map(|p| p.id.clone()).collect();
+        // Once locked, an encrypted partition is listed again as itself:
+        // keep that row hidden until the eject lands, so the drive's rows
+        // still go together.
+        s.dev.hidden.extend(crypto_ids(&parts));
         if s.dev.eject_after.as_deref() == Some(id) {
             s.dev.eject_after = None;
         }
@@ -4053,6 +4289,15 @@ pub fn in_use_text(name: &str, holder: Option<&str>) -> String {
     )
 }
 
+/// The encrypted partitions under `parts`' unlocked filesystems.
+fn crypto_ids(parts: &[crate::devices::Drive]) -> Vec<String> {
+    parts
+        .iter()
+        .filter(|p| !p.crypto.is_empty())
+        .map(|p| p.crypto.clone())
+        .collect()
+}
+
 fn eject_landed(
     ui: &AppWindow,
     st: &Shared,
@@ -4070,6 +4315,13 @@ fn eject_landed(
             s.dev.busy.remove(*i);
         }
         s.dev.ejecting.clear();
+        // Only a reader that stays plugged in keeps its locked rows
+        // hidden; a stopped eject shows them as they are.
+        if !matches!(got, Ok(Ejected::Unmounted)) {
+            let crypto = crypto_ids(parts);
+            s.dev.hidden.retain(|h| !crypto.contains(h));
+            start_side(&mut s);
+        }
         // A refused power-off still unmounted everything first.
         let off = matches!(got, Ok(_) | Err(EjectError::PowerOff(_)));
         let home = off && parts.iter().any(|p| p.holds(&s.ctl.dir));
@@ -4085,8 +4337,9 @@ fn eject_landed(
             // The next listing must not read our own unmount as a removal.
             match how {
                 Ejected::PoweredOff => {
+                    let crypto = crypto_ids(parts);
                     if let Some(all) = s.dev.drives.as_mut() {
-                        all.retain(|d| !ids.contains(&d.id.as_str()));
+                        all.retain(|d| !ids.contains(&d.id.as_str()) && !crypto.contains(&d.id));
                     }
                 }
                 Ejected::Unmounted => {
@@ -4141,6 +4394,21 @@ fn eject_landed(
             st,
             "danger",
             format!("Couldn't unmount {}: {error}", drive_name(&part)),
+            Vec::new(),
+            false,
+            "",
+        ),
+        // Unmounted, but the encrypted partition stayed open: not safe.
+        // UDisks2's reason ("Failed to deactivate device") says nothing
+        // more to act on than this does.
+        Err(EjectError::Lock { part, .. }) => show_toast(
+            ui,
+            st,
+            "danger",
+            format!(
+                "Couldn't lock {}. Close anything using it and try again.",
+                drive_name(&part)
+            ),
             Vec::new(),
             false,
             "",
@@ -4222,7 +4490,16 @@ fn open_device_menu(ui: &AppWindow, st: &Shared, index: usize, x: f32, y: f32) {
         sep: true,
         ..item("", "")
     };
-    let mut items = vec![item("󰉋", "Open")];
+    let locked = row
+        .drive
+        .as_deref()
+        .and_then(|id| drive_by_id(&st.borrow().dev, id).map(|d| d.locked))
+        .unwrap_or(false);
+    let mut items = vec![if locked {
+        item(crate::devices::LOCK_GLYPH, "Unlock…")
+    } else {
+        item("󰉋", "Open")
+    }];
     let mut acts = vec![MenuAct::Open(index)];
     if row.drive.is_some() {
         items.extend([sep, item("󰇪", "Eject")]);
@@ -5041,6 +5318,24 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     ui.on_place_menu(move |index, x, y| {
         if let Some(ui) = w2.upgrade() {
             open_device_menu(&ui, &st2, index.max(0) as usize, x, y);
+        }
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_unlock_submit(move |typed| {
+        if let Some(ui) = w2.upgrade() {
+            unlock_submit(&ui, &st2, typed.as_str());
+        }
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_unlock_cancel(move || {
+        if let Some(ui) = w2.upgrade() {
+            unlock_cancel(&ui, &st2);
+        }
+    });
+    let (w2, st2) = (ui.as_weak(), state.clone());
+    ui.on_unlock_toggle(move || {
+        if let Some(ui) = w2.upgrade() {
+            unlock_toggle(&ui, &st2);
         }
     });
     let (w2, st2) = (ui.as_weak(), state.clone());
@@ -7209,6 +7504,16 @@ fn redraw(ui: &AppWindow, s: &State) {
                 }
             }
         }
+        None if s.dev.unlock.is_some() => {
+            if let Some(u) = &s.dev.unlock {
+                ui.set_unlock_name(u.name.as_str().into());
+                ui.set_unlock_error(u.error.as_str().into());
+                ui.set_unlock_busy(u.busy);
+                ui.set_unlock_select(u.select);
+                ui.set_unlock_shown(u.shown);
+            }
+            ui.set_overlay("unlock-live".into());
+        }
         None if ctl.file_menu.is_some() => {
             if let Some(m) = &ctl.file_menu {
                 ui.set_file_menu_items(ModelRc::new(Rc::new(VecModel::from(m.items.clone()))));
@@ -8061,6 +8366,22 @@ pub fn seed_parked_stickies(pins: &[&str], timed: &str, expanded: bool) {
             }
             if !timed.is_empty() {
                 s.toasts.push(crate::toast::timed(timed));
+            }
+            s.toasts.set_stack_expanded(expanded);
+        }
+        bind_toasts(&ui, st);
+    });
+}
+
+/// For render scenes: replace the toast stack with these toasts (oldest
+/// first, last one current) and optionally expand the list.
+pub fn seed_toast_stack(toasts: Vec<crate::toast::Toast>, expanded: bool) {
+    with_state(|ui, st| {
+        {
+            let mut s = st.borrow_mut();
+            s.toasts = crate::toast::ToastStack::default();
+            for toast in toasts {
+                s.toasts.push(toast);
             }
             s.toasts.set_stack_expanded(expanded);
         }
@@ -10996,6 +11317,44 @@ mod tests {
         cmd.args(["-c", "test \"$(ps -o sid= -p $$ | tr -d ' ')\" = \"$$\""]);
         let status = own_session(&mut cmd).status().unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn a_listing_mid_eject_keeps_the_locked_drives_rows_together() {
+        use crate::devices::{DeviceBackend, FakeDevices, FakeDrive, Passphrase};
+        let root = std::env::temp_dir().join(format!("robin-mid-eject-{}", std::process::id()));
+        let fake = FakeDevices::new();
+        fake.plug(FakeDrive::encrypted(
+            "sda1",
+            "SANDISK",
+            1 << 30,
+            &root.join("SANDISK"),
+            "pass",
+        ));
+        let mut backup = FakeDrive::stick("sda2", "BACKUP", 1 << 30, &root.join("BACKUP"));
+        backup.drive.drive = "sda1-drive".into();
+        fake.plug(backup);
+        let clear = fake.unlock("sda1", &Passphrase::new("pass")).unwrap();
+        fake.mount(&clear).unwrap();
+        fake.mount("sda2").unwrap();
+        let prev = fake.drives().unwrap();
+        let ejecting = vec![clear.clone(), "sda2".to_string()];
+        // Both unmounted and SANDISK locked; the power-off hasn't run.
+        fake.unmount(&clear, false).unwrap();
+        fake.unmount("sda2", false).unwrap();
+        fake.lock("sda1").unwrap();
+        let mut now = fake.drives().unwrap();
+        let locking = mid_eject(&prev, &mut now, &ejecting);
+        assert_eq!(locking, ["sda1"]);
+        let shown: Vec<&str> = now
+            .iter()
+            .filter(|d| !locking.contains(&d.id))
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(shown.len(), 2, "{shown:?}");
+        assert!(shown.contains(&"sda1-clear") && shown.contains(&"sda2"));
+        assert!(now.iter().all(|d| d.mounted().is_none()));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

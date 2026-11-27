@@ -401,7 +401,7 @@ impl SideJob {
                 Some(m) => {
                     let usage = self.probe.space(&self.mounts, m).and_then(used);
                     SideEntry {
-                        glyph: d.kind.glyph(),
+                        glyph: drive_glyph(d),
                         name: m
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
@@ -419,7 +419,7 @@ impl SideJob {
                     }
                 }
                 None => SideEntry {
-                    glyph: d.kind.glyph(),
+                    glyph: drive_glyph(d),
                     name: d.name(),
                     path: PathBuf::new(),
                     count: String::new(),
@@ -510,6 +510,18 @@ fn folder(glyph: &'static str, name: String, path: PathBuf, count: String) -> Si
 }
 
 /// "42%" for a device's count column; blank when its space is unknown.
+/// A drive row's glyph: the lock on a locked encrypted partition, the
+/// open lock once it is unlocked (mounted or not), else its kind's.
+fn drive_glyph(d: &crate::devices::Drive) -> &'static str {
+    if d.locked {
+        crate::devices::LOCK_GLYPH
+    } else if !d.crypto.is_empty() {
+        crate::devices::UNLOCKED_GLYPH
+    } else {
+        d.kind.glyph()
+    }
+}
+
 fn percent(usage: Option<f32>) -> String {
     usage
         .map(|u| format!("{}%", (u * 100.0).round() as u32))
@@ -725,6 +737,25 @@ pub fn picked(data: &SideData, dir: &Path) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
     use crate::mounts::FixtureMounts;
+
+    #[test]
+    fn an_encrypted_row_shows_a_lock_then_an_open_lock() {
+        use crate::devices::{DeviceBackend, FakeDevices, FakeDrive, Passphrase};
+        let fake = FakeDevices::new();
+        fake.plug(FakeDrive::encrypted(
+            "sdb1",
+            "SANDISK",
+            1 << 30,
+            Path::new("/media/sky/SANDISK"),
+            "pass",
+        ));
+        let glyph = |fake: &FakeDevices| drive_glyph(&fake.drives().unwrap()[0]);
+        assert_eq!(glyph(&fake), crate::devices::LOCK_GLYPH);
+        fake.unlock("sdb1", &Passphrase::new("pass")).unwrap();
+        assert_eq!(glyph(&fake), crate::devices::UNLOCKED_GLYPH);
+        fake.lock("sdb1").unwrap();
+        assert_eq!(glyph(&fake), crate::devices::LOCK_GLYPH);
+    }
 
     fn vol(mount: &str, fs: &str, source: &str) -> Volume {
         Volume {
