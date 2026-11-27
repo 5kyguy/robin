@@ -99,6 +99,8 @@ pub fn known(view: &str) -> bool {
             | "copy-path-done"
             | "copy-path-no-tool"
             | "rename-stranded"
+            | "toast-stack"
+            | "toast-stack-restored"
             | "menu-bg"
             | "shortcuts-browser"
             | "reduce-motion"
@@ -1310,41 +1312,70 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
             ui.set_rename_error(error.into());
             ui.set_rename_at(index(photo));
         }
-        "copy-path-done" | "copy-path-no-tool" | "rename-stranded" => {
+        "copy-path-done"
+        | "copy-path-no-tool"
+        | "rename-stranded"
+        | "toast-stack"
+        | "toast-stack-restored" => {
             use crate::clipboard::{paths_toast, Outcome};
-            if view == "rename-stranded" {
-                select(&[photo]);
-            } else {
+            if view == "copy-path-done" || view == "copy-path-no-tool" {
                 // Two paths copied: two rows selected, and the status bar
                 // says so.
                 select(&[photo, "dune-sunset-0413.jpg"]);
                 ui.set_status_left("15 items · 1 hidden · 2 selected (12.2 MB)".into());
+            } else {
+                select(&[photo]);
             }
+            let hidden = ".robin-rename-4127-0-dune-sunset-0412.jpg";
+            let stranded = ("danger", crate::app::STRANDED_HEAD.to_string());
             let (tone, text) = match view {
                 "copy-path-done" => paths_toast(&Outcome::Copied, 2),
                 "copy-path-no-tool" => paths_toast(&Outcome::NoTool, 2),
-                _ => ("danger", crate::app::STRANDED_HEAD.to_string()),
+                "toast-stack" => paths_toast(&Outcome::Copied, 1),
+                _ => stranded.clone(),
             };
             ui.set_overlay("".into());
             ui.set_toast_on(true);
             ui.set_toast_tone(tone.into());
             ui.set_toast_glyph(crate::app::toast_glyph(tone).into());
             ui.set_toast_text(text.into());
+            let sticky =
+                view != "copy-path-done" && view != "copy-path-no-tool" && view != "toast-stack";
             ui.set_toast_action(
-                if view == "rename-stranded" {
+                if sticky {
                     crate::app::TOAST_DISMISS
                 } else {
                     ""
                 }
                 .into(),
             );
-            let details = if view == "rename-stranded" {
-                vec![".robin-rename-4127-0-dune-sunset-0412.jpg".to_string()]
+            let details = if sticky {
+                vec![hidden.to_string()]
             } else {
                 Vec::new()
             };
             crate::app::set_toast_rows(ui, &crate::app::detail_rows(&details, true, false));
-            ui.set_toast_open(view == "rename-stranded");
+            ui.set_toast_open(sticky);
+            if view == "toast-stack" {
+                // The sticky hidden-file toast stays fully visible under
+                // the newer one, 8px below, with [Dismiss] still shown.
+                ui.set_under_toast_on(true);
+                ui.set_under_toast_tone(stranded.0.into());
+                ui.set_under_toast_glyph(crate::app::toast_glyph(stranded.0).into());
+                ui.set_under_toast_text(stranded.1.as_str().into());
+                ui.set_under_toast_action(crate::app::TOAST_DISMISS.into());
+                ui.set_under_toast_open(true);
+                let rows = crate::app::detail_rows(&[hidden.to_string()], true, false);
+                ui.set_under_toast_has_details(rows.has_details());
+                ui.set_under_toast_pin(rows.pin.as_str().into());
+                ui.set_under_toast_more(rows.more as i32);
+                ui.set_under_toast_details(ModelRc::new(Rc::new(VecModel::from(
+                    rows.rows
+                        .iter()
+                        .map(|r| slint::SharedString::from(r.as_str()))
+                        .collect::<Vec<_>>(),
+                ))));
+            }
         }
         "properties" => {
             select(&[photo]);

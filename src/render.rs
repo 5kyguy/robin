@@ -114,6 +114,8 @@ pub fn scripted(view: &str) -> bool {
             | "copy-path-no-tool"
             | "rename-stranded"
             | "rename-stranded-dismissed"
+            | "toast-stack"
+            | "toast-stack-restored"
     )
 }
 
@@ -1142,7 +1144,9 @@ fn paint_in(
             ui.invoke_trash_restore();
             app::land_reads();
         }
-        v if v.starts_with("rename-stranded") => stranded_scene(&ui, v)?,
+        v if v.starts_with("rename-stranded") || v.starts_with("toast-stack") => {
+            stranded_scene(&ui, v)?
+        }
         v if v.starts_with("context-menu")
             || v.starts_with("rename-")
             || v.starts_with("properties")
@@ -1457,7 +1461,9 @@ fn file_scene(ui: &AppWindow, view: &str, size: (u32, u32)) -> Result<()> {
 
 /// A case-only rename that ended under a hidden name: the toast names
 /// it, has no timer (so a long wait can't hide it), and only [Dismiss]
-/// (`-dismissed`) closes it.
+/// (`-dismissed`) closes it. `toast-stack` then copies a path so a newer
+/// toast sits on top of it; `toast-stack-restored` closes that newer
+/// toast and checks the sticky one is back with its filename.
 fn stranded_scene(ui: &AppWindow, view: &str) -> Result<()> {
     let check = |what: &str, got: String, want: &str| {
         if got == want {
@@ -1489,6 +1495,61 @@ fn stranded_scene(ui: &AppWindow, view: &str) -> Result<()> {
     if view == "rename-stranded-dismissed" {
         ui.invoke_toast_link();
         check("dismissed", ui.get_toast_on().to_string(), "false")?;
+        return Ok(());
+    }
+    if view == "toast-stack" || view == "toast-stack-restored" {
+        use crate::clipboard::Session;
+        app::fake_clipboard(
+            &["wl-copy"],
+            Session {
+                wayland: true,
+                x11: false,
+            },
+        );
+        // The original photo is now the hidden file; copy another path
+        // so a newer toast arrives on top of the sticky one.
+        let j = row_index(ui, "dune-sunset-0413.jpg")?;
+        ui.invoke_row_pointer(j, 0, 0, false, false, false);
+        ui.invoke_row_pointer(j, 2, 0, false, false, false);
+        ui.invoke_row_menu(j, 330.0, 150.0);
+        ui.invoke_file_menu_pick(menu_line(ui, "Copy path")?);
+        check("front", ui.get_toast_text().to_string(), "Copied 1 path")?;
+        check("under shown", ui.get_under_toast_on().to_string(), "true")?;
+        check(
+            "under",
+            ui.get_under_toast_text().to_string(),
+            app::STRANDED_HEAD,
+        )?;
+        check(
+            "under name",
+            ui.get_under_toast_pin().to_string(),
+            ".robin-rename-4127-0-dune-sunset-0412.jpg",
+        )?;
+        check(
+            "under action",
+            ui.get_under_toast_action().to_string(),
+            app::TOAST_DISMISS,
+        )?;
+        if view == "toast-stack-restored" {
+            app::expire_toast();
+            check(
+                "restored",
+                ui.get_toast_text().to_string(),
+                app::STRANDED_HEAD,
+            )?;
+            check(
+                "restored name",
+                ui.get_toast_pin().to_string(),
+                ".robin-rename-4127-0-dune-sunset-0412.jpg",
+            )?;
+            check(
+                "restored action",
+                ui.get_toast_action().to_string(),
+                app::TOAST_DISMISS,
+            )?;
+            check("still shown", ui.get_toast_on().to_string(), "true")?;
+            check("under gone", ui.get_under_toast_on().to_string(), "false")?;
+        }
     }
     Ok(())
 }

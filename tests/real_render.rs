@@ -111,6 +111,8 @@ fn scripted_views_render_through_the_real_app() {
         ("copy-path-no-tool", 800),
         ("rename-stranded", 800),
         ("rename-stranded-dismissed", 800),
+        ("toast-stack", 800),
+        ("toast-stack-restored", 800),
         // The 480px floor: the info panel floats, the filmstrip is cut
         // to the window, and the statistics cards stack.
         ("view-info", 480),
