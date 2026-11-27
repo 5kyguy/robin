@@ -102,6 +102,15 @@ pub fn known(view: &str) -> bool {
             | "copy-path-done"
             | "copy-path-no-tool"
             | "rename-stranded"
+            | "toast-stack"
+            | "toast-stack-restored"
+            | "toast-stack-two"
+            | "toast-stack-more"
+            | "toast-stack-expanded"
+            | "toast-stack-expanded-top"
+            | "toast-stack-expanded-bottom"
+            | "toast-stack-short"
+            | "toast-stack-wrap"
             | "menu-bg"
             | "shortcuts-browser"
             | "reduce-motion"
@@ -166,6 +175,7 @@ pub fn paint(view: &str, theme: &Theme, size: (u32, u32), out: &Path) -> Result<
         }
         file_menu_scene(&ui, view, size);
     }
+    crate::render::scroll_parked_stack(&ui, view);
     crate::render::snapshot(&ui, size, out)
 }
 
@@ -1332,41 +1342,117 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
             ui.set_rename_error(error.into());
             ui.set_rename_at(index(photo));
         }
-        "copy-path-done" | "copy-path-no-tool" | "rename-stranded" => {
+        "copy-path-done"
+        | "copy-path-no-tool"
+        | "rename-stranded"
+        | "toast-stack"
+        | "toast-stack-restored"
+        | "toast-stack-two"
+        | "toast-stack-more"
+        | "toast-stack-expanded"
+        | "toast-stack-expanded-top"
+        | "toast-stack-expanded-bottom"
+        | "toast-stack-short"
+        | "toast-stack-wrap" => {
             use crate::clipboard::{paths_toast, Outcome};
-            if view == "rename-stranded" {
-                select(&[photo]);
-            } else {
+            if view == "copy-path-done" || view == "copy-path-no-tool" {
                 // Two paths copied: two rows selected, and the status bar
                 // says so.
                 select(&[photo, "dune-sunset-0413.jpg"]);
                 ui.set_status_left("15 items · 1 hidden · 2 selected (12.2 MB)".into());
+            } else {
+                select(&[photo]);
             }
+            let hidden = ".robin-rename-4127-0-dune-sunset-0412.jpg";
+            let hidden_b = ".robin-rename-4127-0-dune-sunset-0413.jpg";
+            let stranded = ("danger", crate::app::STRANDED_HEAD.to_string());
             let (tone, text) = match view {
                 "copy-path-done" => paths_toast(&Outcome::Copied, 2),
                 "copy-path-no-tool" => paths_toast(&Outcome::NoTool, 2),
-                _ => ("danger", crate::app::STRANDED_HEAD.to_string()),
+                "toast-stack"
+                | "toast-stack-two"
+                | "toast-stack-more"
+                | "toast-stack-expanded"
+                | "toast-stack-expanded-top"
+                | "toast-stack-expanded-bottom"
+                | "toast-stack-short"
+                | "toast-stack-wrap" => paths_toast(&Outcome::Copied, 1),
+                _ => stranded.clone(),
             };
             ui.set_overlay("".into());
             ui.set_toast_on(true);
             ui.set_toast_tone(tone.into());
             ui.set_toast_glyph(crate::app::toast_glyph(tone).into());
             ui.set_toast_text(text.into());
+            let sticky = matches!(view, "rename-stranded" | "toast-stack-restored");
             ui.set_toast_action(
-                if view == "rename-stranded" {
+                if sticky {
                     crate::app::TOAST_DISMISS
                 } else {
                     ""
                 }
                 .into(),
             );
-            let details = if view == "rename-stranded" {
-                vec![".robin-rename-4127-0-dune-sunset-0412.jpg".to_string()]
+            let details = if sticky {
+                vec![hidden.to_string()]
             } else {
                 Vec::new()
             };
             crate::app::set_toast_rows(ui, &crate::app::detail_rows(&details, true, false));
-            ui.set_toast_open(view == "rename-stranded");
+            ui.set_toast_open(sticky);
+            if view == "toast-stack"
+                || view == "toast-stack-two"
+                || view == "toast-stack-more"
+                || view == "toast-stack-expanded"
+                || view == "toast-stack-expanded-top"
+                || view == "toast-stack-expanded-bottom"
+                || view == "toast-stack-short"
+                || view == "toast-stack-wrap"
+            {
+                // Parked sticky toasts stay fully visible under the newer
+                // one, 8px apart, with the hidden name in `text` and
+                // [Dismiss] still shown. Newest is nearest the current
+                // toast; older ones past the cap sit in parked-more.
+                let card = |name: &str| {
+                    crate::app::parked_card(&crate::toast::sticky(
+                        crate::app::STRANDED_HEAD,
+                        name,
+                        crate::app::TOAST_DISMISS,
+                    ))
+                };
+                let pin = |n: u32| format!(".robin-rename-4127-0-dune-sunset-041{n}.jpg");
+                // Newest first, matching bind_toasts.
+                let (parked, more, footer) = match view {
+                    "toast-stack-two" => (vec![card(hidden_b), card(hidden)], 0, ""),
+                    "toast-stack-more" => (
+                        vec![card(&pin(6)), card(&pin(5)), card(&pin(4))],
+                        2,
+                        "+2 more",
+                    ),
+                    "toast-stack-expanded"
+                    | "toast-stack-expanded-top"
+                    | "toast-stack-expanded-bottom" => (
+                        (2..=9).rev().map(|n| card(&pin(n))).collect(),
+                        0,
+                        crate::toast::SHOW_FEWER,
+                    ),
+                    "toast-stack-short" => (vec![card(&pin(6))], 4, "+4 more"),
+                    "toast-stack-wrap" => {
+                        let wrap = crate::app::parked_card(&crate::toast::Toast {
+                            tone: "danger".into(),
+                            text: crate::toast::WRAP_SAMPLE.into(),
+                            action: crate::app::TOAST_DISMISS.into(),
+                            sticky: true,
+                            ..crate::toast::Toast::default()
+                        });
+                        (vec![wrap], 0, "")
+                    }
+                    _ => (vec![card(hidden)], 0, ""),
+                };
+                ui.set_parked_toasts(ModelRc::new(Rc::new(VecModel::from(parked))));
+                ui.set_parked_more(more);
+                ui.set_parked_footer(footer.into());
+            }
         }
         "properties" => {
             select(&[photo]);

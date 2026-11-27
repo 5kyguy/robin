@@ -115,6 +115,17 @@ export struct Fact {
     value: string,
 }
 
+// A sticky toast parked under the one showing now (DESIGN §4).
+export struct ParkedToast {
+    text: string,
+    tone: string,
+    glyph: string,
+    action: string,
+    pin: string,
+    has-details: bool,
+    open: bool,
+}
+
 export struct StatDisk {
     name: string,
     mount: string,
@@ -1135,6 +1146,13 @@ export component AppWindow inherits Window {
     callback unlock-cancel();
     callback unlock-toggle();
     in property <bool> toast-open: false;
+    // Sticky toasts parked under the one showing now, newest first.
+    // At most three are drawn in full (one when the window is under
+    // 600px tall); older ones are counted in parked-more.
+    in property <[ParkedToast]> parked-toasts;
+    in property <int> parked-more: 0;
+    // "+N more" or "Show fewer"; empty when every sticky toast is shown.
+    in property <string> parked-footer: "";
     // "Copy 2 items to raw-exports" while a drag is over a folder.
     in property <string> drag-label: "";
     in property <string> drag-glyph: "󰆏";
@@ -1192,6 +1210,12 @@ export component AppWindow inherits Window {
     callback job-cancel();
     callback toast-link();
     callback toast-expand();
+    // [Dismiss] (or Cancel) on a parked sticky toast; the int is its
+    // index in parked-toasts (0 is the newest one currently drawn).
+    callback parked-toast-link(int);
+    // Expand or collapse the muted "+N more" / "Show fewer" line.
+    callback parked-more-expand();
+    callback parked-more-collapse();
     forward-focus: keys;
 
     title: "Robin";
@@ -1210,6 +1234,29 @@ export component AppWindow inherits Window {
     // Toasts sit 16px above the status bar, or above the progress strip
     // while it shows, so they never hide a job's progress or its Cancel.
     property <length> toast-floor: status-h + (job-on && !view-on ? 44px : 0px);
+    // Height of the parked sticky stack (and its footer), used to lift
+    // a timed toast 8px above it. The sticky stack itself sits 16px
+    // above toast-floor. The whole stack, including the current toast,
+    // is capped 16px below the toolbar.
+    out property <length> toast-stack-room: max(0px, root.height - toolbar-h - toast-floor - 32px);
+    out property <length> parked-stack-h: parked-stack.height;
+    // Parked-list scroll: 0 at the top, more negative as the list
+    // moves up. parked-scroll-min is the end of the overflow.
+    // The scrollbar is drawn only while the list overflows.
+    in-out property <length> parked-scroll: 0px;
+    out property <bool> parked-scrolls: parked-flick.viewport-height > parked-flick.height;
+    out property <length> parked-scroll-min: min(0px, parked-flick.height - parked-flick.viewport-height);
+    // Window-space geometry of the parked cards and the overflow bar.
+    // The bar sits 4px outside the right edge of the widest visible card,
+    // and stays vertically inside the list's clip.
+    out property <length> parked-card-right: parked-stack.x + parked-col.x + parked-col.width;
+    out property <length> parked-bar-x: parked-stack.x + parked-bar.x;
+    out property <length> parked-bar-y: parked-stack.y + parked-bar.y;
+    out property <length> parked-bar-h: parked-bar.height;
+    out property <length> parked-clip-y: parked-stack.y;
+    out property <length> parked-clip-h: flick-slot.height;
+    property <length> parked-budget: max(0px, toast-stack-room - (toast-on ? current-toast.height + 8px : 0px));
+    property <length> under-toast-stack: (parked-toasts.length > 0 || parked-footer != "") ? parked-stack.height + 8px : 0px;
     // Below 720px the sidebar folds to its icon rail on its own.
     property <bool> rail-on: collapsed || root.width < 720px;
     property <length> side-w: rail-on ? 52px : 232px;
@@ -2185,7 +2232,194 @@ export component AppWindow inherits Window {
         }
     }
 
-    if !harness && (toast-on || overlay == "skipped" || overlay == "skipped-details" || overlay == "toast-details"): Rectangle {
+    // Sticky toasts stack upward from 16px above the status bar or the
+    // progress strip, 8px apart, newest nearest the top. Older ones
+    // past the cap collapse into a muted "+N more" line under the stack.
+    parked-stack := Rectangle {
+        visible: !harness && (parked-toasts.length > 0 || parked-footer != "");
+        y: parent.height - toast-floor - 16px - self.height;
+        x: side-w;
+        width: parent.width - side-w;
+        property <length> footer-slot: parked-footer == "" ? 0px : 28px;
+        property <length> parked-natural: parked-col.preferred-height + footer-slot;
+        height: min(parked-natural, max(parked-budget, footer-slot));
+        VerticalLayout {
+            spacing: 8px;
+            width: 100%;
+            height: 100%;
+            // Clip in this rectangle (Flickable cannot take clip:) so a
+            // mid-toast cut fades into bg and a thin muted scrollbar can
+            // sit 4px outside the widest card, inside the list's clip.
+            flick-slot := Rectangle {
+                width: 100%;
+                vertical-stretch: 1;
+                clip: true;
+                parked-flick := Flickable {
+                    width: 100%;
+                    height: 100%;
+                    viewport-width: self.width;
+                    viewport-height: parked-col.preferred-height;
+                    viewport-y <=> root.parked-scroll;
+                    parked-col := VerticalLayout {
+                spacing: 8px;
+                alignment: start;
+                // Shrink-wrap to the widest card; the stack container is
+                // otherwise the full pane and would push the bar out over
+                // the Modified column.
+                x: (parent.width - self.width) / 2;
+                width: self.preferred-width;
+                for card[i] in parked-toasts: Rectangle {
+            property <color> tone: card.tone == "warning" ? warning : card.tone == "danger" ? danger : muted;
+            property <length> line-h: 20px;
+            property <length> acts-w: 96px;
+            property <length> pin-h: card.pin != "" ? line-h : 0px;
+            // The headline wraps to at most three lines, same as the
+            // current toast; the cap uses this real height.
+            property <length> head-h: min(80px, max(52px, parked-line.preferred-height + 28px));
+            property <length> card-w: min(max(520px, min(800px, parked-line.preferred-width + 42px + acts-w + 24px)), parked-flick.width - 32px);
+            horizontal-stretch: 0;
+            width: card-w;
+            height: card.open ? head-h + 12px + pin-h + 12px : head-h;
+            body := Rectangle {
+                width: 100%;
+                x: 0px;
+                height: parent.height;
+                background: surface;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: card.tone == "" || card.tone == "info" ? hairline : tone;
+                drop-shadow-blur: 16px;
+                drop-shadow-color: #000000.with-alpha(0.35);
+                if card.tone == "warning" || card.tone == "danger": Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    width: 4px;
+                    height: parent.height;
+                    border-top-left-radius: 8px;
+                    border-bottom-left-radius: 8px;
+                    background: tone;
+                }
+                Text {
+                    text: card.glyph;
+                    x: 16px;
+                    y: 0px;
+                    width: 18px;
+                    height: head-h;
+                    font-size: 14px;
+                    color: tone;
+                    vertical-alignment: center;
+                }
+                parked-line := Text {
+                    text: card.text;
+                    x: 42px;
+                    y: 0px;
+                    width: parent.width - 42px - acts-w - 24px;
+                    height: head-h;
+                    font-size: 13px;
+                    color: text;
+                    wrap: word-wrap;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: card.action;
+                    x: parent.width - 16px - self.width;
+                    y: 0px;
+                    width: 96px;
+                    height: head-h;
+                    font-size: 12px;
+                    color: accent;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.parked-toast-link(i); }
+                    }
+                }
+                if card.open && card.has-details: Rectangle {
+                    x: 16px;
+                    y: head-h;
+                    width: parent.width - 32px;
+                    height: 1px;
+                    background: hairline;
+                }
+                if card.open && card.pin != "": Text {
+                    x: 42px;
+                    y: head-h + 12px;
+                    width: parent.width - 58px;
+                    height: line-h;
+                    font-size: 11px;
+                    color: text;
+                    overflow: elide;
+                    vertical-alignment: center;
+                    text: card.pin;
+                }
+            }
+        }
+            }
+        }
+                property <length> flick-h: parked-flick.height;
+                property <length> content-h: parked-col.preferred-height;
+                property <length> overflow-h: max(0px, content-h - flick-h);
+                property <length> thumb-h: overflow-h > 0px && content-h > 0px ? max(24px, flick-h * (flick-h / content-h)) : 0px;
+                property <length> thumb-y: overflow-h > 0px ? (-parked-flick.viewport-y / overflow-h) * (flick-h - thumb-h) : 0px;
+                // Soften a mid-toast clip so the cut edge does not look
+                // like a missing border.
+                if root.parked-scrolls && parked-flick.viewport-y < -0.5px: Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    width: 100%;
+                    height: 24px;
+                    background: @linear-gradient(180deg, bg 0%, bg.with-alpha(0) 100%);
+                }
+                if root.parked-scrolls && content-h + parked-flick.viewport-y > flick-h + 0.5px: Rectangle {
+                    x: 0px;
+                    y: parent.height - 24px;
+                    width: 100%;
+                    height: 24px;
+                    background: @linear-gradient(180deg, bg.with-alpha(0) 0%, bg 100%);
+                }
+                // Thin muted thumb, only while the list overflows, 4px
+                // outside the widest visible card and inside the clip.
+                parked-bar := Rectangle {
+                    visible: root.parked-scrolls;
+                    x: parked-col.x + parked-col.width + 4px;
+                    y: thumb-y;
+                    width: 3px;
+                    height: thumb-h;
+                    border-radius: 1.5px;
+                    background: muted;
+                }
+            }
+        if parked-footer != "": Rectangle {
+            height: 20px;
+            width: 100%;
+            vertical-stretch: 0;
+            Text {
+                text: parked-footer;
+                width: 100%;
+                height: 100%;
+                font-size: 11px;
+                color: muted;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        if parked-footer == "Show fewer" {
+                            root.parked-more-collapse();
+                        } else {
+                            root.parked-more-expand();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    }
+
+    current-toast := Rectangle {
+        visible: !harness && (toast-on || overlay == "skipped" || overlay == "skipped-details" || overlay == "toast-details");
         property <bool> open: overlay == "skipped-details" || overlay == "toast-details" || toast-open;
         property <color> tone: toast-tone == "warning" ? warning : toast-tone == "danger" ? danger : muted;
         property <length> line-h: 20px;
@@ -2207,7 +2441,7 @@ export component AppWindow inherits Window {
         property <length> list-h: min(toast-expanded ? min(240px, rows-h) : rows-h, room);
         height: open ? head-h + 12px + pin-h + list-h + 12px : head-h;
         x: side-w + (parent.width - side-w - self.width) / 2;
-        y: parent.height - toast-floor - 16px - self.height;
+        y: parent.height - toast-floor - 16px - self.height - under-toast-stack;
         background: surface;
         border-radius: 8px;
         border-width: 1px;

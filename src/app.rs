@@ -22,6 +22,7 @@ use crate::fsops::{
 use crate::model::{Listing, Nav, SortDir, SortKey};
 use crate::ops::{self, Clipboard, Env, Job, JobKind, Mods, Op, Outcome, Progress, Trashed};
 use crate::safety::DirFd;
+use crate::toast::{Toast, ToastStack};
 use crate::{AppWindow, Columns, Error, GridLine, Mark, MarkRun, Result, Row};
 
 /// What the trash/delete dialog is asking about.
@@ -2742,12 +2743,8 @@ struct State {
     undo: Vec<Trashed>,
     /// Where the waiting job thread's conflict answer goes.
     reply: Option<mpsc::Sender<Option<ConflictChoice>>>,
-    toast_open: bool,
-    toast_gen: u64,
-    /// Every detail line of the toast, its pinned flag, and whether the
-    /// "+N more" was expanded.
-    toast_all: Vec<String>,
-    toast_pinned: bool,
+    /// The toast showing now, and any sticky toasts parked under it.
+    toasts: ToastStack,
     arm_timer: slint::Timer,
     /// Hides the viewer's chrome again after the mouse stops, when zoomed.
     chrome_timer: slint::Timer,
@@ -3955,10 +3952,20 @@ fn device_toast(
     kind: DeviceToast,
     secs: u64,
 ) {
-    bind_toast(ui, st, tone, text, Vec::new(), false, first);
-    ui.set_toast_action2(second.into());
-    ui.set_toast_action2_danger(second == "Force");
-    st.borrow_mut().dev.toast = Some(kind);
+    let toast = Toast {
+        tone: tone.into(),
+        text,
+        action: first.into(),
+        action2: second.into(),
+        action2_danger: second == "Force",
+        ..Toast::default()
+    };
+    {
+        let mut s = st.borrow_mut();
+        s.toasts.push(toast);
+        s.dev.toast = Some(kind);
+    }
+    bind_toasts(ui, st);
     hide_toast_after(ui, st, secs);
 }
 
@@ -4440,7 +4447,7 @@ fn device_toast_button(ui: &AppWindow, st: &Shared, second: bool) -> bool {
     let Some(kind) = st.borrow_mut().dev.toast.take() else {
         return false;
     };
-    ui.set_toast_on(false);
+    hide_front_toast(ui, st, false);
     match (kind, second) {
         (DeviceToast::Open(id), _) => open_drive(ui, st, &id, None),
         (DeviceToast::BusyOwn(id), false) => {
@@ -4880,10 +4887,7 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         cancel: None,
         undo: Vec::new(),
         reply: None,
-        toast_open: false,
-        toast_gen: 0,
-        toast_all: Vec::new(),
-        toast_pinned: false,
+        toasts: ToastStack::default(),
         arm_timer: slint::Timer::default(),
         chrome_timer: slint::Timer::default(),
         watch: None,
@@ -5088,6 +5092,9 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         if changed {
             redraw(&ui, &s);
         }
+        drop(s);
+        // Height can change how many sticky toasts are drawn in full.
+        bind_toasts(&ui, &st);
     });
     let w = ui.as_weak();
     let st = state.clone();
@@ -5287,8 +5294,11 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
     let st = state.clone();
     ui.on_toast_expand(move || {
         let Some(ui) = w.upgrade() else { return };
-        let s = st.borrow();
-        set_toast_rows(&ui, &detail_rows(&s.toast_all, s.toast_pinned, true));
+        let mut s = st.borrow_mut();
+        s.toasts.set_expanded(true);
+        if let Some(t) = s.toasts.current() {
+            set_toast_rows(&ui, &detail_rows(&t.details, t.pinned, true));
+        }
     });
     let w = ui.as_weak();
     let st = state.clone();
@@ -5429,23 +5439,55 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
             eject_drive(&ui, &st2, &id, false);
         }
     });
+    let (w3, st3) = (ui.as_weak(), state.clone());
+    ui.on_parked_toast_link(move |index| {
+        let Some(ui) = w3.upgrade() else { return };
+        let i = index.max(0) as usize;
+        let height = window_height(&ui);
+        let action = st3
+            .borrow()
+            .toasts
+            .visible_parked(height)
+            .get(i)
+            .map(|t| t.action.clone())
+            .unwrap_or_default();
+        if action == TOAST_DISMISS {
+            st3.borrow_mut().toasts.dismiss_visible(i, height);
+            bind_toasts(&ui, &st3);
+            return;
+        }
+        if action == DROP_WAIT_CANCEL {
+            cancel_drop_wait(&ui, &st3);
+        }
+    });
+    let (w_more, st_more) = (ui.as_weak(), state.clone());
+    ui.on_parked_more_expand(move || {
+        let Some(ui) = w_more.upgrade() else { return };
+        st_more.borrow_mut().toasts.set_stack_expanded(true);
+        bind_toasts(&ui, &st_more);
+    });
+    let (w_fewer, st_fewer) = (ui.as_weak(), state.clone());
+    ui.on_parked_more_collapse(move || {
+        let Some(ui) = w_fewer.upgrade() else { return };
+        st_fewer.borrow_mut().toasts.set_stack_expanded(false);
+        bind_toasts(&ui, &st_fewer);
+    });
     ui.on_toast_link(move || {
         let Some(ui) = w.upgrade() else { return };
         if device_toast_button(&ui, &st, false) {
             return;
         }
         if ui.get_toast_action() == TOAST_DISMISS {
-            st.borrow_mut().toast_open = false;
-            ui.set_toast_open(false);
-            ui.set_toast_on(false);
-            ui.set_toast_action("".into());
+            st.borrow_mut().toasts.dismiss();
+            bind_toasts(&ui, &st);
             return;
         }
         if ui.get_toast_details().row_count() > 0 || !ui.get_toast_pin().is_empty() {
             let open = {
                 let mut s = st.borrow_mut();
-                s.toast_open = !s.toast_open;
-                s.toast_open
+                let open = !s.toasts.current().is_some_and(|t| t.open);
+                s.toasts.set_open(open);
+                open
             };
             ui.set_toast_open(open);
             return;
@@ -5460,7 +5502,7 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         }
         // Restoring renames on the job thread like any other job, so a
         // slow drive never stalls the window.
-        ui.set_toast_on(false);
+        hide_front_toast(&ui, &st, true);
         apply(&ui, &st, Action::Run(Job::restore(items)));
     });
     Ok(ui)
@@ -5696,28 +5738,25 @@ fn tick_drop_wait(ui: &AppWindow, st: &Shared, now: std::time::Instant) {
     match tick {
         DropWaitTick::Hold => {}
         DropWaitTick::Clear => {
-            let hide = {
-                let s = st.borrow();
-                s.drop_wait_toast_gen != 0 && s.toast_gen == s.drop_wait_toast_gen
-            };
             st.borrow_mut().drop_wait_toast_gen = 0;
-            if hide {
-                ui.set_toast_on(false);
-                ui.set_toast_action("".into());
-            }
+            st.borrow_mut().toasts.drop_matching(|t| t.drop_wait);
+            bind_toasts(ui, st);
         }
         DropWaitTick::Toast => {
             let name = drop_wait_name_from(st);
-            show_toast_sticky(
+            push_toast(
                 ui,
                 st,
-                "info",
-                drop_wait_toast(&name),
-                Vec::new(),
-                false,
-                DROP_WAIT_CANCEL,
+                Toast {
+                    tone: "info".into(),
+                    text: drop_wait_toast(&name),
+                    action: DROP_WAIT_CANCEL.into(),
+                    sticky: true,
+                    drop_wait: true,
+                    ..Toast::default()
+                },
             );
-            let gen = st.borrow().toast_gen;
+            let gen = st.borrow().toasts.gen();
             st.borrow_mut().drop_wait_toast_gen = gen;
         }
         DropWaitTick::AutoCancel => {
@@ -5726,6 +5765,7 @@ fn tick_drop_wait(ui: &AppWindow, st: &Shared, now: std::time::Instant) {
             let mut s = st.borrow_mut();
             s.drop_wait = None;
             s.drop_wait_toast_gen = 0;
+            s.toasts.drop_matching(|t| t.drop_wait);
             drop(s);
             show_toast(
                 ui,
@@ -5748,9 +5788,9 @@ fn cancel_drop_wait(ui: &AppWindow, st: &Shared) {
     let mut s = st.borrow_mut();
     s.drop_wait = None;
     s.drop_wait_toast_gen = 0;
+    s.toasts.drop_matching(|t| t.drop_wait);
     drop(s);
-    ui.set_toast_on(false);
-    ui.set_toast_action("".into());
+    bind_toasts(ui, st);
 }
 
 /// The one-time neutral notice for a folder without a live watch.
@@ -7614,7 +7654,8 @@ pub const STRANDED_HEAD: &str = "Couldn't finish renaming. It's now this hidden 
 pub const TOAST_DISMISS: &str = "Dismiss";
 
 /// What the stranded-rename toast shows. It is sticky: no timer hides
-/// it, only [Dismiss] (or a newer toast).
+/// it, and a newer toast sits on top of it rather than replacing it.
+/// Only [Dismiss] removes it.
 pub struct StrandedToast {
     pub tone: &'static str,
     pub text: String,
@@ -7757,12 +7798,24 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
             redraw(ui, &st.borrow());
             // The hidden name is long: it gets the toast's pinned line,
             // which wraps, instead of being cut off in the headline.
-            // It stays (no timer) until [Dismiss]: it is the only place
-            // the hidden name is shown.
+            // It stays (no timer) until [Dismiss], even if a newer toast
+            // sits on top of it: it is the only place the hidden name
+            // is shown.
             let t = stranded_toast(&hidden);
-            show_toast_sticky(ui, st, t.tone, t.text, t.details, true, t.action);
-            st.borrow_mut().toast_open = true;
-            ui.set_toast_open(true);
+            push_toast(
+                ui,
+                st,
+                Toast {
+                    tone: t.tone.into(),
+                    text: t.text,
+                    details: t.details,
+                    pinned: true,
+                    action: t.action.into(),
+                    open: true,
+                    sticky: true,
+                    ..Toast::default()
+                },
+            );
             let ticket = st.borrow_mut().ctl.begin_refresh();
             start_read(ticket);
         }
@@ -8218,72 +8271,184 @@ fn show_toast(
     pinned: bool,
     action: &str,
 ) {
-    bind_toast(ui, st, tone, text, details, pinned, action);
-    let secs = if action.is_empty() && st.borrow().toast_all.is_empty() {
-        4
-    } else {
-        8
+    push_toast(
+        ui,
+        st,
+        Toast {
+            tone: tone.into(),
+            text,
+            details,
+            pinned,
+            action: action.into(),
+            ..Toast::default()
+        },
+    );
+    let secs = {
+        let s = st.borrow();
+        let empty = s
+            .toasts
+            .current()
+            .is_none_or(|t| t.action.is_empty() && t.details.is_empty());
+        if empty {
+            4
+        } else {
+            8
+        }
     };
     hide_toast_after(ui, st, secs);
 }
 
-/// Hide the toast showing now after `secs`, unless another replaced it
-/// or its details were opened.
+/// Hide the toast showing now after `secs`, unless another replaced it,
+/// its details were opened, or it is sticky. A parked sticky toast
+/// comes back when this one closes.
 fn hide_toast_after(ui: &AppWindow, st: &Shared, secs: u64) {
-    let gen = st.borrow().toast_gen;
+    let gen = st.borrow().toasts.gen();
     let w = ui.as_weak();
     let st = st.clone();
     slint::Timer::single_shot(Duration::from_secs(secs), move || {
-        let mut s = st.borrow_mut();
-        if s.toast_gen == gen && !s.toast_open {
-            s.undo.clear();
-            s.dev.toast = None;
-            if let Some(ui) = w.upgrade() {
-                ui.set_toast_on(false);
+        let Some(ui) = w.upgrade() else { return };
+        let changed = {
+            let mut s = st.borrow_mut();
+            if s.toasts.expire_if(gen) {
+                s.undo.clear();
+                s.dev.toast = None;
+                true
+            } else {
+                false
             }
+        };
+        if changed {
+            bind_toasts(&ui, &st);
         }
     });
 }
 
-/// A toast that stays until something else replaces it or the caller hides it.
-fn show_toast_sticky(
-    ui: &AppWindow,
-    st: &Shared,
-    tone: &str,
-    text: String,
-    details: Vec<String>,
-    pinned: bool,
-    action: &str,
-) {
-    bind_toast(ui, st, tone, text, details, pinned, action);
-}
-
-fn bind_toast(
-    ui: &AppWindow,
-    st: &Shared,
-    tone: &str,
-    text: String,
-    details: Vec<String>,
-    pinned: bool,
-    action: &str,
-) {
+/// Push a toast onto the stack and bind it. A sticky toast currently
+/// showing is parked underneath; a timed one is replaced.
+fn push_toast(ui: &AppWindow, st: &Shared, toast: Toast) {
     {
         let mut s = st.borrow_mut();
-        s.toast_gen += 1;
-        s.toast_open = false;
-        s.toast_all = details.clone();
-        s.toast_pinned = pinned;
+        s.toasts.push(toast);
         s.dev.toast = None;
     }
-    ui.set_toast_action2(SharedString::new());
-    ui.set_toast_action2_danger(false);
-    ui.set_toast_tone(tone.into());
-    ui.set_toast_glyph(toast_glyph(tone).into());
-    ui.set_toast_text(text.into());
-    set_toast_rows(ui, &detail_rows(&details, pinned, false));
-    ui.set_toast_action(action.into());
-    ui.set_toast_open(false);
-    ui.set_toast_on(true);
+    bind_toasts(ui, st);
+}
+
+/// Close the current toast and restore a parked sticky one, if any.
+fn hide_front_toast(ui: &AppWindow, st: &Shared, clear_undo: bool) {
+    {
+        let mut s = st.borrow_mut();
+        s.toasts.expire();
+        s.dev.toast = None;
+        if clear_undo {
+            s.undo.clear();
+        }
+    }
+    bind_toasts(ui, st);
+}
+
+/// For the render harness: the current toast's timer has fired.
+pub fn expire_toast() {
+    with_state(|ui, st| hide_front_toast(&ui, st, true));
+}
+
+/// For render scenes of a many-sticky stack: park these hidden-file
+/// toasts (oldest first), then a timed toast on top, and optionally
+/// expand the "+N more" line.
+pub fn seed_parked_stickies(pins: &[&str], timed: &str, expanded: bool) {
+    with_state(|ui, st| {
+        {
+            let mut s = st.borrow_mut();
+            s.toasts = crate::toast::ToastStack::default();
+            for pin in pins {
+                s.toasts
+                    .push(crate::toast::sticky(STRANDED_HEAD, pin, TOAST_DISMISS));
+            }
+            if !timed.is_empty() {
+                s.toasts.push(crate::toast::timed(timed));
+            }
+            s.toasts.set_stack_expanded(expanded);
+        }
+        bind_toasts(&ui, st);
+    });
+}
+
+/// For render scenes: replace the toast stack with these toasts (oldest
+/// first, last one current) and optionally expand the list.
+pub fn seed_toast_stack(toasts: Vec<crate::toast::Toast>, expanded: bool) {
+    with_state(|ui, st| {
+        {
+            let mut s = st.borrow_mut();
+            s.toasts = crate::toast::ToastStack::default();
+            for toast in toasts {
+                s.toasts.push(toast);
+            }
+            s.toasts.set_stack_expanded(expanded);
+        }
+        bind_toasts(&ui, st);
+    });
+}
+
+/// Bind the current toast and any sticky toast parked under it.
+fn bind_toasts(ui: &AppWindow, st: &Shared) {
+    let s = st.borrow();
+    match s.toasts.current() {
+        Some(t) => {
+            ui.set_toast_action2(t.action2.as_str().into());
+            ui.set_toast_action2_danger(t.action2_danger);
+            ui.set_toast_tone(t.tone.as_str().into());
+            ui.set_toast_glyph(toast_glyph(&t.tone).into());
+            ui.set_toast_text(t.text.as_str().into());
+            set_toast_rows(ui, &detail_rows(&t.details, t.pinned, t.expanded));
+            ui.set_toast_action(t.action.as_str().into());
+            ui.set_toast_open(t.open);
+            ui.set_toast_on(true);
+        }
+        None => {
+            ui.set_toast_on(false);
+            ui.set_toast_open(false);
+            ui.set_toast_action("".into());
+            ui.set_toast_action2("".into());
+            ui.set_toast_action2_danger(false);
+            set_toast_rows(ui, &detail_rows(&[], false, false));
+        }
+    }
+    // Newest parked toast first, so it sits just under the current one;
+    // the oldest of those shown is at the bottom.
+    let height = window_height(ui);
+    ui.set_parked_toasts(ModelRc::new(Rc::new(VecModel::from(
+        s.toasts
+            .visible_parked(height)
+            .iter()
+            .rev()
+            .map(parked_card)
+            .collect::<Vec<_>>(),
+    ))));
+    ui.set_parked_more(s.toasts.collapsed_count(height) as i32);
+    ui.set_parked_footer(s.toasts.footer(height).into());
+}
+
+/// Logical window height, for how many sticky toasts are drawn in full.
+fn window_height(ui: &AppWindow) -> i32 {
+    ui.window()
+        .size()
+        .to_logical(ui.window().scale_factor())
+        .height
+        .round() as i32
+}
+
+/// Bind one parked sticky toast, as the window draws it.
+pub fn parked_card(t: &Toast) -> crate::ParkedToast {
+    let rows = detail_rows(&t.details, t.pinned, t.expanded);
+    crate::ParkedToast {
+        text: t.text.as_str().into(),
+        tone: t.tone.as_str().into(),
+        glyph: toast_glyph(&t.tone).into(),
+        action: t.action.as_str().into(),
+        pin: rows.pin.as_str().into(),
+        has_details: rows.has_details(),
+        open: t.open,
+    }
 }
 
 /// Details shown before "+N more"; the pinned line doesn't count.

@@ -114,6 +114,15 @@ pub fn scripted(view: &str) -> bool {
             | "copy-path-no-tool"
             | "rename-stranded"
             | "rename-stranded-dismissed"
+            | "toast-stack"
+            | "toast-stack-restored"
+            | "toast-stack-two"
+            | "toast-stack-more"
+            | "toast-stack-expanded"
+            | "toast-stack-expanded-top"
+            | "toast-stack-expanded-bottom"
+            | "toast-stack-short"
+            | "toast-stack-wrap"
             | "devices-luks-locked"
             | "devices-luks-menu"
             | "devices-luks-unlock"
@@ -1455,7 +1464,9 @@ fn paint_in(
             ui.invoke_trash_restore();
             app::land_reads();
         }
-        v if v.starts_with("rename-stranded") => stranded_scene(&ui, v)?,
+        v if v.starts_with("rename-stranded") || v.starts_with("toast-stack") => {
+            stranded_scene(&ui, v)?
+        }
         v if v.starts_with("context-menu")
             || v.starts_with("rename-")
             || v.starts_with("properties")
@@ -1467,7 +1478,25 @@ fn paint_in(
         v if v.starts_with("phones-") => phone_scene(&ui, v, root, home, &fake)?,
         _ => {}
     }
+    scroll_parked_stack(&ui, view);
     snapshot(&ui, size, out)
+}
+
+/// After layout, scroll an expanded parked list to the top or the end
+/// so overflow frames show the muted scrollbar at each end.
+pub fn scroll_parked_stack(ui: &AppWindow, view: &str) {
+    if !matches!(
+        view,
+        "toast-stack-expanded" | "toast-stack-expanded-top" | "toast-stack-expanded-bottom"
+    ) {
+        return;
+    }
+    let _ = ui.show();
+    if view.ends_with("-bottom") {
+        ui.set_parked_scroll(ui.get_parked_scroll_min());
+    } else {
+        ui.set_parked_scroll(0.0);
+    }
 }
 
 /// Length of the fixture's speeder-run clip, as in the mock frames.
@@ -1770,8 +1799,15 @@ fn file_scene(ui: &AppWindow, view: &str, size: (u32, u32)) -> Result<()> {
 
 /// A case-only rename that ended under a hidden name: the toast names
 /// it, has no timer (so a long wait can't hide it), and only [Dismiss]
-/// (`-dismissed`) closes it.
+/// (`-dismissed`) closes it. `toast-stack` then copies a path so a newer
+/// toast sits on top of it; `toast-stack-restored` closes that newer
+/// toast and checks the sticky one is back with its filename.
+/// `toast-stack-two` strands a second file first, so two sticky toasts
+/// sit under the newer one. `toast-stack-more`, `-expanded` and
+/// `-short` seed five sticky toasts under a timed one to check the
+/// "+N more" cap, expanding the list, and the under-600 window.
 fn stranded_scene(ui: &AppWindow, view: &str) -> Result<()> {
+    use slint::Model;
     let check = |what: &str, got: String, want: &str| {
         if got == want {
             Ok(())
@@ -1779,6 +1815,19 @@ fn stranded_scene(ui: &AppWindow, view: &str) -> Result<()> {
             Err(Error::Message(format!("{what}: {got:?}, want {want:?}")))
         }
     };
+    if view == "toast-stack-wrap" {
+        return wrap_stack_scene(ui, check);
+    }
+    if matches!(
+        view,
+        "toast-stack-more"
+            | "toast-stack-expanded"
+            | "toast-stack-expanded-top"
+            | "toast-stack-expanded-bottom"
+            | "toast-stack-short"
+    ) {
+        return many_sticky_scene(ui, view, check);
+    }
     select_row(ui, "dune-sunset-0412.jpg");
     ui.invoke_key(app::keys::F2.into(), false, false, false);
     ui.show().map_err(|e| Error::Message(e.to_string()))?;
@@ -1802,6 +1851,340 @@ fn stranded_scene(ui: &AppWindow, view: &str) -> Result<()> {
     if view == "rename-stranded-dismissed" {
         ui.invoke_toast_link();
         check("dismissed", ui.get_toast_on().to_string(), "false")?;
+        return Ok(());
+    }
+    if view == "toast-stack-two" {
+        // A second case-only rename also gets stuck, so both hidden
+        // names sit in the stack before a newer toast arrives.
+        select_row(ui, "dune-sunset-0413.jpg");
+        ui.invoke_key(app::keys::F2.into(), false, false, false);
+        app::strand_renames(true);
+        type_field(ui, "Dune-sunset-0413");
+        type_field(ui, "\n");
+        app::strand_renames(false);
+        app::land_reads();
+        check(
+            "second",
+            ui.get_toast_text().to_string(),
+            app::STRANDED_HEAD,
+        )?;
+        check(
+            "second name",
+            ui.get_toast_pin().to_string(),
+            ".robin-rename-4127-0-dune-sunset-0413.jpg",
+        )?;
+        check(
+            "first parked",
+            parked_pin(ui, 0)?,
+            ".robin-rename-4127-0-dune-sunset-0412.jpg",
+        )?;
+    }
+    if view == "toast-stack" || view == "toast-stack-restored" || view == "toast-stack-two" {
+        use crate::clipboard::Session;
+        app::fake_clipboard(
+            &["wl-copy"],
+            Session {
+                wayland: true,
+                x11: false,
+            },
+        );
+        // The original photo is now the hidden file; copy another path
+        // so a newer toast arrives on top of the sticky one(s).
+        let copy = if view == "toast-stack-two" {
+            "palette.toml"
+        } else {
+            "dune-sunset-0413.jpg"
+        };
+        let j = row_index(ui, copy)?;
+        ui.invoke_row_pointer(j, 0, 0, false, false, false);
+        ui.invoke_row_pointer(j, 2, 0, false, false, false);
+        ui.invoke_row_menu(j, 330.0, 150.0);
+        ui.invoke_file_menu_pick(menu_line(ui, "Copy path")?);
+        check("front", ui.get_toast_text().to_string(), "Copied 1 path")?;
+        let n = if view == "toast-stack-two" { 2 } else { 1 };
+        check(
+            "parked",
+            ui.get_parked_toasts().row_count().to_string(),
+            &n.to_string(),
+        )?;
+        check("under", parked_text(ui, 0)?, app::STRANDED_HEAD)?;
+        check("under action", parked_action(ui, 0)?, app::TOAST_DISMISS)?;
+        if view == "toast-stack-two" {
+            // Newest parked toast sits just under the current one.
+            check(
+                "under newer",
+                parked_pin(ui, 0)?,
+                ".robin-rename-4127-0-dune-sunset-0413.jpg",
+            )?;
+            check(
+                "under older",
+                parked_pin(ui, 1)?,
+                ".robin-rename-4127-0-dune-sunset-0412.jpg",
+            )?;
+        } else {
+            check(
+                "under name",
+                parked_pin(ui, 0)?,
+                ".robin-rename-4127-0-dune-sunset-0412.jpg",
+            )?;
+        }
+        if view == "toast-stack-restored" {
+            app::expire_toast();
+            check(
+                "restored",
+                ui.get_toast_text().to_string(),
+                app::STRANDED_HEAD,
+            )?;
+            check(
+                "restored name",
+                ui.get_toast_pin().to_string(),
+                ".robin-rename-4127-0-dune-sunset-0412.jpg",
+            )?;
+            check(
+                "restored action",
+                ui.get_toast_action().to_string(),
+                app::TOAST_DISMISS,
+            )?;
+            check("still shown", ui.get_toast_on().to_string(), "true")?;
+            check(
+                "under gone",
+                ui.get_parked_toasts().row_count().to_string(),
+                "0",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn parked_text(ui: &AppWindow, i: usize) -> Result<String> {
+    use slint::Model;
+    ui.get_parked_toasts()
+        .row_data(i)
+        .map(|c| c.text.to_string())
+        .ok_or_else(|| Error::Message(format!("no parked toast {i}")))
+}
+
+fn parked_pin(ui: &AppWindow, i: usize) -> Result<String> {
+    use slint::Model;
+    ui.get_parked_toasts()
+        .row_data(i)
+        .map(|c| c.pin.to_string())
+        .ok_or_else(|| Error::Message(format!("no parked toast {i}")))
+}
+
+fn parked_action(ui: &AppWindow, i: usize) -> Result<String> {
+    use slint::Model;
+    ui.get_parked_toasts()
+        .row_data(i)
+        .map(|c| c.action.to_string())
+        .ok_or_else(|| Error::Message(format!("no parked toast {i}")))
+}
+
+fn hidden_pin(n: u32) -> String {
+    format!(".robin-rename-4127-0-dune-sunset-041{n}.jpg")
+}
+
+/// A parked lock-failed toast under a newer timed one: the message
+/// wraps to two lines, and the stack cap uses that real height.
+fn wrap_stack_scene(
+    ui: &AppWindow,
+    check: impl Fn(&str, String, &str) -> Result<()>,
+) -> Result<()> {
+    use slint::Model;
+    app::seed_toast_stack(
+        vec![
+            crate::toast::Toast {
+                tone: "danger".into(),
+                text: crate::toast::WRAP_SAMPLE.into(),
+                action: app::TOAST_DISMISS.into(),
+                sticky: true,
+                ..crate::toast::Toast::default()
+            },
+            crate::toast::timed("Copied 1 path"),
+        ],
+        false,
+    );
+    check("front", ui.get_toast_text().to_string(), "Copied 1 path")?;
+    check(
+        "parked",
+        ui.get_parked_toasts().row_count().to_string(),
+        "1",
+    )?;
+    check("under", parked_text(ui, 0)?, crate::toast::WRAP_SAMPLE)?;
+    check("under action", parked_action(ui, 0)?, app::TOAST_DISMISS)?;
+    ui.show().map_err(|e| Error::Message(e.to_string()))?;
+    let parked = ui.get_parked_stack_h();
+    if parked <= 52.0 || parked > 80.0 {
+        return Err(Error::Message(format!(
+            "wrapped parked height {parked}, want between 52 and 80"
+        )));
+    }
+    let room = ui.get_toast_stack_room();
+    let current = 52.0;
+    if parked + 8.0 + current > room + 1.0 {
+        return Err(Error::Message(format!(
+            "stack cap: parked {parked} + current {current} + 8 > room {room}"
+        )));
+    }
+    check_parked_scrollbar(ui, false)?;
+    Ok(())
+}
+
+/// Sticky hidden-file toasts under a timed one: three shown and
+/// "+N more" at full height, the full list after expand (eight toasts,
+/// capped and scrolling, with "Show fewer"), or one shown and "+4 more"
+/// when the window is under 600px tall.
+fn many_sticky_scene(
+    ui: &AppWindow,
+    view: &str,
+    check: impl Fn(&str, String, &str) -> Result<()>,
+) -> Result<()> {
+    use slint::Model;
+    let expanded = matches!(
+        view,
+        "toast-stack-expanded" | "toast-stack-expanded-top" | "toast-stack-expanded-bottom"
+    );
+    let last = if expanded { 9 } else { 6 };
+    let pins: Vec<String> = (2..=last).map(hidden_pin).collect();
+    let pin_refs: Vec<&str> = pins.iter().map(String::as_str).collect();
+    app::seed_parked_stickies(&pin_refs, "Copied 1 path", false);
+    check("front", ui.get_toast_text().to_string(), "Copied 1 path")?;
+    if view == "toast-stack-short" {
+        check(
+            "parked",
+            ui.get_parked_toasts().row_count().to_string(),
+            "1",
+        )?;
+        check("more", ui.get_parked_more().to_string(), "4")?;
+        check("footer", ui.get_parked_footer().to_string(), "+4 more")?;
+        check("under newer", parked_pin(ui, 0)?, &hidden_pin(6))?;
+        check("under action", parked_action(ui, 0)?, app::TOAST_DISMISS)?;
+        ui.show().map_err(|e| Error::Message(e.to_string()))?;
+        check_parked_scrollbar(ui, false)?;
+        return Ok(());
+    }
+    let more = if expanded { 5 } else { 2 };
+    check(
+        "parked",
+        ui.get_parked_toasts().row_count().to_string(),
+        "3",
+    )?;
+    check("more", ui.get_parked_more().to_string(), &more.to_string())?;
+    check(
+        "footer",
+        ui.get_parked_footer().to_string(),
+        &format!("+{more} more"),
+    )?;
+    check("under newer", parked_pin(ui, 0)?, &hidden_pin(last))?;
+    check("under mid", parked_pin(ui, 1)?, &hidden_pin(last - 1))?;
+    check("under older", parked_pin(ui, 2)?, &hidden_pin(last - 2))?;
+    check("under action", parked_action(ui, 0)?, app::TOAST_DISMISS)?;
+    if expanded {
+        ui.invoke_parked_more_expand();
+        check(
+            "expanded",
+            ui.get_parked_toasts().row_count().to_string(),
+            "8",
+        )?;
+        check("more gone", ui.get_parked_more().to_string(), "0")?;
+        check(
+            "fewer",
+            ui.get_parked_footer().to_string(),
+            crate::toast::SHOW_FEWER,
+        )?;
+        check("top", parked_pin(ui, 0)?, &hidden_pin(9))?;
+        check("bottom", parked_pin(ui, 7)?, &hidden_pin(2))?;
+        check(
+            "still front",
+            ui.get_toast_text().to_string(),
+            "Copied 1 path",
+        )?;
+        ui.show().map_err(|e| Error::Message(e.to_string()))?;
+        let room = ui.get_toast_stack_room();
+        let parked = ui.get_parked_stack_h();
+        let current = 52.0;
+        if parked + 8.0 + current > room + 1.0 {
+            return Err(Error::Message(format!(
+                "stack cap: parked {parked} + current {current} + 8 > room {room}"
+            )));
+        }
+        if (room - crate::toast::stack_room(800, 46, 26) as f32).abs() > 1.0 {
+            return Err(Error::Message(format!(
+                "toast-stack-room: {room}, want {}",
+                crate::toast::stack_room(800, 46, 26)
+            )));
+        }
+        check_parked_scrollbar(ui, true)?;
+        if view.ends_with("-bottom") {
+            ui.set_parked_scroll(ui.get_parked_scroll_min());
+            let got = ui.get_parked_scroll();
+            let want = ui.get_parked_scroll_min();
+            if (got - want).abs() > 1.0 {
+                return Err(Error::Message(format!(
+                    "parked-scroll: {got}, want end {want}"
+                )));
+            }
+        } else {
+            ui.set_parked_scroll(0.0);
+        }
+        // Still overflowing after the scroll, so the bar stays visible.
+        check_parked_scrollbar(ui, true)?;
+        return Ok(());
+    }
+    // Collapsed stacks (three shown, or one in a short window) fit in
+    // the cap, so the scrollbar stays hidden.
+    ui.show().map_err(|e| Error::Message(e.to_string()))?;
+    check_parked_scrollbar(ui, false)?;
+    Ok(())
+}
+
+/// The parked list's thin scrollbar is shown only while the list overflows.
+fn check_parked_scrollbar(ui: &AppWindow, overflows: bool) -> Result<()> {
+    let shown = ui.get_parked_scrolls();
+    if shown != overflows {
+        return Err(Error::Message(format!(
+            "parked-scrolls: {shown}, want overflow={overflows}"
+        )));
+    }
+    let min = ui.get_parked_scroll_min();
+    if overflows && min >= 0.0 {
+        return Err(Error::Message(format!(
+            "overflow with non-negative parked-scroll-min {min}"
+        )));
+    }
+    if !overflows && min < -1.0 {
+        return Err(Error::Message(format!(
+            "no overflow but parked-scroll-min is {min}"
+        )));
+    }
+    if overflows {
+        check_parked_bar_placement(ui)?;
+    }
+    Ok(())
+}
+
+/// The overflow bar sits 4px outside the widest visible card and stays
+/// vertically inside the list's clip area.
+fn check_parked_bar_placement(ui: &AppWindow) -> Result<()> {
+    let card_right = ui.get_parked_card_right();
+    let bar_x = ui.get_parked_bar_x();
+    let bar_y = ui.get_parked_bar_y();
+    let bar_h = ui.get_parked_bar_h();
+    let clip_y = ui.get_parked_clip_y();
+    let clip_h = ui.get_parked_clip_h();
+    let want_x = card_right + 4.0;
+    if (bar_x - want_x).abs() > 1.0 {
+        return Err(Error::Message(format!(
+            "parked-bar x: {bar_x}, want card-right {card_right} + 4 = {want_x}"
+        )));
+    }
+    if bar_h <= 0.0 {
+        return Err(Error::Message(format!("parked-bar height {bar_h}")));
+    }
+    if bar_y < clip_y - 1.0 || bar_y + bar_h > clip_y + clip_h + 1.0 {
+        return Err(Error::Message(format!(
+            "parked-bar y={bar_y} h={bar_h} outside clip y={clip_y} h={clip_h}"
+        )));
     }
     Ok(())
 }

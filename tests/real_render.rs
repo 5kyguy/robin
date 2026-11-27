@@ -133,6 +133,15 @@ fn scripted_views_render_through_the_real_app() {
         ("copy-path-no-tool", 800),
         ("rename-stranded", 800),
         ("rename-stranded-dismissed", 800),
+        ("toast-stack", 800),
+        ("toast-stack-restored", 800),
+        ("toast-stack-two", 800),
+        ("toast-stack-more", 800),
+        ("toast-stack-expanded", 800),
+        ("toast-stack-expanded-top", 800),
+        ("toast-stack-expanded-bottom", 800),
+        ("toast-stack-short", 800),
+        ("toast-stack-wrap", 800),
         // The 480px floor: the info panel floats, the filmstrip is cut
         // to the window, and the statistics cards stack.
         ("view-info", 480),
@@ -141,6 +150,19 @@ fn scripted_views_render_through_the_real_app() {
         ("trash-empty-confirm", 480),
     ];
     for (view, width) in scenes {
+        // The sticky-stack collapse cap is 3 at 800px tall and 1 under 600.
+        // toast-stack-short stays at 500 so it exercises the short window.
+        let height: u32 = match view {
+            "toast-stack"
+            | "toast-stack-restored"
+            | "toast-stack-two"
+            | "toast-stack-more"
+            | "toast-stack-expanded"
+            | "toast-stack-expanded-top"
+            | "toast-stack-expanded-bottom"
+            | "toast-stack-wrap" => 800,
+            _ => 500,
+        };
         let out = dir.join(format!("{view}-{width}.png"));
         let fixture = dir.join(format!("home-{view}-{width}"));
         let status = Command::new(env!("CARGO_BIN_EXE_robin"))
@@ -148,7 +170,7 @@ fn scripted_views_render_through_the_real_app() {
                 "--render",
                 view,
                 "--size",
-                &format!("{width}x500"),
+                &format!("{width}x{height}"),
                 "--fixture",
             ])
             .arg(&fixture)
@@ -158,7 +180,7 @@ fn scripted_views_render_through_the_real_app() {
             .unwrap();
         assert!(status.success(), "{view}: {status}");
         let img = image::open(&out).unwrap();
-        assert_eq!((img.width(), img.height()), (width, 500), "{view}");
+        assert_eq!((img.width(), img.height()), (width, height), "{view}");
         if (view, width) == ("view-info", 480) {
             // The floating panel stops above the filmstrip: the current
             // tile's accent ring (strip at y 366..426) is still drawn.
