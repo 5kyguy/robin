@@ -261,15 +261,19 @@ impl std::fmt::Debug for Passphrase {
 /// Failed to activate device: …"). It never contains the passphrase:
 /// the error UDisks2 sends doesn't either.
 ///
-/// Only LUKS (`luks`) gets "Wrong passphrase": a BitLocker or TrueCrypt
-/// volume that refuses the key may want a PIM, a hidden volume or a
-/// keyfile this dialog can't give, so it gets a neutral line instead.
-pub fn unlock_error_text(name: &str, e: &DeviceError, luks: bool) -> String {
+/// Only LUKS gets "Wrong passphrase". A TrueCrypt volume that refuses
+/// the key may want a PIM, a hidden volume or a keyfile this dialog
+/// can't give, so it says so; BitLocker (and anything else) gets a
+/// neutral line.
+pub fn unlock_error_text(name: &str, e: &DeviceError, crypto: Crypto) -> String {
     match e {
-        DeviceError::WrongPassphrase if !luks => {
-            format!("Couldn't unlock {name} with this passphrase")
-        }
-        DeviceError::WrongPassphrase => "Wrong passphrase. Try again.".into(),
+        DeviceError::WrongPassphrase => match crypto {
+            Crypto::Luks => "Wrong passphrase. Try again.".into(),
+            Crypto::TrueCrypt => format!(
+                "Couldn't unlock {name}. This TrueCrypt volume may need options Robin doesn't support."
+            ),
+            Crypto::Other => format!("Couldn't unlock {name} with this passphrase"),
+        },
         DeviceError::NotAuthorized(m) if m.to_lowercase().contains("dismissed") => {
             "Authentication was cancelled".into()
         }
@@ -300,10 +304,27 @@ pub fn unlock_error_text(name: &str, e: &DeviceError, luks: bool) -> String {
     }
 }
 
-/// Whether a block's IdType is LUKS (1 or 2), not BitLocker
-/// ("BitLocker") or TrueCrypt / VeraCrypt ("crypto_TCRYPT").
-pub fn is_luks(id_type: &str) -> bool {
-    id_type == "crypto_LUKS"
+/// Which kind of encrypted volume a locked block is, by its IdType; it
+/// decides what a refused key says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Crypto {
+    /// "crypto_LUKS", LUKS 1 or 2.
+    #[default]
+    Luks,
+    /// "crypto_TCRYPT", TrueCrypt or VeraCrypt.
+    TrueCrypt,
+    /// "BitLocker", or a type UDisks2 has no name for.
+    Other,
+}
+
+impl Crypto {
+    pub fn of(id_type: &str) -> Self {
+        match id_type {
+            "crypto_LUKS" => Crypto::Luks,
+            "crypto_TCRYPT" => Crypto::TrueCrypt,
+            _ => Crypto::Other,
+        }
+    }
 }
 
 /// UDisks2's message less its "Error unlocking /dev/sdb1: " and
@@ -2237,7 +2258,7 @@ mod tests {
         let e = fake.unlock("sdb1", &Passphrase::new(WRONG)).unwrap_err();
         assert_eq!(e, DeviceError::WrongPassphrase);
         assert_eq!(
-            unlock_error_text("SANDISK", &e, true),
+            unlock_error_text("SANDISK", &e, Crypto::Luks),
             "Wrong passphrase. Try again."
         );
         assert!(fake.drives().unwrap()[0].locked);
@@ -2262,7 +2283,7 @@ mod tests {
         fake.plug(d);
         let e = fake.unlock("sdb1", &Passphrase::new(RIGHT)).unwrap_err();
         assert_eq!(
-            unlock_error_text("SANDISK", &e, true),
+            unlock_error_text("SANDISK", &e, Crypto::Luks),
             "Not enough free memory to unlock SANDISK"
         );
         assert!(fake.drives().unwrap()[0].locked, "still locked");
@@ -2271,7 +2292,8 @@ mod tests {
 
     #[test]
     fn udisks_unlock_messages_map_to_plain_words() {
-        let t = |m: &str| unlock_error_text("SANDISK", &DeviceError::Failed(m.into()), true);
+        let t =
+            |m: &str| unlock_error_text("SANDISK", &DeviceError::Failed(m.into()), Crypto::Luks);
         assert!(wrong_passphrase(
             "Error unlocking /dev/sdb1: Failed to activate device: Incorrect passphrase."
         ));
@@ -2299,12 +2321,16 @@ mod tests {
             unlock_error_text(
                 "SANDISK",
                 &DeviceError::NotAuthorized("dismissed".into()),
-                true
+                Crypto::Luks
             ),
             "Authentication was cancelled"
         );
         assert_eq!(
-            unlock_error_text("SANDISK", &DeviceError::NotAuthorized(String::new()), true),
+            unlock_error_text(
+                "SANDISK",
+                &DeviceError::NotAuthorized(String::new()),
+                Crypto::Luks
+            ),
             "You aren't allowed to unlock SANDISK"
         );
     }
@@ -2495,26 +2521,30 @@ mod tests {
     }
 
     #[test]
-    fn only_luks_says_wrong_passphrase() {
+    fn a_refused_key_reads_by_volume_type() {
         let e = DeviceError::WrongPassphrase;
-        assert!(is_luks("crypto_LUKS"));
-        for id_type in ["BitLocker", "crypto_TCRYPT"] {
-            assert!(!is_luks(id_type));
-        }
+        let t = |id_type: &str| unlock_error_text("SANDISK", &e, Crypto::of(id_type));
+        assert_eq!(t("crypto_LUKS"), "Wrong passphrase. Try again.");
         assert_eq!(
-            unlock_error_text("SANDISK", &e, false),
+            t("crypto_TCRYPT"),
+            "Couldn't unlock SANDISK. This TrueCrypt volume may need options Robin doesn't support."
+        );
+        assert_eq!(
+            t("BitLocker"),
             "Couldn't unlock SANDISK with this passphrase"
         );
         assert_eq!(
-            unlock_error_text("SANDISK", &e, true),
-            "Wrong passphrase. Try again."
+            t("crypto_unknown"),
+            "Couldn't unlock SANDISK with this passphrase"
         );
         // Other failures read the same whatever the volume.
         let oom = DeviceError::Failed("Failed to activate device: Cannot allocate memory".into());
-        assert_eq!(
-            unlock_error_text("SANDISK", &oom, false),
-            unlock_error_text("SANDISK", &oom, true)
-        );
+        for c in [Crypto::Luks, Crypto::TrueCrypt, Crypto::Other] {
+            assert_eq!(
+                unlock_error_text("SANDISK", &oom, c),
+                "Not enough free memory to unlock SANDISK"
+            );
+        }
     }
 
     #[test]
@@ -2531,7 +2561,10 @@ mod tests {
         assert_eq!(row.fs_type, "crypto_TCRYPT");
         let e = fake.unlock("sdb1", &Passphrase::new(WRONG)).unwrap_err();
         assert_eq!(e, DeviceError::WrongPassphrase);
-        assert_clean("the error", &unlock_error_text("SANDISK", &e, false));
+        assert_clean(
+            "the error",
+            &unlock_error_text("SANDISK", &e, Crypto::of(&row.fs_type)),
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

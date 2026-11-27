@@ -2858,9 +2858,9 @@ pub struct Unlocking {
     /// The eye: the field draws what was typed instead of dots. Only how
     /// the field draws; the text itself never leaves it.
     pub shown: bool,
-    /// LUKS, rather than BitLocker or TrueCrypt: only LUKS says for sure
-    /// that a refused key was the wrong passphrase.
-    pub luks: bool,
+    /// LUKS, TrueCrypt or BitLocker: only LUKS says for sure that a
+    /// refused key was the wrong passphrase.
+    pub crypto: crate::devices::Crypto,
 }
 
 /// The buttons on a device toast, by drive id.
@@ -4050,7 +4050,7 @@ fn open_unlock(ui: &AppWindow, st: &Shared, d: &crate::devices::Drive) {
         s.dev.unlock = Some(Unlocking {
             id: d.id.clone(),
             name: drive_name(d),
-            luks: crate::devices::is_luks(&d.fs_type),
+            crypto: crate::devices::Crypto::of(&d.fs_type),
             ..Unlocking::default()
         });
     }
@@ -4145,7 +4145,7 @@ fn unlock_landed(
                 let mut s = st.borrow_mut();
                 if let Some(u) = s.dev.unlock.as_mut().filter(|u| u.id == id) {
                     u.busy = false;
-                    u.error = crate::devices::unlock_error_text(name, &e, u.luks);
+                    u.error = crate::devices::unlock_error_text(name, &e, u.crypto);
                     u.select += 1;
                 }
             }

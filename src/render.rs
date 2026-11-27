@@ -130,6 +130,7 @@ pub fn scripted(view: &str) -> bool {
             | "devices-luks-shown"
             | "devices-luks-unlocked-row"
             | "devices-luks-truecrypt-wrong"
+            | "devices-luks-bitlocker-wrong"
     )
 }
 
@@ -185,6 +186,9 @@ fn luks_sandisk(root: &Path, view: &str) -> crate::devices::FakeDrive {
         }
         if view == "devices-luks-truecrypt-wrong" {
             l.id_type = "crypto_TCRYPT".into();
+        }
+        if view == "devices-luks-bitlocker-wrong" {
+            l.id_type = "BitLocker".into();
         }
     }
     d
@@ -424,12 +428,18 @@ fn luks_scene(ui: &AppWindow, view: &str, fake: &crate::devices::FakeDevices) ->
             clean(fake)?;
         }
         // TrueCrypt may want options the dialog can't give, so a refused
-        // key reads neutral, not "Wrong passphrase".
-        "devices-luks-truecrypt-wrong" => {
+        // key says so (wrapped to two lines); BitLocker's reads neutral.
+        // Neither says "Wrong passphrase".
+        "devices-luks-truecrypt-wrong" | "devices-luks-bitlocker-wrong" => {
             open_dialog(ui)?;
             submit(ui, wrong);
             let got = ui.get_unlock_error().to_string();
-            if got != "Couldn't unlock SANDISK with this passphrase" {
+            let want = if view == "devices-luks-truecrypt-wrong" {
+                "Couldn't unlock SANDISK. This TrueCrypt volume may need options Robin doesn't support."
+            } else {
+                "Couldn't unlock SANDISK with this passphrase"
+            };
+            if got != want {
                 return fail(format!("error {got:?}"));
             }
             clean(fake)?;

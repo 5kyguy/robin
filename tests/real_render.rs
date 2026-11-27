@@ -91,6 +91,8 @@ fn scripted_views_render_through_the_real_app() {
         ("devices-luks-shown", 480),
         ("devices-luks-unlocked-row", 800),
         ("devices-luks-truecrypt-wrong", 800),
+        ("devices-luks-truecrypt-wrong", 480),
+        ("devices-luks-bitlocker-wrong", 800),
         ("phones-plugged", 800),
         ("phones-row", 800),
         ("phones-waiting", 800),
