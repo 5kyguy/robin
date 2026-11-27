@@ -1116,11 +1116,20 @@ export component AppWindow inherits Window {
     in property <[MenuItem]> device-menu-items;
     in property <length> menu-at-x: 0px;
     in property <length> menu-at-y: 0px;
-    // The LUKS unlock dialog (mock only): the typed passphrase as dots,
-    // and the inline error after a wrong one.
+    // The LUKS unlock dialog. `unlock-text` is the mock's stand-in
+    // passphrase (masked like the live field, which never binds to it);
+    // the error shows inline after a wrong one or another failure.
     in property <string> unlock-name: "";
     in property <string> unlock-text: "";
     in property <string> unlock-error: "";
+    // An unlock is with UDisks2: [Unlock] reads "Unlocking…", the field
+    // is read-only and [Cancel], Esc and the scrim do nothing.
+    in property <bool> unlock-busy: false;
+    // Bumped after a failure to select the whole field again.
+    in property <int> unlock-select: 0;
+    // [Unlock] or Enter with what is typed; [Cancel] or Esc.
+    callback unlock-submit(string);
+    callback unlock-cancel();
     in property <bool> toast-open: false;
     // "Copy 2 items to raw-exports" while a drag is over a folder.
     in property <string> drag-label: "";
@@ -2697,15 +2706,19 @@ export component AppWindow inherits Window {
         }
     }
 
-    // Unlock an encrypted drive (DESIGN §4): 400 wide, a passphrase
-    // field, [Cancel] [Unlock]; a wrong passphrase shows inline in
-    // `danger`. Drawn by --render-mock only in this release.
-    if !harness && overlay == "unlock": Rectangle {
+    // Unlock an encrypted drive (DESIGN §4): min(400, window − 32) wide,
+    // a masked passphrase field, [Cancel] [Unlock]; a failure shows
+    // inline in `danger` under the field, which keeps what was typed,
+    // selected. `unlock` is the --render-mock frame, `unlock-live` the
+    // real dialog. The field is the only place the passphrase lives
+    // until [Unlock] hands it over; it goes when the dialog closes.
+    if !harness && (overlay == "unlock" || overlay == "unlock-live"): Rectangle {
+        property <bool> live: overlay == "unlock-live";
         background: #000000.with-alpha(0.6);
         TouchArea { }
         Rectangle {
             width: min(400px, parent.width - 32px);
-            height: unlock-error != "" ? 196px : 172px;
+            height: unlock-error != "" ? 202px : 178px;
             x: (parent.width - self.width) / 2;
             y: max(0px, (parent.height - self.height) / 2);
             background: surface;
@@ -2719,22 +2732,83 @@ export component AppWindow inherits Window {
                 x: 20px;
                 y: 74px;
                 width: parent.width - 40px;
-                height: 30px;
+                // DESIGN §4: a 36px field.
+                height: 36px;
                 border-radius: 6px;
                 background: bg;
                 border-width: unlock-error != "" ? 1px : 2px;
                 border-color: unlock-error != "" ? danger : accent;
-                Text {
+                opacity: unlock-busy ? 0.6 : 1;
+                unlock-keys := FocusScope {
                     x: 10px;
                     width: parent.width - 20px;
                     height: parent.height;
-                    text: unlock-text == "" ? "Passphrase" : unlock-text;
-                    font-size: 12px;
-                    color: unlock-text == "" ? muted : text;
-                    vertical-alignment: center;
+                    // A failure selects the whole field for a retype.
+                    property <int> select: root.unlock-select;
+                    changed select => {
+                        unlock-field.select-all();
+                        unlock-field.focus();
+                    }
+                    capture-key-pressed(e) => {
+                        if e.text == Key.Escape {
+                            root.unlock-cancel();
+                            return accept;
+                        }
+                        // Tab would hand the keys to the window behind.
+                        if e.text == Key.Tab || e.text == Key.Backtab {
+                            return accept;
+                        }
+                        // Nothing copies a passphrase out, masked or not.
+                        if e.modifiers.control && (e.text == "c" || e.text == "C" || e.text == "x" || e.text == "X" || e.text == Key.Insert) {
+                            return accept;
+                        }
+                        if e.modifiers.shift && e.text == Key.Delete {
+                            return accept;
+                        }
+                        return reject;
+                    }
+                    unlock-field := TextInput {
+                        width: parent.width;
+                        height: parent.height;
+                        // The mock's dots are masked text too, so both
+                        // frames draw the same bullets.
+                        text: root.unlock-text;
+                        input-type: password;
+                        font-size: 12px;
+                        color: text;
+                        selection-background-color: accent.with-alpha(0.45);
+                        selection-foreground-color: text;
+                        vertical-alignment: center;
+                        single-line: true;
+                        read-only: !live || root.unlock-busy;
+                        init => {
+                            if live {
+                                self.focus();
+                            }
+                        }
+                        accepted => {
+                            root.unlock-submit(self.text);
+                        }
+                    }
+                    // A click only focuses the field: a drag-select would
+                    // put the passphrase on the primary selection.
+                    TouchArea {
+                        mouse-cursor: MouseCursor.text;
+                        clicked => {
+                            unlock-field.focus();
+                        }
+                    }
+                    if unlock-field.text == "": Text {
+                        text: "Passphrase";
+                        width: parent.width;
+                        height: parent.height;
+                        font-size: 12px;
+                        color: muted;
+                        vertical-alignment: center;
+                    }
                 }
             }
-            if unlock-error != "": Text { text: unlock-error; x: 20px; y: 110px; width: parent.width - 40px; height: 18px; font-size: 11px; color: danger; overflow: elide; vertical-alignment: center; }
+            if unlock-error != "": Text { text: unlock-error; x: 20px; y: 116px; width: parent.width - 40px; height: 18px; font-size: 11px; color: danger; overflow: elide; vertical-alignment: center; }
             HorizontalLayout {
                 x: 20px;
                 y: parent.height - 16px - 32px;
@@ -2742,8 +2816,22 @@ export component AppWindow inherits Window {
                 height: 32px;
                 alignment: end;
                 spacing: 8px;
-                StateButton { label: "Cancel"; ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover; }
-                StateButton { label: "Unlock"; primary: true; ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover; }
+                StateButton {
+                    label: "Cancel";
+                    opacity: root.unlock-busy ? 0.42 : 1;
+                    ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover;
+                    clicked => { root.unlock-cancel(); }
+                }
+                StateButton {
+                    label: root.unlock-busy ? "Unlocking…" : "Unlock";
+                    primary: true;
+                    ink: root.text; line-ink: root.line; accent: root.accent; on-accent: root.on-accent; hover-bg: root.hover;
+                    clicked => {
+                        if live && !root.unlock-busy {
+                            root.unlock-submit(unlock-field.text);
+                        }
+                    }
+                }
             }
         }
     }

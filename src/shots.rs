@@ -56,6 +56,9 @@ pub fn known(view: &str) -> bool {
             | "device-partitions-removed-elsewhere"
             | "device-unlock"
             | "device-unlock-wrong"
+            | "device-locked"
+            | "device-unlocking"
+            | "device-unlock-error"
             | "phone-waiting"
             | "phone-row"
             | "phone-plugged"
@@ -425,7 +428,10 @@ fn apply_scene(ui: &AppWindow, view: &str) {
             | "move-refused-many" => "move-refused",
             "menu-bg" => "menu-bg",
             "device-menu" => "menu-device",
-            "device-unlock" | "device-unlock-wrong" => "unlock",
+            "device-unlock"
+            | "device-unlock-wrong"
+            | "device-unlocking"
+            | "device-unlock-error" => "unlock",
             "shortcuts-browser" | "shortcuts-viewer" => "shortcuts",
             _ => "",
         }
@@ -731,11 +737,27 @@ fn places(view: &str) -> Vec<Place> {
             | "device-unlock"
             | "device-unlock-wrong"
             | "device-power-off"
+            | "device-locked"
+            | "device-unlocking"
+            | "device-unlock-error"
     ) {
         if let Some(disk) = rows.iter_mut().find(|row| row.name == "SANDISK") {
             disk.count = "".into();
             disk.usage = -1.0;
             disk.dim = true;
+        }
+    }
+    // Encrypted and locked: the lock glyph in place of the USB one.
+    if matches!(
+        view,
+        "device-unlock"
+            | "device-unlock-wrong"
+            | "device-locked"
+            | "device-unlocking"
+            | "device-unlock-error"
+    ) {
+        if let Some(disk) = rows.iter_mut().find(|row| row.name == "SANDISK") {
+            disk.glyph = crate::devices::LOCK_GLYPH.into();
         }
     }
     if matches!(view, "device-read-only" | "device-read-only-empty") {
@@ -1617,12 +1639,17 @@ fn fileops_scene(ui: &AppWindow, view: &str) {
             ui.set_menu_at_x(150.0);
             ui.set_menu_at_y(312.0);
         }
-        "device-unlock" | "device-unlock-wrong" => {
+        "device-unlock" | "device-unlock-wrong" | "device-unlocking" | "device-unlock-error" => {
             ui.set_unlock_name("SANDISK".into());
+            // Masked by the field: ten bullets, as typed.
             ui.set_unlock_text("••••••••••".into());
             if view == "device-unlock-wrong" {
                 ui.set_unlock_error("Wrong passphrase. Try again.".into());
             }
+            if view == "device-unlock-error" {
+                ui.set_unlock_error("Not enough free memory to unlock SANDISK".into());
+            }
+            ui.set_unlock_busy(view == "device-unlocking");
         }
         // The removed screen says it all; the toast is for a drive pulled
         // while another folder is open (DESIGN §2).

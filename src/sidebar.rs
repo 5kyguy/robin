@@ -418,8 +418,13 @@ impl SideJob {
                         waiting: false,
                     }
                 }
+                // A locked encrypted partition shows the lock glyph.
                 None => SideEntry {
-                    glyph: d.kind.glyph(),
+                    glyph: if d.locked {
+                        crate::devices::LOCK_GLYPH
+                    } else {
+                        d.kind.glyph()
+                    },
                     name: d.name(),
                     path: PathBuf::new(),
                     count: String::new(),

@@ -4205,6 +4205,7 @@ dependencies = [
  "slint",
  "slint-build",
  "thiserror 2.0.21",
+ "ttf-parser",
  "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",
