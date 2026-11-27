@@ -25,6 +25,10 @@ unicode-segmentation = "1.13.3"
 unicode-width = "0.2.3"
 unicode-normalization = "0.1.26"
 
+[dev-dependencies]
+# Reads the bundled font's cmap, so a glyph codepoint is checked, not assumed.
+ttf-parser = "0.25"
+
 [build-dependencies]
 slint-build = "=1.17.1"
 

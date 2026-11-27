@@ -327,6 +327,8 @@ pub fn drives_from_volumes(
                 waiting,
                 no_write: Vec::new(),
                 no_rename: Vec::new(),
+                locked: false,
+                crypto: String::new(),
             }
         })
         .collect()
