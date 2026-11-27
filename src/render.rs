@@ -119,6 +119,8 @@ pub fn scripted(view: &str) -> bool {
             | "toast-stack-two"
             | "toast-stack-more"
             | "toast-stack-expanded"
+            | "toast-stack-expanded-top"
+            | "toast-stack-expanded-bottom"
             | "toast-stack-short"
             | "toast-stack-wrap"
             | "devices-luks-locked"
@@ -1476,7 +1478,25 @@ fn paint_in(
         v if v.starts_with("phones-") => phone_scene(&ui, v, root, home, &fake)?,
         _ => {}
     }
+    scroll_parked_stack(&ui, view);
     snapshot(&ui, size, out)
+}
+
+/// After layout, scroll an expanded parked list to the top or the end
+/// so overflow frames show the muted scrollbar at each end.
+pub fn scroll_parked_stack(ui: &AppWindow, view: &str) {
+    if !matches!(
+        view,
+        "toast-stack-expanded" | "toast-stack-expanded-top" | "toast-stack-expanded-bottom"
+    ) {
+        return;
+    }
+    let _ = ui.show();
+    if view.ends_with("-bottom") {
+        ui.set_parked_scroll(ui.get_parked_scroll_min());
+    } else {
+        ui.set_parked_scroll(0.0);
+    }
 }
 
 /// Length of the fixture's speeder-run clip, as in the mock frames.
@@ -1800,7 +1820,11 @@ fn stranded_scene(ui: &AppWindow, view: &str) -> Result<()> {
     }
     if matches!(
         view,
-        "toast-stack-more" | "toast-stack-expanded" | "toast-stack-short"
+        "toast-stack-more"
+            | "toast-stack-expanded"
+            | "toast-stack-expanded-top"
+            | "toast-stack-expanded-bottom"
+            | "toast-stack-short"
     ) {
         return many_sticky_scene(ui, view, check);
     }
@@ -2002,6 +2026,7 @@ fn wrap_stack_scene(
             "stack cap: parked {parked} + current {current} + 8 > room {room}"
         )));
     }
+    check_parked_scrollbar(ui, false)?;
     Ok(())
 }
 
@@ -2015,7 +2040,11 @@ fn many_sticky_scene(
     check: impl Fn(&str, String, &str) -> Result<()>,
 ) -> Result<()> {
     use slint::Model;
-    let last = if view == "toast-stack-expanded" { 9 } else { 6 };
+    let expanded = matches!(
+        view,
+        "toast-stack-expanded" | "toast-stack-expanded-top" | "toast-stack-expanded-bottom"
+    );
+    let last = if expanded { 9 } else { 6 };
     let pins: Vec<String> = (2..=last).map(hidden_pin).collect();
     let pin_refs: Vec<&str> = pins.iter().map(String::as_str).collect();
     app::seed_parked_stickies(&pin_refs, "Copied 1 path", false);
@@ -2030,9 +2059,11 @@ fn many_sticky_scene(
         check("footer", ui.get_parked_footer().to_string(), "+4 more")?;
         check("under newer", parked_pin(ui, 0)?, &hidden_pin(6))?;
         check("under action", parked_action(ui, 0)?, app::TOAST_DISMISS)?;
+        ui.show().map_err(|e| Error::Message(e.to_string()))?;
+        check_parked_scrollbar(ui, false)?;
         return Ok(());
     }
-    let more = if view == "toast-stack-expanded" { 5 } else { 2 };
+    let more = if expanded { 5 } else { 2 };
     check(
         "parked",
         ui.get_parked_toasts().row_count().to_string(),
@@ -2048,7 +2079,7 @@ fn many_sticky_scene(
     check("under mid", parked_pin(ui, 1)?, &hidden_pin(last - 1))?;
     check("under older", parked_pin(ui, 2)?, &hidden_pin(last - 2))?;
     check("under action", parked_action(ui, 0)?, app::TOAST_DISMISS)?;
-    if view == "toast-stack-expanded" {
+    if expanded {
         ui.invoke_parked_more_expand();
         check(
             "expanded",
@@ -2083,6 +2114,48 @@ fn many_sticky_scene(
                 crate::toast::stack_room(800, 46, 26)
             )));
         }
+        check_parked_scrollbar(ui, true)?;
+        if view.ends_with("-bottom") {
+            ui.set_parked_scroll(ui.get_parked_scroll_min());
+            let got = ui.get_parked_scroll();
+            let want = ui.get_parked_scroll_min();
+            if (got - want).abs() > 1.0 {
+                return Err(Error::Message(format!(
+                    "parked-scroll: {got}, want end {want}"
+                )));
+            }
+        } else {
+            ui.set_parked_scroll(0.0);
+        }
+        // Still overflowing after the scroll, so the bar stays visible.
+        check_parked_scrollbar(ui, true)?;
+        return Ok(());
+    }
+    // Collapsed stacks (three shown, or one in a short window) fit in
+    // the cap, so the scrollbar stays hidden.
+    ui.show().map_err(|e| Error::Message(e.to_string()))?;
+    check_parked_scrollbar(ui, false)?;
+    Ok(())
+}
+
+/// The parked list's thin scrollbar is shown only while the list overflows.
+fn check_parked_scrollbar(ui: &AppWindow, overflows: bool) -> Result<()> {
+    let shown = ui.get_parked_scrolls();
+    if shown != overflows {
+        return Err(Error::Message(format!(
+            "parked-scrolls: {shown}, want overflow={overflows}"
+        )));
+    }
+    let min = ui.get_parked_scroll_min();
+    if overflows && min >= 0.0 {
+        return Err(Error::Message(format!(
+            "overflow with non-negative parked-scroll-min {min}"
+        )));
+    }
+    if !overflows && min < -1.0 {
+        return Err(Error::Message(format!(
+            "no overflow but parked-scroll-min is {min}"
+        )));
     }
     Ok(())
 }

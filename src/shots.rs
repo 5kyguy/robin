@@ -107,6 +107,8 @@ pub fn known(view: &str) -> bool {
             | "toast-stack-two"
             | "toast-stack-more"
             | "toast-stack-expanded"
+            | "toast-stack-expanded-top"
+            | "toast-stack-expanded-bottom"
             | "toast-stack-short"
             | "toast-stack-wrap"
             | "menu-bg"
@@ -173,6 +175,7 @@ pub fn paint(view: &str, theme: &Theme, size: (u32, u32), out: &Path) -> Result<
         }
         file_menu_scene(&ui, view, size);
     }
+    crate::render::scroll_parked_stack(&ui, view);
     crate::render::snapshot(&ui, size, out)
 }
 
@@ -1347,6 +1350,8 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
         | "toast-stack-two"
         | "toast-stack-more"
         | "toast-stack-expanded"
+        | "toast-stack-expanded-top"
+        | "toast-stack-expanded-bottom"
         | "toast-stack-short"
         | "toast-stack-wrap" => {
             use crate::clipboard::{paths_toast, Outcome};
@@ -1368,6 +1373,8 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
                 | "toast-stack-two"
                 | "toast-stack-more"
                 | "toast-stack-expanded"
+                | "toast-stack-expanded-top"
+                | "toast-stack-expanded-bottom"
                 | "toast-stack-short"
                 | "toast-stack-wrap" => paths_toast(&Outcome::Copied, 1),
                 _ => stranded.clone(),
@@ -1397,6 +1404,8 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
                 || view == "toast-stack-two"
                 || view == "toast-stack-more"
                 || view == "toast-stack-expanded"
+                || view == "toast-stack-expanded-top"
+                || view == "toast-stack-expanded-bottom"
                 || view == "toast-stack-short"
                 || view == "toast-stack-wrap"
             {
@@ -1420,7 +1429,9 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
                         2,
                         "+2 more",
                     ),
-                    "toast-stack-expanded" => (
+                    "toast-stack-expanded"
+                    | "toast-stack-expanded-top"
+                    | "toast-stack-expanded-bottom" => (
                         (2..=9).rev().map(|n| card(&pin(n))).collect(),
                         0,
                         crate::toast::SHOW_FEWER,

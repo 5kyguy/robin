@@ -14,6 +14,7 @@
 //! the stack; expanding that line shows the full list, with a "Show
 //! fewer" line to collapse it again. The expanded stack is capped at
 //! [`stack_room`] and the parked list scrolls under the current toast.
+//! A thin muted scrollbar is shown only while that list overflows.
 
 /// One toast's content, as bound to the window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

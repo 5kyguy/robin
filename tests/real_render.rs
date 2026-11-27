@@ -138,6 +138,8 @@ fn scripted_views_render_through_the_real_app() {
         ("toast-stack-two", 800),
         ("toast-stack-more", 800),
         ("toast-stack-expanded", 800),
+        ("toast-stack-expanded-top", 800),
+        ("toast-stack-expanded-bottom", 800),
         ("toast-stack-short", 800),
         ("toast-stack-wrap", 800),
         // The 480px floor: the info panel floats, the filmstrip is cut
@@ -156,6 +158,8 @@ fn scripted_views_render_through_the_real_app() {
             | "toast-stack-two"
             | "toast-stack-more"
             | "toast-stack-expanded"
+            | "toast-stack-expanded-top"
+            | "toast-stack-expanded-bottom"
             | "toast-stack-wrap" => 800,
             _ => 500,
         };
