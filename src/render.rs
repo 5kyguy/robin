@@ -112,6 +112,8 @@ pub fn scripted(view: &str) -> bool {
             | "copy-path"
             | "copy-path-xclip"
             | "copy-path-no-tool"
+            | "rename-stranded"
+            | "rename-stranded-dismissed"
     )
 }
 
@@ -1140,6 +1142,7 @@ fn paint_in(
             ui.invoke_trash_restore();
             app::land_reads();
         }
+        v if v.starts_with("rename-stranded") => stranded_scene(&ui, v)?,
         v if v.starts_with("context-menu")
             || v.starts_with("rename-")
             || v.starts_with("properties")
@@ -1448,6 +1451,44 @@ fn file_scene(ui: &AppWindow, view: &str, size: (u32, u32)) -> Result<()> {
             check("overlay", ui.get_overlay().to_string(), "properties")?;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// A case-only rename that ended under a hidden name: the toast names
+/// it, has no timer (so a long wait can't hide it), and only [Dismiss]
+/// (`-dismissed`) closes it.
+fn stranded_scene(ui: &AppWindow, view: &str) -> Result<()> {
+    let check = |what: &str, got: String, want: &str| {
+        if got == want {
+            Ok(())
+        } else {
+            Err(Error::Message(format!("{what}: {got:?}, want {want:?}")))
+        }
+    };
+    select_row(ui, "dune-sunset-0412.jpg");
+    ui.invoke_key(app::keys::F2.into(), false, false, false);
+    ui.show().map_err(|e| Error::Message(e.to_string()))?;
+    app::strand_renames(true);
+    type_field(ui, "Dune-sunset-0412");
+    type_field(ui, "\n");
+    app::strand_renames(false);
+    app::land_reads();
+    check("toast", ui.get_toast_text().to_string(), app::STRANDED_HEAD)?;
+    check(
+        "hidden name",
+        ui.get_toast_pin().to_string(),
+        ".robin-rename-4127-0-dune-sunset-0412.jpg",
+    )?;
+    check(
+        "action",
+        ui.get_toast_action().to_string(),
+        app::TOAST_DISMISS,
+    )?;
+    check("shown", ui.get_toast_on().to_string(), "true")?;
+    if view == "rename-stranded-dismissed" {
+        ui.invoke_toast_link();
+        check("dismissed", ui.get_toast_on().to_string(), "false")?;
     }
     Ok(())
 }

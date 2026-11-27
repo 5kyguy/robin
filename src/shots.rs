@@ -1312,7 +1312,14 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
         }
         "copy-path-done" | "copy-path-no-tool" | "rename-stranded" => {
             use crate::clipboard::{paths_toast, Outcome};
-            select(&[photo, "dune-sunset-0413.jpg"]);
+            if view == "rename-stranded" {
+                select(&[photo]);
+            } else {
+                // Two paths copied: two rows selected, and the status bar
+                // says so.
+                select(&[photo, "dune-sunset-0413.jpg"]);
+                ui.set_status_left("15 items · 1 hidden · 2 selected (12.2 MB)".into());
+            }
             let (tone, text) = match view {
                 "copy-path-done" => paths_toast(&Outcome::Copied, 2),
                 "copy-path-no-tool" => paths_toast(&Outcome::NoTool, 2),
@@ -1323,7 +1330,14 @@ fn file_menu_scene(ui: &AppWindow, view: &str, size: (u32, u32)) {
             ui.set_toast_tone(tone.into());
             ui.set_toast_glyph(crate::app::toast_glyph(tone).into());
             ui.set_toast_text(text.into());
-            ui.set_toast_action("".into());
+            ui.set_toast_action(
+                if view == "rename-stranded" {
+                    crate::app::TOAST_DISMISS
+                } else {
+                    ""
+                }
+                .into(),
+            );
             let details = if view == "rename-stranded" {
                 vec![".robin-rename-4127-0-dune-sunset-0412.jpg".to_string()]
             } else {

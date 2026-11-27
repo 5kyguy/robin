@@ -5139,6 +5139,13 @@ pub fn build(launch: Launch) -> Result<AppWindow> {
         if device_toast_button(&ui, &st, false) {
             return;
         }
+        if ui.get_toast_action() == TOAST_DISMISS {
+            st.borrow_mut().toast_open = false;
+            ui.set_toast_open(false);
+            ui.set_toast_on(false);
+            ui.set_toast_action("".into());
+            return;
+        }
         if ui.get_toast_details().row_count() > 0 || !ui.get_toast_pin().is_empty() {
             let open = {
                 let mut s = st.borrow_mut();
@@ -7238,6 +7245,14 @@ thread_local! {
     /// Set by the render harness: renames fail as a phone folder that
     /// refuses them would (EOPNOTSUPP), without touching the file.
     static REFUSE_RENAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by the render harness: renames end half way, as a case-only
+    /// rename whose way back failed, without touching the file.
+    static STRAND_RENAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// For the render harness: make renames end stranded under a hidden name.
+pub fn strand_renames(on: bool) {
+    STRAND_RENAMES.with(|r| r.set(on));
 }
 
 /// For the render harness: make renames refuse, as some MTP folders do.
@@ -7251,10 +7266,16 @@ fn rename_async(ui: &AppWindow, st: &Shared, dir: PathBuf, from: OsString, to: O
     redraw(ui, &st.borrow());
     let (d, f, t) = (dir.clone(), from.clone(), to.clone());
     let refuse = REFUSE_RENAMES.with(|r| r.get());
+    let strand = STRAND_RENAMES.with(|r| r.get());
     run_device(
         ui,
         st,
         move || {
+            if strand {
+                let mut hidden = OsString::from(".robin-rename-4127-0-");
+                hidden.push(&f);
+                return Err(crate::rename::Failure::Stranded { hidden });
+            }
             if refuse {
                 return Err(crate::rename::Failure::Refused(
                     rustix::io::Errno::OPNOTSUPP,
@@ -7283,6 +7304,27 @@ fn blur_rename(ui: &AppWindow, st: &Shared) {
 /// The toast headline when a half-done case-only rename left the item
 /// under a hidden name; the name itself is the toast's pinned line.
 pub const STRANDED_HEAD: &str = "Couldn't finish renaming. It's now this hidden file:";
+
+/// The toast's action that only closes it.
+pub const TOAST_DISMISS: &str = "Dismiss";
+
+/// What the stranded-rename toast shows. It is sticky: no timer hides
+/// it, only [Dismiss] (or a newer toast).
+pub struct StrandedToast {
+    pub tone: &'static str,
+    pub text: String,
+    pub details: Vec<String>,
+    pub action: &'static str,
+}
+
+pub fn stranded_toast(hidden: &std::ffi::OsStr) -> StrandedToast {
+    StrandedToast {
+        tone: "danger",
+        text: STRANDED_HEAD.into(),
+        details: vec![hidden.to_string_lossy().into_owned()],
+        action: TOAST_DISMISS,
+    }
+}
 
 /// The same in one line, for the inline field.
 pub fn stranded_text(hidden: &std::ffi::OsStr) -> String {
@@ -7410,15 +7452,10 @@ fn apply(ui: &AppWindow, st: &Shared, action: Action) {
             redraw(ui, &st.borrow());
             // The hidden name is long: it gets the toast's pinned line,
             // which wraps, instead of being cut off in the headline.
-            show_toast_sticky(
-                ui,
-                st,
-                "danger",
-                STRANDED_HEAD.into(),
-                vec![hidden.to_string_lossy().into_owned()],
-                true,
-                "",
-            );
+            // It stays (no timer) until [Dismiss]: it is the only place
+            // the hidden name is shown.
+            let t = stranded_toast(&hidden);
+            show_toast_sticky(ui, st, t.tone, t.text, t.details, true, t.action);
             st.borrow_mut().toast_open = true;
             ui.set_toast_open(true);
             let ticket = st.borrow_mut().ctl.begin_refresh();
@@ -11429,6 +11466,12 @@ mod tests {
             "Couldn't finish renaming. It's now this hidden file: .robin-rename-1-0-a.jpg"
         );
         assert!(c.rename.is_none(), "the edit's row is gone");
+        // The toast names it and stays until dismissed.
+        let t = stranded_toast(&hidden);
+        assert_eq!(t.tone, "danger");
+        assert_eq!(t.text, STRANDED_HEAD);
+        assert_eq!(t.details, [".robin-rename-1-0-a.jpg"]);
+        assert_eq!(t.action, TOAST_DISMISS);
         let _ = fs::remove_dir_all(c.env.home.unwrap());
     }
 

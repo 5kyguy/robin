@@ -221,7 +221,7 @@ All empty and error states are centred in the content area: glyph 64 `muted@60%`
 - A change of case only (`photo.JPG` → `photo.jpg`) is allowed; the filesystem decides whether that's the same name.
 - The rename runs off the UI thread (a phone answers each call over USB). While it runs the field dims to 0.6 and ignores typing and Esc.
 - It never overwrites. `renameat2(RENAME_NOREPLACE)` is used, so a file that appears after the check still turns into the inline clash message. Where the flag is unsupported (gvfs FUSE, FAT, old kernels) a file is hard-linked to the new name (which also refuses an existing name) and the old link removed; where links aren't supported either, or for a folder, the name is checked at the last moment before a plain rename. That last case leaves a window of microseconds in which a file created by another program could be replaced.
-- On FAT/exFAT a case-only rename finds "the new name" is the same file (same device and inode). It goes in two steps through a hidden `.robin-rename-…` name in the same folder; if the second step fails, the original name is put back. If even that fails, the edit closes and a `danger` toast that stays says "Couldn't finish renaming. It's now this hidden file:" with the hidden name on its pinned line, so it can be found (hidden files are off by default).
+- On FAT/exFAT a case-only rename finds "the new name" is the same file (same device and inode). It goes in two steps through a hidden `.robin-rename-…` name in the same folder; if the second step fails, the original name is put back. If even that fails, the edit closes and a `danger` toast says "Couldn't finish renaming. It's now this hidden file:" with the hidden name on its pinned line and a [Dismiss] action. It has no 4s/8s timer: it stays until [Dismiss] (or a newer toast) closes it, so it can be found (hidden files are off by default).
 - What the location refuses shows under the field too ("Pixel 8 doesn't allow renaming here", "SANDISK is read-only", "You don't have permission to rename it"), and the field stays open on the typed name.
 - After the rename the item keeps its selection under the new name and is scrolled into view.
 - Batch rename (more than one selected) opens a dialog with find/replace and `{n}` counter, plus a live preview list.
@@ -377,7 +377,7 @@ Things that never animate: scrolling content, list sorting (it cuts), and typing
 20. drop-target valid and invalid
 21. context-menu file and background: menu-file, menu-file-edge (flipped up and left in the bottom-right corner), menu-file-greyed (two selected, Rename's tooltip), menu-file-phone, menu-bg (mocks); context-menu, context-menu-edge, context-menu-multi, phones-rename-refused (Rename greyed with the phone's reason), devices-menu-read-only (real scenes)
 21a. properties (mock and real) and properties-multi (real)
-21b. copy-path-done, copy-path-no-tool, rename-stranded (mocks); copy-path (wl-copy), copy-path-xclip (X11), copy-path-no-tool (real scenes against a stand-in clipboard)
+21b. copy-path-done (2 selected), copy-path-no-tool, rename-stranded (mocks); copy-path (wl-copy), copy-path-xclip (X11), copy-path-no-tool (real scenes against a stand-in clipboard); rename-stranded and rename-stranded-dismissed (real: the toast stays, [Dismiss] closes it)
 22. shortcut-overlay for browser and viewer
 23. settings for each category
 24. viewer-image with chrome, viewer-image with chrome hidden, and viewer-zoom-400 with minimap
