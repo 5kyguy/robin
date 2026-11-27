@@ -130,6 +130,7 @@ Glyph sizes: 14 in rows and the sidebar (FolderSidebar glyph 14 in an 18px box) 
 - Height 46, fill `bg`, bottom 1px `divider`.
 - Contents: back `󰁍`, forward `󰁔`, up `󰁝` (34×34 icon buttons, 2px gap) → 12 gap → breadcrumb field (flex) → 12 gap → search `󰍉` → view switch segmented [list `󰈚` | grid `󰕰`] → overflow `󰇘`.
 - Back and forward step through the folder history: every navigation (a click, Enter, Backspace, up, the sidebar, a path) pushes the folder it left, and a new one clears forward. A search only filters the open folder and adds nothing. A refresh that walks up out of a vanished folder adds nothing either, and a step into a folder that has since vanished fails with the usual toast and drops that entry. Back and forward sit at opacity 0.42 and ignore clicks when there is nowhere to go. Up opens the parent, the same as Backspace, and at `/` it sits at opacity 0.42 and ignores clicks too.
+- `Alt+←` / `Alt+→` and the mouse's side buttons (back / forward) run the same history steps as the two buttons, with the same no-op when there is nowhere to go. They do nothing while a dialog, a menu, the viewer or the rename field is open.
 - Groups are split by a 1px `text@14%` divider 20px tall (ViewerToolbar separator 9×20).
 - **Breadcrumbs:** a field 30px tall with radius `r-md`, fill `surface`, and a 1px `hairline` border. Segments are `t-body` `muted`, the last one is `text` 700, and the separator is `›` in `muted`. Hovering a segment applies `hover` with radius `r-sm`. When segments overflow, the leftmost ones collapse into `…`, which opens a dropdown.
 - **Path edit:** `Ctrl+L`, or a click on empty field space, turns the field into a text input with a monospace path, `focus_ring`, and all text selected. Tab-completion shows a dropdown of matching dirs (max 8 rows, 28px). Enter navigates and Esc reverts. An invalid path shakes the field ±4px (3 cycles in 180ms) and turns the ring to `danger`.
@@ -210,12 +211,26 @@ All empty and error states are centred in the content area: glyph 64 `muted@60%`
 - Buttons [Cancel] [Unlock] (primary). Unlock mounts and opens the drive like a click on its row.
 - Phase 1 has the mock only (`device-unlock`, `device-unlock-wrong`); encrypted drives aren't listed yet.
 
-### Inline rename (`F2`)
-- The name cell becomes a 1px-ring `focus_ring` input in place, at the same height as the row.
-- The stem is pre-selected (extension excluded).
-- Enter commits, and Esc or a blur commits only if the name is valid.
-- When a name collides, the ring turns `danger` and a 22px tooltip appears below: "A file named x already exists". Invalid characters (`/`, NUL) get the same treatment.
+### Inline rename (`F2`, or Rename in the file menu)
+- The name cell becomes a 1px-ring `focus_ring` input in place, at the same height as the row (list) or over the name under the tile (grid), on a `surface` fill.
+- The stem is pre-selected: everything before the last dot, with `.tar.gz`, `.tar.xz`, `.tar.zst`, `.tar.bz2` and `.tar.lz` counted as one extension. Folders, dotfiles (`.bashrc`) and names ending in a dot select the whole name.
+- Enter saves and Esc cancels. Clicking away (a click elsewhere in the list, the grid, the sidebar, or the window losing focus) saves a valid, changed name and otherwise cancels, so a half-typed bad name is never kept and never nags.
+- The name is checked as you type. Problems show in `danger` in a box right under the field (above it on the last visible rows; wrapped under a grid tile), never in a dialog, and the ring turns `danger`. Enter does nothing while one shows:
+  - "A file named x already exists" / "A folder named x already exists"
+  - "Enter a name", "\".\" and \"..\" can't be used as names", "Names can't contain \"/\"", "Names can't contain a null character", "Names can be at most 255 bytes long".
+- A change of case only (`photo.JPG` → `photo.jpg`) is allowed; the filesystem decides whether that's the same name.
+- The rename runs off the UI thread (a phone answers each call over USB). While it runs the field dims to 0.6 and ignores typing and Esc.
+- It never overwrites. `renameat2(RENAME_NOREPLACE)` is used, so a file that appears after the check still turns into the inline clash message. Where the flag is unsupported (gvfs FUSE, FAT, old kernels) a file is hard-linked to the new name (which also refuses an existing name) and the old link removed; where links aren't supported either, or for a folder, the name is checked at the last moment before a plain rename. That last case leaves a window of microseconds in which a file created by another program could be replaced.
+- On FAT/exFAT a case-only rename finds "the new name" is the same file (same device and inode). It goes in two steps through a hidden `.robin-rename-…` name in the same folder; if the second step fails, the original name is put back. If even that fails, the edit closes and a `danger` toast says "Couldn't finish renaming. It's now this hidden file:" with the hidden name on its pinned line and a [Dismiss] action. It has no 4s/8s timer: it stays until [Dismiss] (or a newer toast) closes it, so it can be found (hidden files are off by default).
+- What the location refuses shows under the field too ("Pixel 8 doesn't allow renaming here", "SANDISK is read-only", "You don't have permission to rename it"), and the field stays open on the typed name.
+- After the rename the item keeps its selection under the new name and is scrolled into view.
 - Batch rename (more than one selected) opens a dialog with find/replace and `{n}` counter, plus a live preview list.
+
+### Properties (file menu)
+- A dialog `min(440, window − 32)` wide, in the shared dialog style: the item's glyph and name as the title, then 22px fact rows with a 96-wide `muted` key and a `text` value, and one [Close] (primary, focused). Enter and Esc close it.
+- One item: Kind, Size ("6.2 MB (6 204 811 bytes)"; a folder shows its item count), Location (`~`-shortened), Modified (absolute date and time), Permissions (`-rw-r--r--`).
+- Several: "N items" as the title, Kind as counts ("3 files, 1 folder"), Size of the files only ("… in files; folders not counted"), Location, the newest Modified, and Permissions or "Mixed".
+- No recursive folder size: it would mean walking the tree on open.
 
 ### New folder and file
 - `Ctrl+Shift+N` inserts a new row at the sort position with the name "New folder" selected inline, the same as rename.
@@ -305,9 +320,13 @@ All empty and error states are centred in the content area: glyph 64 `muted@60%`
   - Items are 28 tall (24 at compact) with radius `r-md` and hover `selected`. Each item has a glyph 14 `muted`, a label `t-body`, and a shortcut `t-small` `muted` aligned right. Separators are a 1px `divider` with 4px margins. Submenus are marked `󰅂`.
   - Destructive items ("Delete permanently") have a `danger` label and glyph, and are always last.
   - Opening scales from 0.98 to 1 plus opacity over 120ms from the pointer. Closing is a 80ms fade.
-  - File menu: Open · Open with › · Open in viewer · ─ · Cut · Copy · Copy path · Paste · ─ · Rename · Duplicate · Compress · Pin to sidebar · ─ · Properties · ─ · Move to trash · Delete permanently.
+  - File menu (right-click on an item): Open · Open with… · ─ · Cut · Copy · Paste · Rename `F2` · ─ · Move to Trash `Del` (or **Delete permanently** in `danger` where there is no trash, through the no-trash dialog) · ─ · Copy path · Properties.
+    - Right-clicking an unselected item selects it first; on a selected one the menu acts on the whole selection.
+    - Open opens the right-clicked item (a folder in Robin, media in the viewer, anything else with its default app). Open with… hands one file to the desktop's opener. Paste pastes into the open folder. Copy path puts the absolute paths, one per line, on the clipboard through a helper, off the UI thread: `wl-copy` on Wayland, else `xclip -selection clipboard`, then `xsel --clipboard --input` wherever `DISPLAY` is set. Only once a helper has taken the text does the toast say "Copied 1 path" / "Copied 3 paths". With no helper installed it is a `warning` toast, "Couldn't copy: install wl-clipboard or xclip"; a helper that fails gives a `danger` "Couldn't copy the path: …".
+    - Lines the location or selection can't do stay in place at opacity 0.42, ignore clicks and hover, and show their reason in a tooltip (`surface` box, 1px `hairline`, `t-small`) to the right of the line on hover, flipped left near the window edge: "Select one item to rename", "Select one item to open with another app", "Folders open in Robin", "Nothing to paste: cut or copy something first", "Restore it from the Trash first", "SANDISK is read-only", "Pixel 8 doesn't allow renaming in DCIM", "You don't have permission to change …".
+    - The menu opens at the pointer and flips left and/or up when it would cross the window's right or bottom edge; when the window is shorter than the menu it is clamped to 8px margins and scrolls.
   - Background menu: New folder · New file › · Paste · Select all · View › · Sort by › · Show hidden · Open terminal here · Properties.
-- **Shortcut overlay (`?`, ViewerShortcutHelp.qml):** a centred 760×520 panel, `panel_float`, radius r-lg, on a scrim. It has 3 columns (NAVIGATE / FILES / VIEW, with the viewer's keys when opened from the viewer) under `t-label` headers. Each row shows key caps (`t-small`, a 1px `line` border, radius r-xs, padding 4/1, min width 20) then the description. A filter input sits at the top, and Esc closes it.
+- **Shortcut overlay (`?`, ViewerShortcutHelp.qml):** a centred 760×520 panel, `panel_float`, radius r-lg, on a scrim. It has 3 columns (NAVIGATE / FILES / VIEW, with the viewer's keys when opened from the viewer) under `t-label` headers. Each row shows key caps (`t-small`, a 1px `line` border, radius r-xs, padding 4/1, min width 20) then the description. A filter input sits at the top, and Esc closes it. NAVIGATE lists `Alt ← →` back / forward and `M4 M5` mouse back / forward; FILES lists `F2` rename.
 - **Settings** (`Ctrl+,`): a full page with a left category list 200 wide using sidebar row style, and a form column max 640.
   - Rows are 44 tall: label `t-body` with a `t-small` `muted` hint, and the control on the right.
   - Toggles are 32×18 pills (on: `accent` track with an `on_accent` knob; off: a `text@20%` track with a `text` knob). The knob moves with the spring.
@@ -348,7 +367,7 @@ Things that never animate: scrolling content, list sorting (it cuts), and typing
 10b. Phones, as mocks (`--render-mock`): phone-row (phone and camera glyphs), phone-plugged, phone-waiting, phone-still-waiting, phone-top-refused, phone-no-write, phone-no-trash, phone-busy-copy, phone-safe-unplug, camera-waiting. As real scenes against the fake backend (`--render`): phones-row, phones-plugged, phones-waiting, phones-still-waiting, phones-allowed, phones-storage, phones-loading, phones-top-refused, phones-no-write, phones-no-trash, phones-copying, phones-copied (no partial file left), phones-busy-copy, phones-safe-unplug (unmount only, never a power-off), phones-removed, phones-removed-elsewhere, phones-menu, phones-camera-waiting, phones-camera-still-waiting, phones-new-folder (made off the UI thread, then selected). phones-storage also checks the status bar reads "12 GB free of 128 GB", and phones-no-trash checks the note
 11. loading-large-dir (skeleton)
 12. hidden-files-shown
-13. rename-inline and rename-collision
+13. rename-inline, rename-collision, rename-invalid and rename-grid (mocks); rename-editing, rename-clash, rename-invalid, rename-grid, rename-done (selected and in view after), phones-rename-refused-reached (the refusal inline) as real scenes
 14. new-folder inline and new-file popover
 15. confirm-trash (neutral) and confirm-trash-no-trash-on-drive
 16. confirm-delete-permanent (danger)
@@ -356,7 +375,9 @@ Things that never animate: scrolling content, list sorting (it cuts), and typing
 18. conflict-dialog (file vs file and folder merge)
 19. toasts with 3 stacked
 20. drop-target valid and invalid
-21. context-menu file and background
+21. context-menu file and background: menu-file, menu-file-edge (flipped up and left in the bottom-right corner), menu-file-greyed (two selected, Rename's tooltip), menu-file-phone, menu-bg (mocks); context-menu, context-menu-edge, context-menu-multi, phones-rename-refused (Rename greyed with the phone's reason), devices-menu-read-only (real scenes)
+21a. properties (mock and real) and properties-multi (real)
+21b. copy-path-done (2 selected), copy-path-no-tool, rename-stranded (mocks); copy-path (wl-copy), copy-path-xclip (X11), copy-path-no-tool (real scenes against a stand-in clipboard); rename-stranded and rename-stranded-dismissed (real: the toast stays, [Dismiss] closes it)
 22. shortcut-overlay for browser and viewer
 23. settings for each category
 24. viewer-image with chrome, viewer-image with chrome hidden, and viewer-zoom-400 with minimap

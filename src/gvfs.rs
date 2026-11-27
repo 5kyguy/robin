@@ -326,6 +326,7 @@ pub fn drives_from_volumes(
                 kind,
                 waiting,
                 no_write: Vec::new(),
+                no_rename: Vec::new(),
             }
         })
         .collect()

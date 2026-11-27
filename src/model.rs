@@ -486,6 +486,15 @@ pub fn format_modified(mtime: i64, now: i64, offset: impl Fn(i64) -> i64) -> Str
             _ => format!("{}h ago", ago / 3_600),
         };
     }
+    format_date(mtime, offset)
+}
+
+/// `2026-10-30 18:58` in local time, never relative: the Properties
+/// dialog's Modified. `mtime <= 0` is blank.
+pub fn format_date(mtime: i64, offset: impl Fn(i64) -> i64) -> String {
+    if mtime <= 0 {
+        return String::new();
+    }
     let local = mtime + offset(mtime);
     let (y, m, d) = civil_from_days(local.div_euclid(86_400));
     let secs = local.rem_euclid(86_400);

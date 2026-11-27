@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod clipboard;
 pub mod delegate;
 pub mod devices;
 pub mod error;
@@ -20,6 +21,7 @@ pub mod ops;
 pub mod picture;
 pub mod player;
 pub mod prefs;
+pub mod rename;
 pub mod render;
 pub mod safety;
 pub mod shots;
